@@ -12,6 +12,19 @@ from .arranger import SongArranger, Section
 
 
 @dataclass
+class TransitionPattern:
+    """Detailed pattern for a single transition between sections."""
+    from_label: str
+    to_label: str
+    energy_ratio: float  # to_energy / from_energy
+    chroma_similarity: float  # harmonic continuity (0-1)
+    timbre_similarity: float  # timbral continuity (0-1)
+    brightness_change: float  # to_brightness - from_brightness
+    tempo_ratio: float  # local tempo change if any
+    transition_duration: float  # duration of transition region in seconds
+
+
+@dataclass
 class SongProfile:
     """Profile of a single analyzed song."""
     name: str
@@ -33,6 +46,7 @@ class SongProfile:
     # Transitions
     transition_types: List[str]  # "rise", "fall", "steady"
     avg_section_duration: float
+    transition_patterns: List[TransitionPattern]  # Detailed transition features
     
     # Audio features
     avg_brightness: float
@@ -65,6 +79,15 @@ class StyleProfile:
     
     # Transitions
     preferred_transitions: Dict[str, List[str]]  # section -> likely next sections
+    
+    # Learned transition patterns (NEW)
+    transition_patterns: Dict[str, Dict[str, float]]  # "label1_to_label2" -> {energy_ratio, chroma_sim, etc}
+    typical_energy_jumps: List[float]  # Distribution of energy ratios at transitions
+    typical_chroma_continuity: float  # Average harmonic continuity (0-1)
+    typical_timbre_continuity: float  # Average timbral continuity (0-1)
+    
+    # Section timing (NEW) - learned target durations per section type
+    section_timing: Dict[str, Dict[str, float]]  # label -> {"mean": 45.0, "std": 10.0, "min": 30.0, "max": 60.0}
 
 
 class SongTrainer:
@@ -122,7 +145,7 @@ class SongTrainer:
         energy_mean = float(np.mean(energy_curve))
         energy_variance = float(np.var(energy_curve))
         
-        # Transition analysis
+        # Transition analysis - basic types
         transition_types = []
         for i in range(len(sections) - 1):
             e1 = sections[i].energy
@@ -133,6 +156,9 @@ class SongTrainer:
                 transition_types.append("fall")
             else:
                 transition_types.append("steady")
+        
+        # Detailed transition pattern extraction (NEW)
+        transition_patterns = self._extract_transition_patterns(audio_data, sections)
         
         avg_section_duration = float(np.mean(section_durations)) if section_durations else 30.0
         
@@ -154,6 +180,7 @@ class SongTrainer:
             energy_variance=energy_variance,
             transition_types=transition_types,
             avg_section_duration=avg_section_duration,
+            transition_patterns=transition_patterns,
             avg_brightness=avg_brightness,
             avg_harmonicity=avg_harmonicity
         )
@@ -161,8 +188,103 @@ class SongTrainer:
         print(f"   ✓ Tempo: {tempo:.0f} BPM, Key: {key}")
         print(f"   ✓ Sections: {len(sections)} ({' → '.join(section_labels)})")
         print(f"   ✓ Duration: {duration:.0f}s ({duration/60:.1f} min)")
+        print(f"   ✓ Transitions: {len(transition_patterns)} patterns extracted")
         
         return profile
+    
+    def _extract_transition_patterns(
+        self, 
+        audio_data: np.ndarray, 
+        sections: List
+    ) -> List[TransitionPattern]:
+        """
+        Extract detailed transition patterns between consecutive sections.
+        
+        Analyzes the musical characteristics of each transition:
+        - Energy ratio (how much energy changes)
+        - Chroma similarity (harmonic continuity)
+        - Timbre similarity (tonal continuity)
+        - Brightness change
+        """
+        patterns = []
+        
+        if len(sections) < 2:
+            return patterns
+        
+        # Use adaptive hop_length for memory efficiency
+        target_frames = 5000
+        hop_length = max(512, int(len(audio_data) / target_frames))
+        
+        for i in range(len(sections) - 1):
+            s1 = sections[i]
+            s2 = sections[i + 1]
+            
+            # Get audio for each section (last 2s of s1, first 2s of s2)
+            transition_window = 2.0  # seconds
+            
+            # End of section 1
+            s1_end_start = max(s1.start_time, s1.end_time - transition_window)
+            s1_start_sample = int(s1_end_start * self.sample_rate)
+            s1_end_sample = int(s1.end_time * self.sample_rate)
+            s1_audio = audio_data[s1_start_sample:s1_end_sample]
+            
+            # Start of section 2
+            s2_start_sample = int(s2.start_time * self.sample_rate)
+            s2_end_sample = int(min(s2.start_time + transition_window, s2.end_time) * self.sample_rate)
+            s2_audio = audio_data[s2_start_sample:s2_end_sample]
+            
+            if len(s1_audio) < self.sample_rate * 0.5 or len(s2_audio) < self.sample_rate * 0.5:
+                continue  # Skip if sections are too short
+            
+            # Compute features for each transition region
+            try:
+                # Energy ratio
+                rms1 = np.sqrt(np.mean(s1_audio ** 2))
+                rms2 = np.sqrt(np.mean(s2_audio ** 2))
+                energy_ratio = float(rms2 / max(rms1, 1e-6))
+                
+                # Chroma (harmonic content)
+                chroma1 = librosa.feature.chroma_cqt(y=s1_audio, sr=self.sample_rate, hop_length=hop_length)
+                chroma2 = librosa.feature.chroma_cqt(y=s2_audio, sr=self.sample_rate, hop_length=hop_length)
+                chroma1_avg = np.mean(chroma1, axis=1)
+                chroma2_avg = np.mean(chroma2, axis=1)
+                # Normalize
+                chroma1_avg = chroma1_avg / (np.linalg.norm(chroma1_avg) + 1e-6)
+                chroma2_avg = chroma2_avg / (np.linalg.norm(chroma2_avg) + 1e-6)
+                chroma_similarity = float(np.dot(chroma1_avg, chroma2_avg))
+                
+                # MFCC (timbre)
+                mfcc1 = librosa.feature.mfcc(y=s1_audio, sr=self.sample_rate, n_mfcc=13, hop_length=hop_length)
+                mfcc2 = librosa.feature.mfcc(y=s2_audio, sr=self.sample_rate, n_mfcc=13, hop_length=hop_length)
+                mfcc1_avg = np.mean(mfcc1, axis=1)
+                mfcc2_avg = np.mean(mfcc2, axis=1)
+                # Normalize
+                mfcc1_avg = mfcc1_avg / (np.linalg.norm(mfcc1_avg) + 1e-6)
+                mfcc2_avg = mfcc2_avg / (np.linalg.norm(mfcc2_avg) + 1e-6)
+                timbre_similarity = float(np.dot(mfcc1_avg, mfcc2_avg))
+                
+                # Brightness (spectral centroid)
+                bright1 = float(np.mean(librosa.feature.spectral_centroid(y=s1_audio, sr=self.sample_rate, hop_length=hop_length)))
+                bright2 = float(np.mean(librosa.feature.spectral_centroid(y=s2_audio, sr=self.sample_rate, hop_length=hop_length)))
+                brightness_change = bright2 - bright1
+                
+                pattern = TransitionPattern(
+                    from_label=s1.label,
+                    to_label=s2.label,
+                    energy_ratio=energy_ratio,
+                    chroma_similarity=chroma_similarity,
+                    timbre_similarity=timbre_similarity,
+                    brightness_change=brightness_change,
+                    tempo_ratio=1.0,  # Could detect local tempo changes
+                    transition_duration=transition_window * 2
+                )
+                patterns.append(pattern)
+                
+            except Exception as e:
+                print(f"      ⚠ Error extracting transition {s1.label}→{s2.label}: {e}")
+                continue
+        
+        return patterns
     
     def _detect_key(self, audio_data: np.ndarray) -> str:
         """Detect musical key."""
@@ -289,6 +411,17 @@ class SongTrainer:
             for label, durations in section_durations.items()
         }
         
+        # Compute detailed section timing stats (NEW)
+        section_timing = {}
+        for label, durations in section_durations.items():
+            section_timing[label] = {
+                "mean": float(np.mean(durations)),
+                "std": float(np.std(durations)) if len(durations) > 1 else 5.0,
+                "min": float(min(durations)),
+                "max": float(max(durations)),
+                "count": len(durations)
+            }
+        
         section_ratios = {
             label: float(np.mean(ratios))
             for label, ratios in section_ratios_all.items()
@@ -320,6 +453,10 @@ class SongTrainer:
                 counts[t] = counts.get(t, 0) + 1
             preferred_transitions[label] = sorted(counts.keys(), key=lambda x: counts[x], reverse=True)
         
+        # Aggregate learned transition patterns (NEW)
+        transition_patterns, typical_energy_jumps, typical_chroma, typical_timbre = \
+            self._aggregate_transition_patterns(profiles)
+        
         return StyleProfile(
             name=name,
             num_songs=len(profiles),
@@ -333,8 +470,62 @@ class SongTrainer:
             target_energy_curve=target_energy_curve,
             energy_variance_range=energy_variance_range,
             section_ratios=section_ratios,
-            preferred_transitions=preferred_transitions
+            preferred_transitions=preferred_transitions,
+            transition_patterns=transition_patterns,
+            typical_energy_jumps=typical_energy_jumps,
+            typical_chroma_continuity=typical_chroma,
+            typical_timbre_continuity=typical_timbre,
+            section_timing=section_timing
         )
+    
+    def _aggregate_transition_patterns(
+        self, 
+        profiles: List[SongProfile]
+    ) -> Tuple[Dict[str, Dict[str, float]], List[float], float, float]:
+        """
+        Aggregate transition patterns from all song profiles into style-level patterns.
+        
+        Returns:
+            - transition_patterns: Dict mapping "label1_to_label2" -> {avg features}
+            - typical_energy_jumps: List of all energy ratios (for distribution)
+            - typical_chroma_continuity: Average chroma similarity across all transitions
+            - typical_timbre_continuity: Average timbre similarity across all transitions
+        """
+        # Collect all transitions by type
+        transitions_by_type: Dict[str, List[TransitionPattern]] = {}
+        all_energy_ratios = []
+        all_chroma_sims = []
+        all_timbre_sims = []
+        
+        for profile in profiles:
+            for pattern in profile.transition_patterns:
+                key = f"{pattern.from_label}_to_{pattern.to_label}"
+                if key not in transitions_by_type:
+                    transitions_by_type[key] = []
+                transitions_by_type[key].append(pattern)
+                
+                all_energy_ratios.append(pattern.energy_ratio)
+                all_chroma_sims.append(pattern.chroma_similarity)
+                all_timbre_sims.append(pattern.timbre_similarity)
+        
+        # Aggregate into averages per transition type
+        transition_patterns: Dict[str, Dict[str, float]] = {}
+        for key, patterns in transitions_by_type.items():
+            transition_patterns[key] = {
+                "energy_ratio_mean": float(np.mean([p.energy_ratio for p in patterns])),
+                "energy_ratio_std": float(np.std([p.energy_ratio for p in patterns])),
+                "chroma_similarity": float(np.mean([p.chroma_similarity for p in patterns])),
+                "timbre_similarity": float(np.mean([p.timbre_similarity for p in patterns])),
+                "brightness_change": float(np.mean([p.brightness_change for p in patterns])),
+                "count": len(patterns)
+            }
+        
+        # Global statistics
+        typical_energy_jumps = all_energy_ratios if all_energy_ratios else [1.0]
+        typical_chroma = float(np.mean(all_chroma_sims)) if all_chroma_sims else 0.5
+        typical_timbre = float(np.mean(all_timbre_sims)) if all_timbre_sims else 0.5
+        
+        return transition_patterns, typical_energy_jumps, typical_chroma, typical_timbre
     
     def save_style(self, style_name: str, filepath: Optional[str] = None):
         """Save a trained style to disk."""
@@ -403,6 +594,43 @@ class SongTrainer:
             f"Energy curve: {'↗' if sp.target_energy_curve[5] > sp.target_energy_curve[0] else '↘'}"
             f" (builds {'up' if sp.target_energy_curve[5] > sp.target_energy_curve[2] else 'down'})"
         ])
+        
+        # Add transition pattern info (NEW)
+        if sp.transition_patterns:
+            lines.extend([
+                f"",
+                f"Learned transition patterns: {len(sp.transition_patterns)}"
+            ])
+            # Show top patterns by frequency
+            sorted_patterns = sorted(
+                sp.transition_patterns.items(), 
+                key=lambda x: x[1].get("count", 0), 
+                reverse=True
+            )[:5]
+            for key, data in sorted_patterns:
+                from_label, to_label = key.replace("_to_", " → ").split(" → ")
+                energy_change = "↗" if data.get("energy_ratio_mean", 1.0) > 1.1 else \
+                               ("↘" if data.get("energy_ratio_mean", 1.0) < 0.9 else "→")
+                chroma_sim = data.get("chroma_similarity", 0.5)
+                lines.append(f"  {from_label} → {to_label}: {energy_change} (harmonic: {chroma_sim:.2f})")
+            
+            lines.extend([
+                f"",
+                f"Typical continuity:",
+                f"  Harmonic: {sp.typical_chroma_continuity:.2f}",
+                f"  Timbral: {sp.typical_timbre_continuity:.2f}"
+            ])
+        
+        # Show section timing (NEW)
+        if hasattr(sp, 'section_timing') and sp.section_timing:
+            lines.extend([
+                f"",
+                f"Learned section timing:"
+            ])
+            for label, timing in sorted(sp.section_timing.items(), key=lambda x: x[1].get("mean", 0), reverse=True):
+                mean_dur = timing.get("mean", 0)
+                std_dur = timing.get("std", 0)
+                lines.append(f"  {label}: {mean_dur:.0f}s ± {std_dur:.0f}s")
         
         return "\n".join(lines)
 

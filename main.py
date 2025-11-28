@@ -25,9 +25,9 @@ def main():
         "-t",
         "--template",
         type=str,
-        default="auto",
-        choices=["auto", "content", "pop", "edm", "rock", "doom", "stoner", "simple", "minimal"],
-        help="Song structure template (default: auto, 'content' uses best parts of recording)",
+        default="medium",
+        choices=["short", "medium", "long", "full", "content"],
+        help="Arrangement length: short (~3min), medium (~5min), long (~8min), full (all good material), content (detected sections as-is)",
     )
     parser.add_argument(
         "--no-arrange",
@@ -40,10 +40,22 @@ def main():
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose output"
     )
+    parser.add_argument(
+        "-s", "--style", type=str, default=None,
+        help="Trained style profile to use for arrangement (e.g., 'doom')"
+    )
 
     args = parser.parse_args()
 
     editor = AIEditor()
+    
+    # Load style profile if specified
+    if args.style:
+        if editor.load_style(args.style):
+            print(f"🎨 Using trained style: {args.style}")
+        else:
+            print(f"⚠ Style '{args.style}' not found, using default")
+    
     input_path = Path(args.input)
 
     if args.batch:

@@ -9,6 +9,7 @@ from ..audio.processor import AudioProcessor
 from ..audio.analyzer import AudioAnalyzer
 from ..audio.effects import AudioEffects
 from .arranger import SongArranger, Arrangement, Section
+from .trainer import SongTrainer, StyleProfile
 
 
 class EditDecision:
@@ -50,9 +51,29 @@ class AIEditor:
         self.analyzer = AudioAnalyzer(sample_rate)
         self.effects = AudioEffects(sample_rate)
         self.arranger = SongArranger(sample_rate)
+        self.trainer = SongTrainer(sample_rate)
         self.edit_log: List[EditDecision] = []
         self.arrangement: Optional[Arrangement] = None
         self.detected_sections: List[Section] = []
+        self.style_profile: Optional[StyleProfile] = None
+    
+    def load_style(self, style_name: str) -> bool:
+        """
+        Load a trained style profile to use for arrangements.
+        
+        Args:
+            style_name: Name of the style to load.
+            
+        Returns:
+            True if style was loaded successfully.
+        """
+        try:
+            self.trainer.load_style(style_name)
+            self.style_profile = self.trainer.style_profiles.get(style_name)
+            return self.style_profile is not None
+        except Exception as e:
+            print(f"⚠ Could not load style '{style_name}': {e}")
+            return False
 
     def analyze_recording(self, audio_data: np.ndarray) -> Dict[str, Any]:
         """
@@ -287,9 +308,17 @@ class AIEditor:
         # PHASE 1: Song arrangement (if enabled)
         if arrange:
             print("\n🎼 Analyzing song structure...")
+            
+            # Use style profile if loaded and applicable
+            style_to_use = None
+            if self.style_profile and arrangement_template in ["doom", "stoner"]:
+                print(f"   Using learned style: {self.style_profile.name}")
+                style_to_use = self.style_profile
+            
             arranged_audio, arrangement, sections = self.arranger.auto_arrange(
                 audio_data, 
-                template=arrangement_template
+                template=arrangement_template,
+                style_profile=style_to_use
             )
             self.arrangement = arrangement
             self.detected_sections = sections

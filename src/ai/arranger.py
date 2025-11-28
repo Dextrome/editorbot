@@ -1,9 +1,13 @@
 """AI-powered song arranger that creates coherent song structures."""
 
+from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 import librosa
+
+if TYPE_CHECKING:
+    from .trainer import StyleProfile
 
 
 @dataclass
@@ -63,16 +67,14 @@ class SongArranger:
         self._tempo = None  # Cached tempo
         self._bar_times = None  # Cached bar (downbeat) times
         
-        # Common song structure templates
+        # Song structure templates
+        # All now use simpler section-level arrangement for coherence
         self.templates = {
-            "pop": ["intro", "verse", "chorus", "verse", "chorus", "bridge", "chorus", "outro"],
-            "edm": ["intro", "buildup", "drop", "breakdown", "buildup", "drop", "outro"],
-            "rock": ["intro", "verse", "chorus", "verse", "chorus", "solo", "chorus", "outro"],
-            "simple": ["intro", "verse", "chorus", "verse", "chorus", "outro"],
-            "minimal": ["intro", "main", "main", "outro"],
-            "doom": ["intro", "verse", "verse", "chorus", "verse", "chorus", "breakdown", "verse", "outro"],
-            "stoner": ["intro", "verse", "chorus", "breakdown", "verse", "chorus", "chorus", "outro"],
-            "content": None,  # Will use actual detected sections
+            "short": {"target_minutes": 3, "min_sections": 3, "max_sections": 5},
+            "medium": {"target_minutes": 5, "min_sections": 4, "max_sections": 7},
+            "long": {"target_minutes": 8, "min_sections": 5, "max_sections": 10},
+            "full": {"target_minutes": None, "min_sections": None, "max_sections": None},  # Use all good material
+            "content": None,  # Legacy: use actual detected sections as-is
         }
     
     def detect_beat_grid(self, audio_data: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -496,7 +498,8 @@ class SongArranger:
         audio_data: np.ndarray,
         sections: List[Section],
         template: str = "simple",
-        target_duration: Optional[float] = None
+        target_duration: Optional[float] = None,
+        style_profile: StyleProfile = None
     ) -> Arrangement:
         """
         Create a song arrangement from detected sections.
@@ -506,21 +509,33 @@ class SongArranger:
             sections: Detected sections.
             template: Song structure template to follow ("content" uses detected sections).
             target_duration: Target duration in seconds (None = auto).
+            style_profile: Optional learned style profile for transition scoring.
             
         Returns:
             Arrangement plan.
         """
-        # "content" mode: use the best sections from the actual recording
-        if template == "content" or self.templates.get(template) is None:
+        # Get template settings
+        template_config = self.templates.get(template, self.templates["medium"])
+        
+        # "content" mode: use the best sections from the actual recording (legacy)
+        if template == "content" or template_config is None:
             return self._create_content_based_arrangement(
                 audio_data, sections, target_duration
             )
         
-        # Doom/stoner specific arrangement
-        if template in ["doom", "stoner"]:
-            return self.create_doom_arrangement(audio_data, sections, target_duration)
+        # All templates now use simpler section-level arrangement for coherence
+        # Template config determines target length and section count
+        if target_duration is None and template_config.get("target_minutes"):
+            target_duration = template_config["target_minutes"] * 60
         
-        structure = self.templates.get(template, self.templates["simple"])
+        return self.create_simple_arrangement(
+            audio_data, sections, target_duration, style_profile,
+            min_sections=template_config.get("min_sections"),
+            max_sections=template_config.get("max_sections")
+        )
+        
+        # Legacy code below - keeping for reference but not used
+        structure = self.templates.get(template, self.templates["medium"])
         
         # Group similar sections
         section_groups = self.find_similar_sections(audio_data, sections)
@@ -851,11 +866,24 @@ class SongArranger:
         from_phrase: Phrase,
         to_phrase: Phrase,
         features: Dict = None,
-        locality_weight: float = 0.3
+        locality_weight: float = 0.3,
+        style_profile: 'StyleProfile' = None,
+        from_section: Section = None,
+        to_section: Section = None
     ) -> float:
         """
         Score how well two phrases flow together.
         Optimized for musical coherence with locality bias.
+        
+        Args:
+            audio_data: The audio data
+            from_phrase: Source phrase
+            to_phrase: Target phrase
+            features: Precomputed phrase features
+            locality_weight: Weight for locality bias (default 0.3)
+            style_profile: Optional learned style profile with transition patterns
+            from_section: Optional section that from_phrase belongs to
+            to_section: Optional section that to_phrase belongs to
         """
         score = 0.0
         
@@ -877,19 +905,44 @@ class SongArranger:
             if f_from["section_id"] == f_to["section_id"]:
                 score += 0.15
             
-            # 3. HARMONIC CONTINUITY (20%) - similar key/chords
+            # Compute actual transition characteristics
             chroma_sim = np.dot(f_from["chroma"], f_to["chroma"])
-            score += max(0, chroma_sim) * 0.20
-            
-            # 4. TIMBRAL CONTINUITY (15%) - similar instrument/tone
             timbre_sim = np.dot(f_from["timbre"], f_to["timbre"])
-            score += max(0, timbre_sim) * 0.15
+            energy_ratio = f_to["energy"] / max(f_from["energy"], 0.01)
             
-            # 5. ENERGY CONTINUITY (10%) - smooth energy transitions
+            # If we have a learned style profile, score against learned patterns
+            if style_profile is not None and from_section and to_section:
+                style_bonus = self._score_against_style(
+                    style_profile,
+                    from_section.label,
+                    to_section.label,
+                    energy_ratio,
+                    chroma_sim,
+                    timbre_sim
+                )
+                # Style conformance bonus - 30% weight (increased from 20%)
+                score += style_bonus * 0.30
+                
+                # Reduce other weights to make room for increased style influence
+                chroma_weight = 0.12
+                timbre_weight = 0.08
+                energy_weight = 0.05
+            else:
+                chroma_weight = 0.20
+                timbre_weight = 0.15
+                energy_weight = 0.10
+            
+            # 3. HARMONIC CONTINUITY - similar key/chords
+            score += max(0, chroma_sim) * chroma_weight
+            
+            # 4. TIMBRAL CONTINUITY - similar instrument/tone
+            score += max(0, timbre_sim) * timbre_weight
+            
+            # 5. ENERGY CONTINUITY - smooth energy transitions
             energy_diff = abs(f_from["energy"] - f_to["energy"])
             max_energy = max(f_from["energy"], f_to["energy"], 0.01)
             energy_score = 1.0 - min(energy_diff / max_energy, 1.0)
-            score += energy_score * 0.10
+            score += energy_score * energy_weight
         else:
             # Fallback to basic scoring
             score += 0.3  # Base score
@@ -901,6 +954,71 @@ class SongArranger:
         # 7. NOT SAME PHRASE (5%) - avoid exact repetition
         if from_phrase.start_time != to_phrase.start_time:
             score += 0.05
+        
+        return score
+    
+    def _score_against_style(
+        self,
+        style_profile: 'StyleProfile',
+        from_label: str,
+        to_label: str,
+        energy_ratio: float,
+        chroma_sim: float,
+        timbre_sim: float
+    ) -> float:
+        """
+        Score a transition against learned style patterns.
+        
+        Returns a score 0-1 indicating how well this transition matches 
+        the learned patterns from reference songs.
+        """
+        score = 0.0
+        
+        # Look for matching transition pattern
+        transition_key = f"{from_label}_to_{to_label}"
+        
+        if hasattr(style_profile, 'transition_patterns') and style_profile.transition_patterns:
+            if transition_key in style_profile.transition_patterns:
+                pattern = style_profile.transition_patterns[transition_key]
+                
+                # Score energy ratio match (how close to learned pattern)
+                learned_ratio = pattern.get("energy_ratio_mean", 1.0)
+                learned_std = pattern.get("energy_ratio_std", 0.3)
+                energy_diff = abs(energy_ratio - learned_ratio)
+                # Score higher if within 1 std deviation
+                if learned_std > 0:
+                    energy_match = max(0, 1.0 - (energy_diff / (learned_std * 2)))
+                else:
+                    energy_match = 1.0 if energy_diff < 0.2 else 0.5
+                score += energy_match * 0.4
+                
+                # Score chroma similarity match
+                learned_chroma = pattern.get("chroma_similarity", 0.5)
+                chroma_diff = abs(chroma_sim - learned_chroma)
+                chroma_match = max(0, 1.0 - chroma_diff)
+                score += chroma_match * 0.3
+                
+                # Score timbre similarity match
+                learned_timbre = pattern.get("timbre_similarity", 0.5)
+                timbre_diff = abs(timbre_sim - learned_timbre)
+                timbre_match = max(0, 1.0 - timbre_diff)
+                score += timbre_match * 0.3
+                
+            else:
+                # No specific pattern learned, use general style metrics
+                if hasattr(style_profile, 'typical_chroma_continuity'):
+                    # Reward transitions that match typical continuity level
+                    target_chroma = style_profile.typical_chroma_continuity
+                    chroma_match = max(0, 1.0 - abs(chroma_sim - target_chroma))
+                    score += chroma_match * 0.5
+                
+                if hasattr(style_profile, 'typical_timbre_continuity'):
+                    target_timbre = style_profile.typical_timbre_continuity
+                    timbre_match = max(0, 1.0 - abs(timbre_sim - target_timbre))
+                    score += timbre_match * 0.5
+        else:
+            # No transition patterns available, return neutral score
+            score = 0.5
         
         return score
     
@@ -1006,11 +1124,443 @@ class SongArranger:
         
         return groups
     
+    def create_simple_arrangement(
+        self,
+        audio_data: np.ndarray,
+        sections: List[Section],
+        target_duration: Optional[float] = None,
+        style_profile: StyleProfile = None,
+        min_sections: Optional[int] = None,
+        max_sections: Optional[int] = None
+    ) -> Arrangement:
+        """
+        Create a smart arrangement by scoring sections and keeping the best material.
+        
+        This approach:
+        1. Scores every section for quality (tightness, energy, interest)
+        2. Preserves original section order (natural flow of the jam)
+        3. Removes truly weak sections (significantly below average)
+        4. Only trims further if there's a big gap between good and mediocre content
+        
+        Key insight: Don't try to "rearrange" - just trim the fat and keep the good stuff
+        in its original order. If the whole jam is solid, keep most of it!
+        
+        Args:
+            audio_data: Raw audio data
+            sections: Detected sections
+            target_duration: Target output duration in seconds (flexible)
+            style_profile: Optional learned style (not used currently)
+            min_sections: Minimum number of sections to include
+            max_sections: Maximum number of sections to include
+        """
+        if not sections:
+            return Arrangement(sections=[], total_duration=0, structure=[])
+        
+        total_duration_available = sum(s.duration for s in sections)
+        
+        # If no target specified, keep all good material (just trim the fat)
+        if target_duration is None:
+            target_duration = total_duration_available  # No hard limit
+            trim_to_target = False
+            print(f"   Quality-based trimming (keeping all good material)...")
+        else:
+            trim_to_target = True
+            print(f"   Quality-based trimming (preserving natural flow)...")
+        
+        print(f"   Target: ~{target_duration:.0f}s from {total_duration_available:.0f}s available")
+        
+        # Step 1: Score every section for quality
+        scored_sections = []
+        for section in sections:
+            quality = self._score_section_deep(audio_data, section)
+            scored_sections.append((section, quality))
+        
+        # Show quality distribution
+        qualities = [q for _, q in scored_sections]
+        avg_quality = np.mean(qualities)
+        quality_range = max(qualities) - min(qualities)
+        print(f"   Quality: min={min(qualities):.1f}, max={max(qualities):.1f}, avg={avg_quality:.1f}, range={quality_range:.1f}")
+        
+        # Step 2: Decide how aggressive to trim based on quality distribution
+        # If quality is fairly uniform, don't trim much - everything is similarly good
+        # Only trim if there's a clear gap between good and weak content
+        
+        # Check if there's a clear quality gap
+        sorted_qualities = sorted(qualities)
+        has_weak_outliers = False
+        if len(sorted_qualities) >= 3:
+            # Check if lowest sections are significantly worse (>15 points below median)
+            median_q = np.median(sorted_qualities)
+            if sorted_qualities[0] < median_q - 15:
+                has_weak_outliers = True
+                quality_threshold = median_q - 15
+                print(f"   Found weak outliers below {quality_threshold:.1f}")
+        
+        # Step 3: Only remove truly weak sections
+        good_sections = []
+        for section, quality in scored_sections:
+            if has_weak_outliers and quality < quality_threshold:
+                print(f"   ✗ Removing weak section {section.start_time:.0f}s-{section.end_time:.0f}s (quality={quality:.1f})")
+            else:
+                good_sections.append((section, quality))
+        
+        print(f"   Keeping {len(good_sections)} of {len(scored_sections)} sections")
+        
+        # Step 4: Duration trimming - only if we have a target and significantly over it
+        current_duration = sum(s.duration for s, _ in good_sections)
+        
+        if trim_to_target:
+            overshoot_factor = 1.3  # Allow 30% overshoot before trimming
+            min_keep = 3  # Keep at least 3 sections
+            
+            while current_duration > target_duration * overshoot_factor and len(good_sections) > min_keep:
+                # Find lowest quality section that's not first or last
+                min_idx = None
+                min_quality = float('inf')
+                for i in range(1, len(good_sections) - 1):
+                    if good_sections[i][1] < min_quality:
+                        min_quality = good_sections[i][1]
+                        min_idx = i
+                
+                if min_idx is None:
+                    break
+                    
+                removed = good_sections.pop(min_idx)
+                current_duration -= removed[0].duration
+                print(f"   ✗ Trimming {removed[0].start_time:.0f}s-{removed[0].end_time:.0f}s to reduce length (quality={removed[1]:.1f})")
+        
+        # Step 5: Build final arrangement keeping original order
+        arrangement_sections = []
+        arr_time = 0.0
+        
+        # Get energy distribution for labeling
+        energies = [s.energy for s, _ in good_sections]
+        energy_med = np.median(energies) if energies else 0.5
+        
+        for i, (section, quality) in enumerate(good_sections):
+            # Assign labels based on position and energy
+            if i == 0:
+                label = "intro"
+            elif i == len(good_sections) - 1:
+                label = "outro"
+            elif section.energy > energy_med * 1.2:
+                label = "riff"
+            elif section.energy < energy_med * 0.8:
+                label = "breakdown"
+            else:
+                label = "verse"
+            
+            section_dur = section.duration
+            
+            new_section = Section(
+                start_time=section.start_time,
+                end_time=section.end_time,
+                label=label,
+                energy=section.energy,
+                features=section.features
+            )
+            
+            arrangement_sections.append((new_section, arr_time, arr_time + section_dur))
+            arr_time += section_dur
+        
+        # Show what we kept
+        print(f"   Final: {len(arrangement_sections)} sections, {arr_time:.0f}s")
+        kept_times = [f"{s.start_time:.0f}-{s.end_time:.0f}s" for s, _, _ in arrangement_sections]
+        print(f"   Keeping: {', '.join(kept_times)}")
+        
+        return Arrangement(
+            sections=arrangement_sections,
+            total_duration=arr_time,
+            structure=[s[0].label for s in arrangement_sections]
+        )
+    
+    def _score_section_deep(self, audio_data: np.ndarray, section: Section) -> float:
+        """
+        Deep quality scoring for a section - tries to find the "good parts".
+        
+        Scoring philosophy: A good section has:
+        - Clear rhythmic pulse (locked in groove, not sloppy)
+        - Musical structure (repeating motifs, not random noodling)
+        - Appropriate dynamics (not flat, not chaotic)
+        - Tonal clarity (in key, not dissonant mess)
+        
+        Returns score 0-100, aiming for more spread between good/bad sections.
+        """
+        start_sample = int(section.start_time * self.sample_rate)
+        end_sample = int(section.end_time * self.sample_rate)
+        segment = audio_data[start_sample:end_sample]
+        
+        if len(segment) < self.sample_rate:
+            return 0.0
+        
+        score = 0.0
+        penalties = []
+        bonuses = []
+        
+        # === 1. RHYTHMIC TIGHTNESS (0-25 points) ===
+        # Good sections have consistent beat strength, sloppy ones don't
+        try:
+            hop_length = 512
+            onset_env = librosa.onset.onset_strength(y=segment, sr=self.sample_rate, hop_length=hop_length)
+            
+            # Detect tempo and beats
+            tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=self.sample_rate, hop_length=hop_length)
+            
+            if len(beats) > 4:
+                # Measure beat regularity - consistent time between beats = tight
+                beat_times = librosa.frames_to_time(beats, sr=self.sample_rate, hop_length=hop_length)
+                beat_intervals = np.diff(beat_times)
+                
+                if len(beat_intervals) > 2:
+                    interval_variance = np.std(beat_intervals) / (np.mean(beat_intervals) + 1e-6)
+                    # Lower variance = more locked in
+                    if interval_variance < 0.1:
+                        score += 25
+                        bonuses.append("tight groove")
+                    elif interval_variance < 0.2:
+                        score += 18
+                    elif interval_variance < 0.3:
+                        score += 12
+                    else:
+                        score += 5
+                        penalties.append("sloppy timing")
+                else:
+                    score += 10  # Not enough beats to judge
+            else:
+                score += 5  # Very few beats detected
+                penalties.append("weak rhythm")
+        except:
+            score += 10
+        
+        # === 2. MUSICAL STRUCTURE / REPETITION (0-25 points) ===
+        # Good sections have repeating motifs, bad ones are random noodling
+        try:
+            hop_length = max(512, len(segment) // 200)
+            chroma = librosa.feature.chroma_cqt(y=segment, sr=self.sample_rate, hop_length=hop_length)
+            
+            # Self-similarity: does the section repeat itself?
+            # Compare first half to second half
+            mid = chroma.shape[1] // 2
+            if mid > 10:
+                first_half = np.mean(chroma[:, :mid], axis=1)
+                second_half = np.mean(chroma[:, mid:], axis=1)
+                
+                # Cosine similarity between halves
+                similarity = np.dot(first_half, second_half) / (
+                    np.linalg.norm(first_half) * np.linalg.norm(second_half) + 1e-6
+                )
+                
+                if similarity > 0.9:
+                    score += 25
+                    bonuses.append("strong motif")
+                elif similarity > 0.8:
+                    score += 20
+                elif similarity > 0.7:
+                    score += 15
+                elif similarity > 0.5:
+                    score += 10
+                else:
+                    score += 5
+                    penalties.append("no clear motif")
+            else:
+                score += 12
+        except:
+            score += 12
+        
+        # === 3. DYNAMIC RANGE (0-15 points) ===
+        # Some dynamics are good, but steady grooves are fine too
+        hop = self.sample_rate // 8  # 125ms frames
+        frame_energies = []
+        for i in range(0, len(segment) - hop, hop):
+            frame = segment[i:i+hop]
+            frame_energies.append(np.sqrt(np.mean(frame**2)))
+        
+        if len(frame_energies) > 4:
+            energy_std = np.std(frame_energies)
+            energy_mean = np.mean(frame_energies)
+            dynamic_range = energy_std / (energy_mean + 1e-6)
+            
+            # Reward dynamics but don't heavily penalize steady playing
+            if 0.15 < dynamic_range < 0.5:
+                score += 15
+                bonuses.append("dynamic")
+            elif 0.1 < dynamic_range < 0.6:
+                score += 12
+            elif dynamic_range < 0.1:
+                score += 10  # Steady groove - not a big penalty
+            else:
+                score += 8
+                penalties.append("chaotic")
+        else:
+            score += 10
+        
+        # === 4. HARMONIC INTEREST (0-20 points) ===
+        # Reward sections with chord movement / harmonic variety
+        try:
+            hop_length = max(512, len(segment) // 100)
+            chroma = librosa.feature.chroma_cqt(y=segment, sr=self.sample_rate, hop_length=hop_length)
+            
+            # Measure harmonic movement over time (chord changes)
+            # High variance in chroma over time = interesting harmony
+            chroma_variance = np.mean(np.var(chroma, axis=1))
+            
+            if chroma_variance > 0.08:
+                score += 20
+                bonuses.append("harmonic movement")
+            elif chroma_variance > 0.05:
+                score += 16
+                bonuses.append("some harmony")
+            elif chroma_variance > 0.03:
+                score += 12
+            else:
+                score += 8  # Static harmony but not heavily penalized
+        except:
+            score += 10
+        
+        # === 5. ENERGY LEVEL (0-10 points) ===
+        # Penalize very quiet sections (probably pauses/noodling)
+        rms = np.sqrt(np.mean(segment**2))
+        if rms > 0.05:
+            score += 10
+        elif rms > 0.02:
+            score += 7
+        elif rms > 0.01:
+            score += 4
+        else:
+            score += 0
+            penalties.append("too quiet")
+        
+        # === 6. NO CLIPPING PENALTY (0-5 points) ===
+        clipping_ratio = np.sum(np.abs(segment) > 0.98) / len(segment)
+        if clipping_ratio < 0.001:
+            score += 5
+        elif clipping_ratio < 0.01:
+            score += 3
+        else:
+            score += 0
+            penalties.append("clipping")
+        
+        # Debug output for tuning (uncomment to see scoring details)
+        # print(f"      {section.start_time:.0f}s-{section.end_time:.0f}s: {score:.0f} pts | +{bonuses} -{penalties}")
+        
+        return score
+    
+    def _find_repeated_loops(
+        self, 
+        audio_data: np.ndarray, 
+        sections: List[Section],
+        similarity_threshold: float = 0.80
+    ) -> List[List[Section]]:
+        """
+        Find sections that are actually repeated (same riff played multiple times).
+        Returns groups of similar sections.
+        """
+        if not sections:
+            return []
+        
+        # Compute fingerprint for each section
+        fingerprints = []
+        for section in sections:
+            start_sample = int(section.start_time * self.sample_rate)
+            end_sample = int(section.end_time * self.sample_rate)
+            segment = audio_data[start_sample:end_sample]
+            
+            if len(segment) < self.sample_rate:  # Skip very short sections
+                fingerprints.append(None)
+                continue
+            
+            # Use chroma (harmonic content) + MFCC (timbre) for matching
+            hop_length = max(512, len(segment) // 100)
+            
+            try:
+                chroma = librosa.feature.chroma_cqt(y=segment, sr=self.sample_rate, hop_length=hop_length)
+                mfcc = librosa.feature.mfcc(y=segment, sr=self.sample_rate, n_mfcc=13, hop_length=hop_length)
+                
+                # Create compact fingerprint
+                chroma_mean = np.mean(chroma, axis=1)
+                mfcc_mean = np.mean(mfcc, axis=1)
+                fingerprint = np.concatenate([chroma_mean, mfcc_mean])
+                fingerprint = fingerprint / (np.linalg.norm(fingerprint) + 1e-6)
+                fingerprints.append(fingerprint)
+            except:
+                fingerprints.append(None)
+        
+        # Group similar sections
+        groups: List[List[Section]] = []
+        used = set()
+        
+        for i, section in enumerate(sections):
+            if i in used or fingerprints[i] is None:
+                continue
+            
+            group = [section]
+            used.add(i)
+            
+            for j, other in enumerate(sections):
+                if j in used or j <= i or fingerprints[j] is None:
+                    continue
+                
+                # Compute similarity
+                sim = np.dot(fingerprints[i], fingerprints[j])
+                
+                if sim > similarity_threshold:
+                    group.append(other)
+                    used.add(j)
+            
+            groups.append(group)
+        
+        # Sort by group size (most repeated first)
+        groups.sort(key=lambda g: len(g), reverse=True)
+        
+        return groups
+    
+    def _pick_best_section(
+        self, 
+        audio_data: np.ndarray, 
+        candidates: List[Section]
+    ) -> Section:
+        """Pick the best quality section from candidates."""
+        if not candidates:
+            raise ValueError("No candidates provided")
+        
+        if len(candidates) == 1:
+            return candidates[0]
+        
+        best_score = -1
+        best_section = candidates[0]
+        
+        for section in candidates:
+            start_sample = int(section.start_time * self.sample_rate)
+            end_sample = int(section.end_time * self.sample_rate)
+            segment = audio_data[start_sample:end_sample]
+            
+            if len(segment) < self.sample_rate * 0.5:
+                continue
+            
+            # Score based on: consistent loudness, no clipping, decent length
+            rms = librosa.feature.rms(y=segment)[0]
+            consistency = 1.0 / (np.std(rms) + 0.01)
+            
+            # Penalize clipping
+            clipping = np.sum(np.abs(segment) > 0.99) / len(segment)
+            
+            # Prefer longer sections (more material)
+            length_bonus = min(section.duration / 60, 1.0)  # Cap at 60s
+            
+            score = consistency * (1 - clipping * 10) * (0.5 + length_bonus * 0.5)
+            
+            if score > best_score:
+                best_score = score
+                best_section = section
+        
+        return best_section
+
     def create_doom_arrangement(
         self,
         audio_data: np.ndarray,
         sections: List[Section],
-        target_duration: Optional[float] = None
+        target_duration: Optional[float] = None,
+        style_profile: StyleProfile = None
     ) -> Arrangement:
         """
         Create a stoner/doom arrangement using phrase-level selection.
@@ -1019,9 +1569,16 @@ class SongArranger:
         - Harmonic/timbral similarity matching
         - Section continuity
         - Smart phrase grouping
+        - Learned transition patterns (when style_profile provided)
         
         Doom structure: long, heavy, hypnotic repetition with slow dynamics.
         Starts quiet/ambient, builds into heavy riffs.
+        
+        Args:
+            audio_data: The full audio data
+            sections: Detected sections with phrases
+            target_duration: Target duration for the arrangement
+            style_profile: Optional learned style profile for transition scoring
         """
         if not sections:
             return Arrangement(sections=[], total_duration=0, structure=[])
@@ -1094,20 +1651,40 @@ class SongArranger:
         # Select build material
         build_material = mid_groups[0] if mid_groups else primary_heavy
         
-        # Structure: use coherent groups, not random phrases
+        # Calculate phrase counts based on learned section timing (if available)
+        def get_phrase_count(section_label: str, default: int, phrase_duration: float = 26.0) -> int:
+            """Calculate number of phrases based on learned section duration."""
+            if style_profile and hasattr(style_profile, 'section_timing') and style_profile.section_timing:
+                timing = style_profile.section_timing.get(section_label)
+                if timing:
+                    target_dur = timing.get("mean", default * phrase_duration)
+                    # Calculate phrases needed for target duration
+                    return max(1, round(target_dur / phrase_duration))
+            return default
+        
+        # Estimate average phrase duration from available material
+        avg_phrase_dur = 26.0  # Default ~26s for 8 bars at 73 BPM
+        if all_phrases:
+            avg_phrase_dur = np.mean([p.duration for p, _ in all_phrases])
+        
+        # Structure: use coherent groups with learned timing
         structure_plan = [
-            ("intro", quiet_material, 2),           # 2 phrases from quiet group
-            ("build", build_material, 2),           # 2 phrases building up
-            ("riff", primary_heavy, 4),             # 4 phrases of main riff
-            ("riff", secondary_heavy, 3),           # 3 phrases of variation
-            ("breakdown", quiet_material, 2),       # Breathing room
-            ("riff", primary_heavy, 3),             # Return to main riff
-            ("outro", quiet_material, 2),           # Quiet ending
+            ("intro", quiet_material, get_phrase_count("intro", 2, avg_phrase_dur)),
+            ("build", build_material, get_phrase_count("buildup", 2, avg_phrase_dur)),
+            ("riff", primary_heavy, get_phrase_count("chorus", 4, avg_phrase_dur)),
+            ("riff", secondary_heavy, get_phrase_count("drop", 3, avg_phrase_dur)),
+            ("breakdown", quiet_material, get_phrase_count("breakdown", 2, avg_phrase_dur)),
+            ("riff", primary_heavy, get_phrase_count("chorus", 3, avg_phrase_dur)),
+            ("outro", quiet_material, get_phrase_count("outro", 2, avg_phrase_dur)),
         ]
+        
+        if style_profile and hasattr(style_profile, 'section_timing'):
+            print(f"   Using learned section timing from style")
         
         arrangement_sections = []
         current_time = 0.0
         previous_phrase = None
+        previous_section = None  # Track for style-aware transition scoring
         used_phrases = set()
         
         for phase_name, phrase_group, num_phrases in structure_plan:
@@ -1134,7 +1711,10 @@ class SongArranger:
                         flow_score = self._score_phrase_transition(
                             audio_data, previous_phrase, phrase,
                             features=phrase_features,
-                            locality_weight=0.35  # Strong locality preference
+                            locality_weight=0.35,  # Strong locality preference
+                            style_profile=style_profile,
+                            from_section=previous_section,
+                            to_section=section
                         ) - reuse_penalty
                         
                         scored.append((phrase, section, flow_score))
@@ -1178,6 +1758,7 @@ class SongArranger:
                 
                 current_time += phrase_duration
                 previous_phrase = selected_phrase
+                previous_section = selected_section  # Track for style-aware scoring
                 phrases_added += 1
         
         return Arrangement(
@@ -1578,16 +2159,18 @@ class SongArranger:
     def auto_arrange(
         self,
         audio_data: np.ndarray,
-        template: str = "auto",
-        target_duration: Optional[float] = None
+        template: str = "medium",
+        target_duration: Optional[float] = None,
+        style_profile: StyleProfile = None
     ) -> Tuple[np.ndarray, Arrangement, List[Section]]:
         """
         Automatically analyze and arrange audio into a song structure.
         
         Args:
             audio_data: Raw audio data.
-            template: Structure template ("auto", "pop", "edm", "rock", "simple", "minimal").
-            target_duration: Target duration in seconds.
+            template: Arrangement length - "short" (~3min), "medium" (~5min), "long" (~8min), "full" (all material).
+            target_duration: Target duration in seconds (overrides template).
+            style_profile: Optional learned style profile for transition scoring.
             
         Returns:
             Tuple of (arranged_audio, arrangement, detected_sections).
@@ -1595,17 +2178,13 @@ class SongArranger:
         # Analyze sections
         sections = self.analyze_sections(audio_data)
         
-        # Auto-detect best template
-        if template == "auto":
-            template = self._detect_best_template(sections)
-        
         # Create arrangement
         arrangement = self.create_arrangement(
-            audio_data, sections, template, target_duration
+            audio_data, sections, template, target_duration, style_profile
         )
         
-        # Use longer crossfades for doom/stoner (more hypnotic)
-        crossfade_dur = 1.5 if template in ("doom", "stoner") else 0.5
+        # Use longer crossfades for smoother transitions
+        crossfade_dur = 1.5
         
         # Render
         arranged_audio = self.render_arrangement(audio_data, arrangement, crossfade_duration=crossfade_dur)
