@@ -1,0 +1,91 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Audio files (keep samples, ignore large files)
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+!data/samples/*.wav
+
+# Model files
+*.pt
+*.pth
+*.onnx
+models/
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Output
+output/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

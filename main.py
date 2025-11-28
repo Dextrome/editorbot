@@ -1,0 +1,106 @@
+"""Main entry point for the AI Audio Editor."""
+
+import argparse
+from pathlib import Path
+
+from src.ai.editor import AIEditor
+
+
+def main():
+    """Main function to run the AI audio editor."""
+    parser = argparse.ArgumentParser(
+        description="AI Audio Editor - Transform raw recordings into polished songs"
+    )
+    parser.add_argument("input", type=str, help="Input audio file or directory")
+    parser.add_argument("-o", "--output", type=str, help="Output file or directory")
+    parser.add_argument(
+        "-p",
+        "--preset",
+        type=str,
+        default="balanced",
+        choices=["balanced", "warm", "bright", "aggressive"],
+        help="Editing preset to use (default: balanced)",
+    )
+    parser.add_argument(
+        "-t",
+        "--template",
+        type=str,
+        default="auto",
+        choices=["auto", "content", "pop", "edm", "rock", "doom", "stoner", "simple", "minimal"],
+        help="Song structure template (default: auto, 'content' uses best parts of recording)",
+    )
+    parser.add_argument(
+        "--no-arrange",
+        action="store_true",
+        help="Disable automatic song arrangement (only do cleanup edits)",
+    )
+    parser.add_argument(
+        "-b", "--batch", action="store_true", help="Process all files in input directory"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose output"
+    )
+
+    args = parser.parse_args()
+
+    editor = AIEditor()
+    input_path = Path(args.input)
+
+    if args.batch:
+        # Batch processing
+        output_dir = Path(args.output) if args.output else input_path.parent / "edited"
+        if args.verbose:
+            print(f"Batch processing files in: {input_path}")
+            print(f"Output directory: {output_dir}")
+            print(f"Using preset: {args.preset}")
+            print(f"Arrangement template: {args.template}")
+
+        results = editor.batch_process(input_path, output_dir, preset=args.preset)
+
+        success_count = sum(1 for r in results if r.get("status") == "success")
+        print(f"\nProcessed {success_count}/{len(results)} files successfully")
+
+        for result in results:
+            if result.get("status") == "error":
+                print(f"  Error processing {result['input_path']}: {result['error']}")
+    else:
+        # Single file processing
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = input_path.parent / f"{input_path.stem}_edited{input_path.suffix}"
+
+        if args.verbose:
+            print(f"Processing: {input_path}")
+            print(f"Output: {output_path}")
+            print(f"Using preset: {args.preset}")
+            print(f"Arrangement: {'disabled' if args.no_arrange else args.template}")
+
+        result = editor.process_file(
+            input_path, 
+            output_path, 
+            preset=args.preset,
+            arrange=not args.no_arrange,
+            arrangement_template=args.template
+        )
+
+        print(f"\n✅ Processing complete!")
+        print(f"Output saved to: {result['output_path']}")
+        
+        # Show edit summary
+        print(f"\n{editor.get_edit_summary()}")
+        
+        if args.verbose:
+            analysis = result["analysis"]
+            print(f"\nAnalysis:")
+            print(f"  Tempo: {analysis['tempo']:.1f} BPM")
+            print(f"  Key: {analysis['key']}")
+            print(f"  Loudness: {analysis['loudness']:.1f} dB")
+            print(f"  Duration: {analysis['duration']:.1f}s")
+            print(f"  Silence regions found: {len(analysis['silence_regions'])}")
+            print(f"  Anomalies detected: {len(analysis['anomalies'])}")
+            print(f"  Repeated sections: {len(analysis['repeated_sections'])}")
+
+
+if __name__ == "__main__":
+    main()
