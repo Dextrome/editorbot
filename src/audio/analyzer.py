@@ -54,27 +54,31 @@ class AudioAnalyzer:
         Returns:
             Dictionary of extracted features.
         """
+        # Use adaptive hop_length for long files
+        target_frames = 5000
+        hop_length = max(512, int(len(audio_data) / target_frames))
+        
         features = {}
 
         # Mel-frequency cepstral coefficients
-        features["mfcc"] = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, n_mfcc=13)
+        features["mfcc"] = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, n_mfcc=13, hop_length=hop_length)
 
         # Spectral features
         features["spectral_centroid"] = librosa.feature.spectral_centroid(
-            y=audio_data, sr=self.sample_rate
+            y=audio_data, sr=self.sample_rate, hop_length=hop_length
         )
         features["spectral_rolloff"] = librosa.feature.spectral_rolloff(
-            y=audio_data, sr=self.sample_rate
+            y=audio_data, sr=self.sample_rate, hop_length=hop_length
         )
 
         # Chroma features (pitch class)
-        features["chroma"] = librosa.feature.chroma_stft(y=audio_data, sr=self.sample_rate)
+        features["chroma"] = librosa.feature.chroma_stft(y=audio_data, sr=self.sample_rate, hop_length=hop_length)
 
         # Zero crossing rate
-        features["zcr"] = librosa.feature.zero_crossing_rate(audio_data)
+        features["zcr"] = librosa.feature.zero_crossing_rate(audio_data, hop_length=hop_length)
 
         # RMS energy
-        features["rms"] = librosa.feature.rms(y=audio_data)
+        features["rms"] = librosa.feature.rms(y=audio_data, hop_length=hop_length)
 
         return features
 
@@ -91,12 +95,16 @@ class AudioAnalyzer:
         Returns:
             Tuple of (segment_boundaries, segment_labels).
         """
+        # Use adaptive hop_length for long files
+        target_frames = 5000
+        hop_length = max(512, int(len(audio_data) / target_frames))
+        
         # Compute self-similarity matrix
-        mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate)
+        mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, hop_length=hop_length)
         
         # Use structural segmentation
         bounds = librosa.segment.agglomerative(mfcc, num_segments)
-        bound_times = librosa.frames_to_time(bounds, sr=self.sample_rate)
+        bound_times = librosa.frames_to_time(bounds, sr=self.sample_rate, hop_length=hop_length)
         
         # Generate simple labels
         labels = np.arange(len(bounds))
@@ -246,8 +254,14 @@ class AudioAnalyzer:
         Returns:
             List of (section1_start, section1_end, section2_start, section2_end) for similar sections.
         """
+        # Use larger hop length for long files to avoid memory explosion
+        # Target max ~5000 frames to keep matrix under ~200MB
+        duration = len(audio_data) / self.sample_rate
+        target_frames = 5000
+        hop_length = max(512, int(len(audio_data) / target_frames))
+        
         # Compute features for comparison
-        mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, n_mfcc=13)
+        mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, n_mfcc=13, hop_length=hop_length)
         
         # Compute self-similarity matrix
         sim_matrix = librosa.segment.recurrence_matrix(
@@ -256,17 +270,17 @@ class AudioAnalyzer:
         
         # Find repeated sections using diagonal matching
         repeated = []
-        window_frames = int(2.0 * self.sample_rate / 512)  # ~2 second windows
+        window_frames = int(2.0 * self.sample_rate / hop_length)  # ~2 second windows
         
         for i in range(0, sim_matrix.shape[0] - window_frames, window_frames // 2):
             for j in range(i + window_frames, sim_matrix.shape[1] - window_frames, window_frames // 2):
                 # Check diagonal similarity
                 diag_sim = np.mean([sim_matrix[i + k, j + k] for k in range(window_frames)])
                 if diag_sim > min_similarity:
-                    t1_start = librosa.frames_to_time(i, sr=self.sample_rate)
-                    t1_end = librosa.frames_to_time(i + window_frames, sr=self.sample_rate)
-                    t2_start = librosa.frames_to_time(j, sr=self.sample_rate)
-                    t2_end = librosa.frames_to_time(j + window_frames, sr=self.sample_rate)
+                    t1_start = librosa.frames_to_time(i, sr=self.sample_rate, hop_length=hop_length)
+                    t1_end = librosa.frames_to_time(i + window_frames, sr=self.sample_rate, hop_length=hop_length)
+                    t2_start = librosa.frames_to_time(j, sr=self.sample_rate, hop_length=hop_length)
+                    t2_end = librosa.frames_to_time(j + window_frames, sr=self.sample_rate, hop_length=hop_length)
                     repeated.append((t1_start, t1_end, t2_start, t2_end))
         
         return repeated
