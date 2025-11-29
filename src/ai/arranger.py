@@ -211,20 +211,30 @@ class SongArranger:
         idx = np.argmin(np.abs(bar_times - time))
         return float(bar_times[idx])
     
-    def analyze_sections(self, audio_data: np.ndarray) -> List[Section]:
+    def analyze_sections(
+        self, 
+        audio_data: np.ndarray,
+        min_section_duration: Optional[float] = None,
+        max_section_duration: Optional[float] = None
+    ) -> List[Section]:
         """
         Analyze audio and identify distinct sections with characteristics.
         
         Args:
             audio_data: Raw audio data.
+            min_section_duration: Minimum section duration in seconds (default: 8s).
+            max_section_duration: Maximum section duration in seconds (default: ~30s based on audio length).
             
         Returns:
             List of detected sections with labels and phrases.
-            
-        Returns:
-            List of detected sections with labels.
         """
         duration = len(audio_data) / self.sample_rate
+        
+        # Set defaults
+        if min_section_duration is None:
+            min_section_duration = 8.0
+        if max_section_duration is None:
+            max_section_duration = 30.0
         
         # Use adaptive hop_length for long files to avoid memory issues
         target_frames = 5000
@@ -240,8 +250,8 @@ class SongArranger:
         features = np.vstack([mfcc, chroma, spectral_contrast])
         
         # Detect segment boundaries using structural analysis
-        # Use fewer segments for cleaner structure (aim for ~20-30 second sections)
-        num_segments = max(4, min(12, int(duration / 25)))
+        # Number of segments based on max section duration
+        num_segments = max(4, min(20, int(duration / max_section_duration) + 1))
         
         try:
             bounds = librosa.segment.agglomerative(features, num_segments)
@@ -256,20 +266,21 @@ class SongArranger:
         if bound_times[-1] < duration - 0.1:
             bound_times = np.append(bound_times, duration)
         
-        # Merge very short segments (less than 8 seconds)
-        bound_times = self._merge_short_segments(bound_times, min_duration=8.0)
+        # Merge very short segments (using configurable min duration)
+        bound_times = self._merge_short_segments(bound_times, min_duration=min_section_duration)
         
         # Detect beat grid for phrase alignment
         tempo, beat_times, bar_times = self.detect_beat_grid(audio_data)
         
         # Snap section boundaries to nearest bar
         snapped_bounds = []
+        min_snap_duration = max(4.0, min_section_duration - 2)  # Allow slightly shorter after snapping
         for t in bound_times:
             snapped = self.snap_to_bar(t, bar_times)
             # Don't snap if it would create a very short section
-            if len(snapped_bounds) == 0 or snapped - snapped_bounds[-1] >= 6.0:
+            if len(snapped_bounds) == 0 or snapped - snapped_bounds[-1] >= min_snap_duration:
                 snapped_bounds.append(snapped)
-            elif t - snapped_bounds[-1] >= 6.0:
+            elif t - snapped_bounds[-1] >= min_snap_duration:
                 snapped_bounds.append(t)  # Keep original if snapping fails
         
         # Ensure we have end time
@@ -499,7 +510,8 @@ class SongArranger:
         sections: List[Section],
         template: str = "simple",
         target_duration: Optional[float] = None,
-        style_profile: StyleProfile = None
+        style_profile: StyleProfile = None,
+        allow_rearrange: bool = False
     ) -> Arrangement:
         """
         Create a song arrangement from detected sections.
@@ -510,6 +522,7 @@ class SongArranger:
             template: Song structure template to follow ("content" uses detected sections).
             target_duration: Target duration in seconds (None = auto).
             style_profile: Optional learned style profile for transition scoring.
+            allow_rearrange: If True, allow reordering sections for better flow.
             
         Returns:
             Arrangement plan.
@@ -531,7 +544,8 @@ class SongArranger:
         return self.create_simple_arrangement(
             audio_data, sections, target_duration, style_profile,
             min_sections=template_config.get("min_sections"),
-            max_sections=template_config.get("max_sections")
+            max_sections=template_config.get("max_sections"),
+            allow_rearrange=allow_rearrange
         )
         
         # Legacy code below - keeping for reference but not used
@@ -1131,19 +1145,17 @@ class SongArranger:
         target_duration: Optional[float] = None,
         style_profile: StyleProfile = None,
         min_sections: Optional[int] = None,
-        max_sections: Optional[int] = None
+        max_sections: Optional[int] = None,
+        allow_rearrange: bool = False
     ) -> Arrangement:
         """
         Create a smart arrangement by scoring sections and keeping the best material.
         
         This approach:
         1. Scores every section for quality (tightness, energy, interest)
-        2. Preserves original section order (natural flow of the jam)
+        2. Preserves original section order (natural flow of the jam) OR rearranges for better flow
         3. Removes truly weak sections (significantly below average)
         4. Only trims further if there's a big gap between good and mediocre content
-        
-        Key insight: Don't try to "rearrange" - just trim the fat and keep the good stuff
-        in its original order. If the whole jam is solid, keep most of it!
         
         Args:
             audio_data: Raw audio data
@@ -1152,6 +1164,7 @@ class SongArranger:
             style_profile: Optional learned style (not used currently)
             min_sections: Minimum number of sections to include
             max_sections: Maximum number of sections to include
+            allow_rearrange: If True, reorder sections for better musical flow
         """
         if not sections:
             return Arrangement(sections=[], total_duration=0, structure=[])
@@ -1229,7 +1242,12 @@ class SongArranger:
                 current_duration -= removed[0].duration
                 print(f"   ✗ Trimming {removed[0].start_time:.0f}s-{removed[0].end_time:.0f}s to reduce length (quality={removed[1]:.1f})")
         
-        # Step 5: Build final arrangement keeping original order
+        # Step 5: Optionally rearrange sections for better musical flow
+        if allow_rearrange and len(good_sections) >= 3:
+            good_sections = self._rearrange_for_flow(audio_data, good_sections)
+            print(f"   Rearranged sections for better flow")
+        
+        # Step 6: Build final arrangement
         arrangement_sections = []
         arr_time = 0.0
         
@@ -1274,6 +1292,111 @@ class SongArranger:
             structure=[s[0].label for s in arrangement_sections]
         )
     
+    def _rearrange_for_flow(
+        self, 
+        audio_data: np.ndarray, 
+        scored_sections: List[Tuple[Section, float]]
+    ) -> List[Tuple[Section, float]]:
+        """
+        Rearrange sections for better musical flow, but VERY conservatively.
+        
+        Since rearranged sections use hard cuts (crossfades between unrelated audio sounds bad),
+        we can only swap sections that are:
+        1. Originally adjacent or very close in the timeline
+        2. Have similar energy levels
+        3. Would clearly improve the arrangement
+        
+        Strategy:
+        - Keep chronological order as the base
+        - Only swap ADJACENT sections if it improves energy flow
+        - Never move sections far from their original position
+        """
+        if len(scored_sections) < 3:
+            return scored_sections
+        
+        # Analyze each section's energy
+        sections_with_features = []
+        for section, quality in scored_sections:
+            start_sample = int(section.start_time * self.sample_rate)
+            end_sample = int(section.end_time * self.sample_rate)
+            segment = audio_data[start_sample:end_sample]
+            
+            if len(segment) < self.sample_rate:
+                avg_energy = 0
+            else:
+                avg_energy = np.sqrt(np.mean(segment**2))
+            
+            sections_with_features.append({
+                'section': section,
+                'quality': quality,
+                'avg_energy': avg_energy,
+                'original_idx': len(sections_with_features)
+            })
+        
+        # Start with original chronological order
+        result = list(sections_with_features)
+        
+        # Only do ADJACENT swaps that improve energy flow
+        # Goal: energy should generally build up, not jump around randomly
+        made_swap = True
+        max_iterations = len(result)  # Prevent infinite loops
+        iterations = 0
+        
+        while made_swap and iterations < max_iterations:
+            made_swap = False
+            iterations += 1
+            
+            for i in range(len(result) - 1):
+                curr = result[i]
+                next_sec = result[i + 1]
+                
+                # Skip if this is first or last position (intro/outro should stay)
+                if i == 0 or i == len(result) - 2:
+                    continue
+                
+                # Check if swapping would improve energy flow
+                # We want energy to generally increase toward the climax (position -2)
+                curr_energy = curr['avg_energy']
+                next_energy = next_sec['avg_energy']
+                
+                # If current has MORE energy than next, and we're before the climax,
+                # consider swapping so energy builds up
+                climax_pos = len(result) - 2
+                if i < climax_pos and curr_energy > next_energy * 1.3:
+                    # Swap would put lower energy first (building up)
+                    # But only if it doesn't create too big a jump with neighbors
+                    
+                    prev_energy = result[i - 1]['avg_energy'] if i > 0 else curr_energy
+                    after_energy = result[i + 2]['avg_energy'] if i + 2 < len(result) else next_energy
+                    
+                    # Check that swap doesn't create jarring transitions
+                    # Current order: prev -> curr -> next -> after
+                    # After swap:    prev -> next -> curr -> after
+                    
+                    curr_flow_ok = True
+                    # Check prev -> next transition
+                    if prev_energy > 0 and next_energy > 0:
+                        ratio = next_energy / prev_energy
+                        if ratio < 0.4 or ratio > 2.5:
+                            curr_flow_ok = False
+                    # Check curr -> after transition  
+                    if curr_energy > 0 and after_energy > 0:
+                        ratio = after_energy / curr_energy
+                        if ratio < 0.4 or ratio > 2.5:
+                            curr_flow_ok = False
+                    
+                    if curr_flow_ok:
+                        # Do the swap
+                        result[i], result[i + 1] = result[i + 1], result[i]
+                        made_swap = True
+                        print(f"   Swapped sections at positions {i} and {i+1} for better energy flow")
+                        break  # Restart the loop after a swap
+        
+        if iterations == 1:
+            print(f"   Keeping original order (no beneficial swaps found)")
+        
+        return [(s['section'], s['quality']) for s in result]
+    
     def _score_section_deep(self, audio_data: np.ndarray, section: Section) -> float:
         """
         Deep quality scoring for a section - tries to find the "good parts".
@@ -1281,10 +1404,12 @@ class SongArranger:
         Scoring philosophy: A good section has:
         - Clear rhythmic pulse (locked in groove, not sloppy)
         - Musical structure (repeating motifs, not random noodling)
-        - Appropriate dynamics (not flat, not chaotic)
-        - Tonal clarity (in key, not dissonant mess)
+        - Peak moments / climaxes
+        - Tension and release patterns
+        - Harmonic interest (chord changes, not static)
         
         Returns score 0-100, aiming for more spread between good/bad sections.
+        CRITICAL: Use continuous scoring, not just thresholds!
         """
         start_sample = int(section.start_time * self.sample_rate)
         end_sample = int(section.end_time * self.sample_rate)
@@ -1296,152 +1421,283 @@ class SongArranger:
         score = 0.0
         penalties = []
         bonuses = []
+        metrics = {}  # Store raw metrics for debug
         
-        # === 1. RHYTHMIC TIGHTNESS (0-25 points) ===
-        # Good sections have consistent beat strength, sloppy ones don't
+        # === 1. RHYTHMIC TIGHTNESS (0-20 points) ===
+        # Use CONTINUOUS scoring based on variance
         try:
             hop_length = 512
             onset_env = librosa.onset.onset_strength(y=segment, sr=self.sample_rate, hop_length=hop_length)
-            
-            # Detect tempo and beats
             tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=self.sample_rate, hop_length=hop_length)
             
             if len(beats) > 4:
-                # Measure beat regularity - consistent time between beats = tight
                 beat_times = librosa.frames_to_time(beats, sr=self.sample_rate, hop_length=hop_length)
                 beat_intervals = np.diff(beat_times)
                 
                 if len(beat_intervals) > 2:
                     interval_variance = np.std(beat_intervals) / (np.mean(beat_intervals) + 1e-6)
-                    # Lower variance = more locked in
-                    if interval_variance < 0.1:
-                        score += 25
-                        bonuses.append("tight groove")
-                    elif interval_variance < 0.2:
-                        score += 18
-                    elif interval_variance < 0.3:
-                        score += 12
-                    else:
-                        score += 5
-                        penalties.append("sloppy timing")
+                    metrics['rhythm_var'] = interval_variance
+                    # Continuous score: lower variance = higher score
+                    # 0.05 variance = 20 pts, 0.4 variance = 0 pts
+                    rhythm_score = max(0, min(20, 20 * (1 - interval_variance / 0.4)))
+                    score += rhythm_score
+                    if interval_variance < 0.12:
+                        bonuses.append("tight")
+                    elif interval_variance > 0.25:
+                        penalties.append("sloppy")
                 else:
-                    score += 10  # Not enough beats to judge
+                    score += 10
             else:
-                score += 5  # Very few beats detected
+                score += 5
                 penalties.append("weak rhythm")
         except:
             score += 10
         
-        # === 2. MUSICAL STRUCTURE / REPETITION (0-25 points) ===
-        # Good sections have repeating motifs, bad ones are random noodling
+        # === 2. MUSICAL STRUCTURE / REPETITION (0-15 points) ===
+        # Continuous based on self-similarity
         try:
             hop_length = max(512, len(segment) // 200)
             chroma = librosa.feature.chroma_cqt(y=segment, sr=self.sample_rate, hop_length=hop_length)
             
-            # Self-similarity: does the section repeat itself?
-            # Compare first half to second half
             mid = chroma.shape[1] // 2
             if mid > 10:
                 first_half = np.mean(chroma[:, :mid], axis=1)
                 second_half = np.mean(chroma[:, mid:], axis=1)
                 
-                # Cosine similarity between halves
                 similarity = np.dot(first_half, second_half) / (
                     np.linalg.norm(first_half) * np.linalg.norm(second_half) + 1e-6
                 )
+                metrics['self_sim'] = similarity
                 
-                if similarity > 0.9:
-                    score += 25
-                    bonuses.append("strong motif")
-                elif similarity > 0.8:
-                    score += 20
-                elif similarity > 0.7:
-                    score += 15
-                elif similarity > 0.5:
-                    score += 10
-                else:
-                    score += 5
-                    penalties.append("no clear motif")
+                # Continuous: 0.6 sim = 0 pts, 0.95 sim = 15 pts
+                struct_score = max(0, min(15, 15 * (similarity - 0.6) / 0.35))
+                score += struct_score
+                if similarity > 0.92:
+                    bonuses.append("motif")
             else:
-                score += 12
+                score += 8
         except:
-            score += 12
+            score += 8
         
-        # === 3. DYNAMIC RANGE (0-15 points) ===
-        # Some dynamics are good, but steady grooves are fine too
-        hop = self.sample_rate // 8  # 125ms frames
+        # === 3. PEAK MOMENTS / CLIMAX DETECTION (0-20 points) ===
+        hop = self.sample_rate // 4
         frame_energies = []
         for i in range(0, len(segment) - hop, hop):
             frame = segment[i:i+hop]
             frame_energies.append(np.sqrt(np.mean(frame**2)))
         
-        if len(frame_energies) > 4:
-            energy_std = np.std(frame_energies)
+        if len(frame_energies) > 8:
+            frame_energies = np.array(frame_energies)
             energy_mean = np.mean(frame_energies)
-            dynamic_range = energy_std / (energy_mean + 1e-6)
+            energy_max = np.max(frame_energies)
+            energy_std = np.std(frame_energies)
             
-            # Reward dynamics but don't heavily penalize steady playing
-            if 0.15 < dynamic_range < 0.5:
-                score += 15
-                bonuses.append("dynamic")
-            elif 0.1 < dynamic_range < 0.6:
-                score += 12
-            elif dynamic_range < 0.1:
-                score += 10  # Steady groove - not a big penalty
-            else:
-                score += 8
-                penalties.append("chaotic")
+            # Peak ratio: how much does the loudest moment stand out?
+            peak_ratio = energy_max / (energy_mean + 1e-6)
+            metrics['peak_ratio'] = peak_ratio
+            
+            # Energy variance (normalized) - how much does energy vary?
+            energy_cv = energy_std / (energy_mean + 1e-6)
+            metrics['energy_cv'] = energy_cv
+            
+            # Count significant peaks
+            peaks = []
+            for i in range(1, len(frame_energies) - 1):
+                if (frame_energies[i] > frame_energies[i-1] and 
+                    frame_energies[i] > frame_energies[i+1] and
+                    frame_energies[i] > energy_mean * 1.3):
+                    peaks.append(i)
+            metrics['num_peaks'] = len(peaks)
+            
+            # Continuous scoring: peak_ratio 1.0 = 0 pts, 2.0+ = 15 pts
+            # Plus bonus for having 1-4 distinct peaks
+            peak_score = max(0, min(15, 15 * (peak_ratio - 1.0)))
+            if 1 <= len(peaks) <= 4:
+                peak_score += 5
+                bonuses.append("climax")
+            elif len(peaks) > 4:
+                peak_score += 2  # Too many peaks = chaotic
+            score += peak_score
         else:
             score += 10
         
-        # === 4. HARMONIC INTEREST (0-20 points) ===
-        # Reward sections with chord movement / harmonic variety
+        # === 4. TENSION/RELEASE PATTERN (0-15 points) ===
+        tension_score = 0
+        if len(frame_energies) > 8:
+            q_len = len(frame_energies) // 4
+            if q_len > 1:
+                q1 = np.mean(frame_energies[:q_len])
+                q2 = np.mean(frame_energies[q_len:2*q_len])
+                q3 = np.mean(frame_energies[2*q_len:3*q_len])
+                q4 = np.mean(frame_energies[3*q_len:])
+                
+                # Compute arc magnitude (how much does energy move?)
+                arc_magnitude = max(abs(q2-q1), abs(q3-q2), abs(q4-q3)) / (energy_mean + 1e-6)
+                metrics['arc_mag'] = arc_magnitude
+                
+                # Build-up: q1 < q2 < q3
+                is_buildup = q1 < q2 * 0.92 and q2 < q3 * 0.92
+                # Release: high to low
+                is_release = q1 > q2 * 1.08 and q2 > q3 * 1.08
+                # Arc: build then release
+                is_arc = q2 > q1 * 1.1 and q3 > q4 * 1.1
+                # Middle climax
+                middle_peak = max(q2, q3) > max(q1, q4) * 1.25
+                
+                # Continuous scoring based on arc magnitude
+                tension_score = min(10, arc_magnitude * 30)
+                
+                # Bonus for clear pattern
+                if is_arc or middle_peak:
+                    tension_score += 5
+                    bonuses.append("arc")
+                elif is_buildup:
+                    tension_score += 4
+                    bonuses.append("build")
+                elif is_release:
+                    tension_score += 3
+                    bonuses.append("release")
+                
+                score += min(15, tension_score)
+            else:
+                score += 5
+        else:
+            score += 5
+        
+        # === 5. HARMONIC INTEREST (0-15 points) ===
         try:
             hop_length = max(512, len(segment) // 100)
             chroma = librosa.feature.chroma_cqt(y=segment, sr=self.sample_rate, hop_length=hop_length)
             
-            # Measure harmonic movement over time (chord changes)
-            # High variance in chroma over time = interesting harmony
-            chroma_variance = np.mean(np.var(chroma, axis=1))
+            # Harmonic movement (chord changes)
+            chroma_diff = np.diff(chroma, axis=1)
+            harmonic_movement = np.mean(np.abs(chroma_diff))
+            metrics['harm_move'] = harmonic_movement
             
-            if chroma_variance > 0.08:
-                score += 20
-                bonuses.append("harmonic movement")
-            elif chroma_variance > 0.05:
-                score += 16
-                bonuses.append("some harmony")
-            elif chroma_variance > 0.03:
-                score += 12
-            else:
-                score += 8  # Static harmony but not heavily penalized
+            # Chromatic variety
+            chroma_variance = np.mean(np.var(chroma, axis=1))
+            metrics['harm_var'] = chroma_variance
+            
+            # Combined and scaled
+            # Good values: movement > 0.02, variance > 0.02
+            harm_score = min(8, harmonic_movement * 200) + min(7, chroma_variance * 150)
+            score += harm_score
+            if harmonic_movement > 0.025 and chroma_variance > 0.025:
+                bonuses.append("rich harmony")
+            elif harmonic_movement > 0.015:
+                bonuses.append("harmony")
         except:
-            score += 10
+            score += 8
         
-        # === 5. ENERGY LEVEL (0-10 points) ===
-        # Penalize very quiet sections (probably pauses/noodling)
-        rms = np.sqrt(np.mean(segment**2))
-        if rms > 0.05:
-            score += 10
-        elif rms > 0.02:
-            score += 7
-        elif rms > 0.01:
-            score += 4
-        else:
-            score += 0
-            penalties.append("too quiet")
-        
-        # === 6. NO CLIPPING PENALTY (0-5 points) ===
-        clipping_ratio = np.sum(np.abs(segment) > 0.98) / len(segment)
-        if clipping_ratio < 0.001:
+        # === 6. SPECTRAL INTEREST (0-10 points) ===
+        try:
+            spec_cent = librosa.feature.spectral_centroid(y=segment, sr=self.sample_rate)[0]
+            spec_contrast = librosa.feature.spectral_contrast(y=segment, sr=self.sample_rate)
+            
+            centroid_cv = np.std(spec_cent) / (np.mean(spec_cent) + 1e-6)
+            contrast_mean = np.mean(spec_contrast)
+            metrics['timbre_cv'] = centroid_cv
+            metrics['contrast'] = contrast_mean
+            
+            # Continuous: centroid_cv 0.1-0.4, contrast 10-25
+            timbre_score = min(5, centroid_cv * 15) + min(5, (contrast_mean - 10) / 3)
+            score += max(0, timbre_score)
+            if centroid_cv > 0.35 and contrast_mean > 22:
+                bonuses.append("timbre")
+        except:
             score += 5
-        elif clipping_ratio < 0.01:
-            score += 3
-        else:
-            score += 0
-            penalties.append("clipping")
         
-        # Debug output for tuning (uncomment to see scoring details)
-        # print(f"      {section.start_time:.0f}s-{section.end_time:.0f}s: {score:.0f} pts | +{bonuses} -{penalties}")
+        # === 7. ENERGY LEVEL (0-5 points) ===
+        rms = np.sqrt(np.mean(segment**2))
+        metrics['rms'] = rms
+        # Continuous: 0.01 = 0 pts, 0.08 = 5 pts
+        energy_score = max(0, min(5, 5 * (rms - 0.01) / 0.07))
+        score += energy_score
+        if rms < 0.015:
+            penalties.append("quiet")
+        
+        # === 8. TUNING/NOODLING DETECTION (penalty up to -30 points) ===
+        # Detect sections that sound like guitar tuning or random noodling
+        # NOTE: Can't rely on timing being sloppy - some players tune in rhythm!
+        tuning_penalty = 0
+        try:
+            # Tuning characteristics:
+            # 1. Single notes (not chords) - narrow harmonic content
+            # 2. Same pitches repeated (checking tuning)
+            # 3. Limited pitch range (not melodic playing)
+            # 4. Sparse polyphony (one note at a time)
+            
+            hop_length = 512
+            
+            # Check harmonic complexity - tuning = simple, single notes
+            chroma = librosa.feature.chroma_cqt(y=segment, sr=self.sample_rate, hop_length=hop_length)
+            
+            # Count how many pitch classes are active at once (on average)
+            # Tuning = mostly 1-2 notes, playing = 3+ (chords, harmonics)
+            chroma_binary = (chroma > 0.3).astype(float)  # Threshold for "active" pitch
+            avg_active_pitches = np.mean(np.sum(chroma_binary, axis=0))
+            metrics['active_pitches'] = avg_active_pitches
+            
+            if avg_active_pitches < 2.0:
+                tuning_penalty += 15
+                penalties.append("single notes")
+            elif avg_active_pitches < 2.5:
+                tuning_penalty += 8
+            
+            # Check pitch variety - tuning repeats same notes, playing has variety
+            # Use the dominant pitch in each frame
+            dominant_pitches = np.argmax(chroma, axis=0)
+            unique_pitches = len(np.unique(dominant_pitches))
+            pitch_variety = unique_pitches / 12.0  # Normalize by total pitch classes
+            metrics['pitch_variety'] = pitch_variety
+            
+            if pitch_variety < 0.4:  # Less than 5 different notes used
+                tuning_penalty += 12
+                penalties.append("repetitive pitch")
+            elif pitch_variety < 0.5:
+                tuning_penalty += 6
+            
+            # Check for "tuning pattern" - same note repeated with gaps
+            # Look at pitch stability over time
+            pitch_changes = np.sum(np.abs(np.diff(dominant_pitches)) > 0)
+            pitch_change_rate = pitch_changes / (len(dominant_pitches) + 1)
+            metrics['pitch_change_rate'] = pitch_change_rate
+            
+            # Very low change rate = holding/repeating same note (tuning)
+            # But riffs can also be repetitive - only penalize VERY static
+            if pitch_change_rate < 0.05:  # Almost no pitch movement at all
+                tuning_penalty += 12
+                penalties.append("static pitch")
+            elif pitch_change_rate < 0.08:
+                tuning_penalty += 6
+            
+            # Check spectral bandwidth - tuning is narrow, playing is full
+            spec_bw = librosa.feature.spectral_bandwidth(y=segment, sr=self.sample_rate)[0]
+            avg_bandwidth = np.mean(spec_bw)
+            metrics['bandwidth'] = avg_bandwidth
+            
+            # Low bandwidth = thin sound (single notes)
+            if avg_bandwidth < 1500:
+                tuning_penalty += 8
+                penalties.append("thin sound")
+            elif avg_bandwidth < 2000:
+                tuning_penalty += 4
+            
+        except Exception as e:
+            pass
+        
+        # Apply tuning penalty (cap at -35)
+        tuning_penalty = min(35, tuning_penalty)
+        score -= tuning_penalty
+        if tuning_penalty > 20:
+            penalties.append("tuning?")
+        
+        # Ensure score doesn't go below 0
+        score = max(0, score)
+        
+        # Debug output for tuning - show key metrics
+        metric_str = " ".join([f"{k}={v:.2f}" for k,v in list(metrics.items())[:6]])
+        print(f"      {section.start_time:.0f}s-{section.end_time:.0f}s: {score:.1f} pts | {metric_str} | +{bonuses} -{penalties}")
         
         return score
     
@@ -1961,18 +2217,18 @@ class SongArranger:
         self,
         audio_data: np.ndarray,
         arrangement: Arrangement,
-        crossfade_duration: float = 0.5,
+        crossfade_duration: float = 0.05,  # Short crossfade just for click prevention
         snap_to_beats: bool = True
     ) -> np.ndarray:
         """
-        Render an arrangement to audio with smooth, musical transitions.
-        Uses phrase-aware cutting for natural transitions.
+        Render an arrangement to audio with clean cuts at BAR boundaries.
+        Detects loop length from rhythm track and aligns cuts to bar starts.
         
         Args:
             audio_data: Original audio data.
             arrangement: Arrangement plan.
-            crossfade_duration: Duration of crossfades between sections (default 0.5s).
-            snap_to_beats: Whether to snap cuts to beat boundaries.
+            crossfade_duration: Duration of micro-fade for click prevention (default 50ms).
+            snap_to_beats: Whether to snap cuts to beat/bar boundaries.
             
         Returns:
             Rendered audio.
@@ -1980,43 +2236,65 @@ class SongArranger:
         if not arrangement.sections:
             return audio_data
         
-        # Detect beats for the whole track for snapping
+        # Check if sections are in chronological order
+        # If not, they've been rearranged and we should use hard cuts (crossfades between
+        # unrelated audio sections sound weird)
+        sections_rearranged = False
+        prev_end = -1
+        for section, _, _ in arrangement.sections:
+            if section.start_time < prev_end - 0.1:  # Allow tiny overlap tolerance
+                sections_rearranged = True
+                break
+            prev_end = section.end_time
+        
+        if sections_rearranged:
+            print(f"   Sections rearranged - using hard cuts (crossfades would blend unrelated audio)")
+        
+        # Detect tempo, beats, and BAR structure
+        bar_times = None
         beat_times = None
+        bar_length = None
+        
         if snap_to_beats:
             try:
                 tempo, beat_frames = librosa.beat.beat_track(y=audio_data, sr=self.sample_rate)
                 beat_times = librosa.frames_to_time(beat_frames, sr=self.sample_rate)
-            except:
+                
+                if len(beat_times) > 8:
+                    # Estimate beats per bar (usually 4, sometimes 3 or 6)
+                    beat_duration = np.median(np.diff(beat_times))
+                    
+                    # Try to detect loop length by finding repeating patterns
+                    loop_length = self._detect_loop_length(audio_data, beat_duration, tempo)
+                    
+                    if loop_length:
+                        bar_length = loop_length
+                        print(f"   Detected loop/bar length: {bar_length:.2f}s ({bar_length/beat_duration:.1f} beats)")
+                    else:
+                        # Default to 4 beats per bar
+                        bar_length = beat_duration * 4
+                        print(f"   Using 4/4 bar length: {bar_length:.2f}s")
+                    
+                    # Generate bar boundary times
+                    bar_times = self._generate_bar_times(beat_times, bar_length)
+            except Exception as e:
+                print(f"   Beat detection failed: {e}")
                 beat_times = None
         
-        # Pre-analyze all sections for phrase boundaries
-        transitions = self._analyze_transitions(audio_data, [s for s, _, _ in arrangement.sections])
-        
-        # Process each section to find good cut points
+        # Process each section to find good cut points at BAR boundaries
         processed_sections = []
         for i, (section, new_start, new_end) in enumerate(arrangement.sections):
-            section_id = id(section)
+            start_time = section.start_time
+            end_time = section.end_time
             
-            # Use phrase-aware entry/exit points if available
-            if section_id in transitions:
-                trans = transitions[section_id]
-                # For first section, use best entry point
-                if i == 0:
-                    start_time = trans.get("best_entry", section.start_time)
-                else:
-                    start_time = trans.get("best_entry", section.start_time)
-                
-                # For last section, use best exit point
-                if i == len(arrangement.sections) - 1:
-                    end_time = trans.get("best_exit", section.end_time)
-                else:
-                    end_time = trans.get("best_exit", section.end_time)
-            else:
-                start_time = section.start_time
-                end_time = section.end_time
-            
-            # Snap to nearest beat if available
-            if beat_times is not None and len(beat_times) > 0:
+            # Snap to BAR boundaries (not just beats)
+            if bar_times is not None and len(bar_times) > 0:
+                # For section START: snap to nearest bar start
+                start_time = self._snap_to_bar(start_time, bar_times, prefer='after')
+                # For section END: snap to nearest bar END (which is next bar's start)
+                end_time = self._snap_to_bar(end_time, bar_times, prefer='before')
+            elif beat_times is not None and len(beat_times) > 0:
+                # Fallback to beat snapping
                 start_time = self._snap_to_beat(start_time, beat_times)
                 end_time = self._snap_to_beat(end_time, beat_times)
             
@@ -2025,8 +2303,8 @@ class SongArranger:
             end_sample = int(end_time * self.sample_rate)
             
             # Fine-tune to nearest zero crossing for click-free cuts
-            start_sample = self._find_zero_crossing(audio_data, start_sample, search_range=int(0.01 * self.sample_rate))
-            end_sample = self._find_zero_crossing(audio_data, end_sample, search_range=int(0.01 * self.sample_rate))
+            start_sample = self._find_zero_crossing(audio_data, start_sample, search_range=int(0.005 * self.sample_rate))
+            end_sample = self._find_zero_crossing(audio_data, end_sample, search_range=int(0.005 * self.sample_rate))
             
             # Ensure valid range
             start_sample = max(0, start_sample)
@@ -2038,76 +2316,207 @@ class SongArranger:
         if not processed_sections:
             return audio_data
         
-        # Build output with proper crossfades
-        crossfade_samples = int(crossfade_duration * self.sample_rate)
+        # Micro-fade for click prevention
+        micro_fade = int(0.02 * self.sample_rate)  # 20ms for hard cuts
         
-        # Calculate output length
-        total_samples = sum(end - start for start, end, _ in processed_sections)
-        # Subtract overlaps from crossfades (except first section)
-        total_samples -= crossfade_samples * (len(processed_sections) - 1)
-        total_samples = max(total_samples, self.sample_rate)  # At least 1 second
+        # If sections were rearranged, use hard cuts (crossfades between unrelated audio sound weird)
+        if sections_rearranged:
+            print(f"   Using hard cuts with 20ms micro-fades")
+            
+            # Simple concatenation with micro-fades at each cut point
+            output_parts = []
+            
+            for i, (start_sample, end_sample, label) in enumerate(processed_sections):
+                section_audio = audio_data[start_sample:end_sample].copy().astype(np.float32)
+                
+                # Apply micro-fades at edges
+                if len(section_audio) > micro_fade * 2:
+                    # Fade in
+                    fade_in = np.linspace(0, 1, micro_fade).astype(np.float32)
+                    section_audio[:micro_fade] *= fade_in
+                    # Fade out
+                    fade_out = np.linspace(1, 0, micro_fade).astype(np.float32)
+                    section_audio[-micro_fade:] *= fade_out
+                
+                output_parts.append(section_audio)
+            
+            # Concatenate all parts
+            output = np.concatenate(output_parts)
+            
+            # Normalize if needed
+            max_val = np.max(np.abs(output))
+            if max_val > 0.95:
+                output = output * 0.9 / max_val
+            
+            return output
         
-        output = np.zeros(total_samples, dtype=np.float32)
-        output_pos = 0
+        # For chronological sections, use BAR-aligned crossfade (1 full bar) for natural musical transitions
+        crossfade_duration_sec = bar_length if bar_length else 1.5  # 1 bar, fallback to 1.5s
+        crossfade_samples = int(crossfade_duration_sec * self.sample_rate)
+        crossfade_samples = max(int(0.5 * self.sample_rate), crossfade_samples)  # At least 0.5s
+        crossfade_samples = min(int(2.0 * self.sample_rate), crossfade_samples)  # Max 2 seconds
+        
+        print(f"   Using {crossfade_duration_sec:.2f}s bar-aligned crossfade")
+        
+        # Build output with bar-aligned crossfades between sections
+        output_parts = []
         
         for i, (start_sample, end_sample, label) in enumerate(processed_sections):
             section_audio = audio_data[start_sample:end_sample].copy().astype(np.float32)
-            section_length = len(section_audio)
             
-            if section_length < crossfade_samples * 2:
-                # Section too short for crossfade, just add it
-                end_pos = min(output_pos + section_length, len(output))
-                output[output_pos:end_pos] = section_audio[:end_pos - output_pos]
-                output_pos = end_pos
+            if len(section_audio) < crossfade_samples * 2:
+                output_parts.append(section_audio)
                 continue
             
             if i == 0:
-                # First section: fade in at start, prepare for crossfade at end
-                fade_in = self._create_fade(crossfade_samples, 'in')
-                section_audio[:crossfade_samples] *= fade_in
-                
-                # Add full section
-                end_pos = min(output_pos + section_length, len(output))
-                output[output_pos:end_pos] = section_audio[:end_pos - output_pos]
-                output_pos = end_pos - crossfade_samples  # Back up for overlap
-                
-            elif i == len(processed_sections) - 1:
-                # Last section: crossfade in, fade out at end
-                fade_in = self._create_fade(crossfade_samples, 'in')
-                fade_out = self._create_fade(crossfade_samples, 'out')
-                
-                section_audio[:crossfade_samples] *= fade_in
-                section_audio[-crossfade_samples:] *= fade_out
-                
-                # Overlap-add for crossfade
-                end_pos = min(output_pos + section_length, len(output))
-                add_length = min(section_length, end_pos - output_pos)
-                output[output_pos:output_pos + add_length] += section_audio[:add_length]
-                output_pos = output_pos + add_length
-                
+                # First section: micro fade in at very start
+                fade_in = np.linspace(0, 1, micro_fade).astype(np.float32)
+                section_audio[:micro_fade] *= fade_in
+            
+            if i == len(processed_sections) - 1:
+                # Last section: micro fade out at very end
+                fade_out = np.linspace(1, 0, micro_fade).astype(np.float32)
+                section_audio[-micro_fade:] *= fade_out
+            
+            output_parts.append(section_audio)
+        
+        # Now combine with bar-aligned crossfades between sections
+        if len(output_parts) == 0:
+            return audio_data
+        elif len(output_parts) == 1:
+            return output_parts[0]
+        
+        # Calculate total length accounting for overlaps
+        total_length = sum(len(p) for p in output_parts) - crossfade_samples * (len(output_parts) - 1)
+        output = np.zeros(total_length, dtype=np.float32)
+        
+        pos = 0
+        for i, part in enumerate(output_parts):
+            if i == 0:
+                # First section: copy fully, position for crossfade at end
+                output[pos:pos + len(part)] = part
+                pos += len(part) - crossfade_samples
             else:
-                # Middle section: crossfade in and out
-                fade_in = self._create_fade(crossfade_samples, 'in')
-                fade_out = self._create_fade(crossfade_samples, 'out')
+                # Create equal-power crossfade over 1 bar
+                fade_out = np.cos(np.linspace(0, np.pi/2, crossfade_samples)).astype(np.float32)
+                fade_in = np.sin(np.linspace(0, np.pi/2, crossfade_samples)).astype(np.float32)
                 
-                section_audio[:crossfade_samples] *= fade_in
-                section_audio[-crossfade_samples:] *= fade_out
+                # Apply crossfade in overlap region (1 bar)
+                overlap_start = pos
+                overlap_end = pos + crossfade_samples
                 
-                # Overlap-add
-                end_pos = min(output_pos + section_length, len(output))
-                add_length = min(section_length, end_pos - output_pos)
-                output[output_pos:output_pos + add_length] += section_audio[:add_length]
-                output_pos = output_pos + add_length - crossfade_samples  # Back up for next overlap
+                # Fade out the previous section's tail
+                output[overlap_start:overlap_end] *= fade_out
+                # Fade in and add the new section's head
+                output[overlap_start:overlap_end] += part[:crossfade_samples] * fade_in
+                
+                # Copy the rest of the new section
+                remaining = part[crossfade_samples:]
+                output[overlap_end:overlap_end + len(remaining)] = remaining
+                
+                if i < len(output_parts) - 1:
+                    pos = overlap_end + len(remaining) - crossfade_samples
+                else:
+                    pos = overlap_end + len(remaining)
         
         # Trim to actual content
-        output = output[:output_pos + crossfade_samples]
+        output = output[:pos]
         
-        # Normalize to prevent clipping from overlap-add
+        # Normalize if needed
         max_val = np.max(np.abs(output))
         if max_val > 0.95:
             output = output * 0.9 / max_val
         
         return output
+    
+    def _detect_loop_length(self, audio_data: np.ndarray, beat_duration: float, tempo: float) -> Optional[float]:
+        """
+        Detect the loop/riff length by finding repeating patterns in the rhythm track.
+        Assumes 4/4 time signature. Returns the bar length in seconds.
+        """
+        # For 4/4 time, one bar = 4 beats
+        bar_length = beat_duration * 4
+        
+        try:
+            # Verify the 4-beat bar length by checking autocorrelation
+            hop_length = 512
+            onset_env = librosa.onset.onset_strength(y=audio_data, sr=self.sample_rate, hop_length=hop_length)
+            
+            bar_samples = int(bar_length * self.sample_rate / hop_length)
+            
+            if bar_samples < 10 or bar_samples * 2 > len(onset_env):
+                return bar_length  # Just use 4 beats
+            
+            # Check if the rhythm repeats every 4 beats (one bar)
+            # Also check 8 beats (two bars) which is common for riffs
+            for multiplier in [1, 2]:  # 1 bar or 2 bars
+                test_samples = bar_samples * multiplier
+                correlations = []
+                
+                for offset in range(0, min(len(onset_env) - test_samples * 2, test_samples * 8), test_samples):
+                    seg1 = onset_env[offset:offset + test_samples]
+                    seg2 = onset_env[offset + test_samples:offset + test_samples * 2]
+                    
+                    if len(seg1) == len(seg2) and len(seg1) > 0:
+                        corr = np.corrcoef(seg1, seg2)[0, 1]
+                        if not np.isnan(corr):
+                            correlations.append(corr)
+                
+                if correlations and np.mean(correlations) > 0.6:
+                    # Found a strong repeating pattern
+                    return bar_length * multiplier
+            
+            # Default to single bar (4 beats)
+            return bar_length
+            
+        except Exception as e:
+            return bar_length  # Default to 4 beats per bar
+    
+    def _generate_bar_times(self, beat_times: np.ndarray, bar_length: float) -> np.ndarray:
+        """Generate bar boundary times from beat times and bar length."""
+        if len(beat_times) == 0:
+            return np.array([])
+        
+        # Start from first beat
+        first_beat = beat_times[0]
+        last_beat = beat_times[-1]
+        
+        # Generate bar times
+        bar_times = []
+        t = first_beat
+        while t <= last_beat + bar_length:
+            bar_times.append(t)
+            t += bar_length
+        
+        return np.array(bar_times)
+    
+    def _snap_to_bar(self, time: float, bar_times: np.ndarray, prefer: str = 'nearest') -> float:
+        """
+        Snap a time to the nearest bar boundary.
+        
+        Args:
+            time: Time to snap
+            bar_times: Array of bar boundary times
+            prefer: 'nearest', 'before', or 'after'
+        """
+        if len(bar_times) == 0:
+            return time
+        
+        idx = np.argmin(np.abs(bar_times - time))
+        
+        if prefer == 'before':
+            # Find the bar boundary AT or BEFORE the time
+            candidates = bar_times[bar_times <= time + 0.1]  # Small tolerance
+            if len(candidates) > 0:
+                return candidates[-1]
+        elif prefer == 'after':
+            # Find the bar boundary AT or AFTER the time
+            candidates = bar_times[bar_times >= time - 0.1]  # Small tolerance
+            if len(candidates) > 0:
+                return candidates[0]
+        
+        # Default: nearest
+        return bar_times[idx]
     
     def _snap_to_beat(self, time: float, beat_times: np.ndarray) -> float:
         """Snap a time to the nearest beat."""
@@ -2161,7 +2570,10 @@ class SongArranger:
         audio_data: np.ndarray,
         template: str = "medium",
         target_duration: Optional[float] = None,
-        style_profile: StyleProfile = None
+        style_profile: StyleProfile = None,
+        allow_rearrange: bool = False,
+        min_section_duration: Optional[float] = None,
+        max_section_duration: Optional[float] = None
     ) -> Tuple[np.ndarray, Arrangement, List[Section]]:
         """
         Automatically analyze and arrange audio into a song structure.
@@ -2171,20 +2583,28 @@ class SongArranger:
             template: Arrangement length - "short" (~3min), "medium" (~5min), "long" (~8min), "full" (all material).
             target_duration: Target duration in seconds (overrides template).
             style_profile: Optional learned style profile for transition scoring.
+            allow_rearrange: If True, allow reordering sections for better musical flow.
+            min_section_duration: Minimum section duration in seconds.
+            max_section_duration: Maximum section duration in seconds.
             
         Returns:
             Tuple of (arranged_audio, arrangement, detected_sections).
         """
-        # Analyze sections
-        sections = self.analyze_sections(audio_data)
+        # Analyze sections with custom duration constraints
+        sections = self.analyze_sections(
+            audio_data, 
+            min_section_duration=min_section_duration,
+            max_section_duration=max_section_duration
+        )
         
         # Create arrangement
         arrangement = self.create_arrangement(
-            audio_data, sections, template, target_duration, style_profile
+            audio_data, sections, template, target_duration, style_profile,
+            allow_rearrange=allow_rearrange
         )
         
-        # Use longer crossfades for smoother transitions
-        crossfade_dur = 1.5
+        # Use short micro-fades for click prevention (not blending crossfades)
+        crossfade_dur = 0.03  # 30ms - just to prevent clicks
         
         # Render
         arranged_audio = self.render_arrangement(audio_data, arrangement, crossfade_duration=crossfade_dur)

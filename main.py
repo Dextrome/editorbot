@@ -35,6 +35,23 @@ def main():
         help="Disable automatic song arrangement (only do cleanup edits)",
     )
     parser.add_argument(
+        "--rearrange",
+        action="store_true",
+        help="Allow reordering sections for better musical flow (default: preserve original order)",
+    )
+    parser.add_argument(
+        "--min-section",
+        type=float,
+        default=None,
+        help="Minimum section duration in seconds (default: 8s, or 4s with --rearrange)",
+    )
+    parser.add_argument(
+        "--max-section",
+        type=float,
+        default=None,
+        help="Maximum section duration in seconds (default: ~30s)",
+    )
+    parser.add_argument(
         "-b", "--batch", action="store_true", help="Process all files in input directory"
     )
     parser.add_argument(
@@ -82,18 +99,31 @@ def main():
         else:
             output_path = input_path.parent / f"{input_path.stem}_edited{input_path.suffix}"
 
+        # When rearranging, default to shorter sections for more flexibility
+        min_section = args.min_section
+        max_section = args.max_section
+        if args.rearrange and min_section is None:
+            min_section = 4.0  # Shorter sections when rearranging
+        
         if args.verbose:
             print(f"Processing: {input_path}")
             print(f"Output: {output_path}")
             print(f"Using preset: {args.preset}")
             print(f"Arrangement: {'disabled' if args.no_arrange else args.template}")
+            if args.rearrange:
+                print(f"Rearrangement: enabled")
+            if min_section or max_section:
+                print(f"Section duration: {min_section or 8}s - {max_section or 30}s")
 
         result = editor.process_file(
             input_path, 
             output_path, 
             preset=args.preset,
             arrange=not args.no_arrange,
-            arrangement_template=args.template
+            arrangement_template=args.template,
+            allow_rearrange=args.rearrange,
+            min_section_duration=min_section,
+            max_section_duration=max_section
         )
 
         print(f"\n✅ Processing complete!")

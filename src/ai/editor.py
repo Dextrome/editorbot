@@ -279,6 +279,9 @@ class AIEditor:
         preset: str = "balanced",
         arrange: bool = True,
         arrangement_template: str = "auto",
+        allow_rearrange: bool = False,
+        min_section_duration: Optional[float] = None,
+        max_section_duration: Optional[float] = None,
     ) -> np.ndarray:
         """
         Automatically edit audio based on analysis.
@@ -289,6 +292,9 @@ class AIEditor:
             preset: Editing preset ("balanced", "warm", "bright", "aggressive").
             arrange: Whether to arrange the song structure.
             arrangement_template: Template for arrangement ("auto", "pop", "edm", "rock", "simple", "minimal").
+            allow_rearrange: Whether to allow reordering sections for better flow.
+            min_section_duration: Minimum section duration in seconds.
+            max_section_duration: Maximum section duration in seconds.
 
         Returns:
             Edited audio data.
@@ -318,7 +324,10 @@ class AIEditor:
             arranged_audio, arrangement, sections = self.arranger.auto_arrange(
                 audio_data, 
                 template=arrangement_template,
-                style_profile=style_to_use
+                style_profile=style_to_use,
+                allow_rearrange=allow_rearrange,
+                min_section_duration=min_section_duration,
+                max_section_duration=max_section_duration
             )
             self.arrangement = arrangement
             self.detected_sections = sections
@@ -531,6 +540,9 @@ class AIEditor:
         preset: str = "balanced",
         arrange: bool = True,
         arrangement_template: str = "auto",
+        allow_rearrange: bool = False,
+        min_section_duration: Optional[float] = None,
+        max_section_duration: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Process an audio file from start to finish.
@@ -541,6 +553,9 @@ class AIEditor:
             preset: Editing preset to use.
             arrange: Whether to arrange the song structure.
             arrangement_template: Template for arrangement.
+            allow_rearrange: Whether to allow reordering sections for better flow.
+            min_section_duration: Minimum section duration in seconds.
+            max_section_duration: Maximum section duration in seconds.
 
         Returns:
             Processing results including analysis and output path.
@@ -555,7 +570,10 @@ class AIEditor:
         edited = self.auto_edit(
             audio_data, analysis, preset, 
             arrange=arrange, 
-            arrangement_template=arrangement_template
+            arrangement_template=arrangement_template,
+            allow_rearrange=allow_rearrange,
+            min_section_duration=min_section_duration,
+            max_section_duration=max_section_duration
         )
 
         # Save
