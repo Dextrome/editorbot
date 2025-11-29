@@ -1,0 +1,3 @@
+# NATTEN (Neighborhood Attention) is required for efficient attention in audio models.
+# Install from source as described in the README.
+# pip install -e ./natten_build  # or use the build instructions
