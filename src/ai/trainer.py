@@ -102,6 +102,12 @@ class SongTrainer:
         self.style_profiles: Dict[str, StyleProfile] = {}
         self.data_dir = Path("data/training")
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # Optional encoder (projection + NATTEN) that can be used during training
+        self.encoder = None
+
+    def set_encoder(self, encoder):
+        """Register a PyTorch encoder (e.g., NattenFrameEncoder) for use in training routines."""
+        self.encoder = encoder
     
     def analyze_reference_song(
         self, 

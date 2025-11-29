@@ -1,9 +1,12 @@
 """Audio analysis functionality for feature extraction."""
 
 from typing import Dict, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import librosa
+import torch
+import torch.nn as nn
 
 
 class AudioAnalyzer:
@@ -17,32 +20,66 @@ class AudioAnalyzer:
             sample_rate: Sample rate of the audio to analyze.
         """
         self.sample_rate = sample_rate
+        # Persistent encoder (projection + NATTEN) for framing -> contextual features
+        # Lazily created by `extract_attention_features` or set via `set_encoder`.
+        self.encoder: Optional[torch.nn.Module] = None
+        self.encoder_frame_size: Optional[int] = None
+        self.encoder_proj_dim: int = 8
 
-    def detect_tempo(self, audio_data: np.ndarray) -> float:
+    def detect_tempo(self, audio_data: np.ndarray, use_natten: bool = False) -> float:
         """
         Detect the tempo (BPM) of the audio.
 
+        This function optionally uses NATTEN-derived contextual features when
+        `use_natten=True`. NATTEN provides contextualized frame embeddings which
+        can improve onset/tempo estimates when the raw waveform is noisy.
+
         Args:
             audio_data: Audio data to analyze.
+            use_natten: If True, use `extract_attention_features` to compute features
+                        and compute tempo from those features. Defaults to False.
 
         Returns:
             Estimated tempo in BPM.
         """
-        tempo, _ = librosa.beat.beat_track(y=audio_data, sr=self.sample_rate)
-        return float(tempo)
+        def _tempo_from_onset_env(onset_env):
+            tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=self.sample_rate)
+            return float(tempo)
 
-    def detect_beats(self, audio_data: np.ndarray) -> np.ndarray:
+        if not use_natten:
+            tempo, _ = librosa.beat.beat_track(y=audio_data, sr=self.sample_rate)
+            return float(tempo)
+
+        # Use NATTEN features to compute an onset envelope
+        feats = self.extract_attention_features(audio_data)
+        # Compute a simple onset envelope from feature deltas
+        feat_env = np.mean(np.abs(np.diff(feats, axis=0)), axis=1)
+        feat_env = feat_env / (np.max(feat_env) + 1e-9)
+        return _tempo_from_onset_env(feat_env)
+
+    def detect_beats(self, audio_data: np.ndarray, use_natten: bool = False) -> np.ndarray:
         """
         Detect beat positions in the audio.
 
         Args:
             audio_data: Audio data to analyze.
+            use_natten: If True, compute beats from NATTEN-derived features.
 
         Returns:
             Array of beat positions in seconds.
         """
-        _, beat_frames = librosa.beat.beat_track(y=audio_data, sr=self.sample_rate)
-        return librosa.frames_to_time(beat_frames, sr=self.sample_rate)
+        if not use_natten:
+            _, beat_frames = librosa.beat.beat_track(y=audio_data, sr=self.sample_rate)
+            return librosa.frames_to_time(beat_frames, sr=self.sample_rate)
+
+        # Compute NATTEN features and derive an onset envelope
+        feats = self.extract_attention_features(audio_data)
+        onset_env = np.mean(np.abs(np.diff(feats, axis=0)), axis=1)
+        # Use librosa beat on the feature-derived onset env (frame-based)
+        tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=self.sample_rate)
+        # Convert beat frames (from onset_env frames) into times using hop of 256 samples
+        beat_times = librosa.frames_to_time(beats, sr=self.sample_rate, hop_length=256)
+        return beat_times
 
     def extract_features(self, audio_data: np.ndarray) -> Dict[str, np.ndarray]:
         """
@@ -82,8 +119,140 @@ class AudioAnalyzer:
 
         return features
 
+    def extract_attention_features(
+        self,
+        audio_data: Optional[np.ndarray] = None,
+        frame_size: int = 512,
+        hop_size: int = 256,
+        proj_dim: int = 8,
+        kernel_size: int = 7,
+        device: Optional[torch.device] = None,
+    ) -> np.ndarray:
+        """
+        Extract contextualized frame features using NATTEN 1D attention.
+
+        Pipeline:
+        - Frame the audio into overlapping frames (shape: n_frames x frame_size)
+        - Project each frame to a low-dimensional vector
+        - Run NATTEN 1D self-attention across frames to get contextualized features
+
+        Args:
+            audio_data: Optional numpy array; uses stored audio if None.
+            frame_size: Frame length in samples.
+            hop_size: Hop length in samples.
+            proj_dim: Output projection dimension (must be supported by NATTEN head sizes, e.g., 8,16,32...).
+            kernel_size: Neighborhood kernel size for NATTEN.
+            device: Torch device; defaults to CUDA if available.
+
+        Returns:
+            Numpy array of shape (n_frames, proj_dim) containing contextualized features.
+        """
+        data = audio_data if audio_data is not None else getattr(self, "audio_data", None)
+        if data is None:
+            raise ValueError("No audio data provided for attention feature extraction")
+
+        # Frame the audio: shape (frame_size, n_frames)
+        frames = librosa.util.frame(data, frame_length=frame_size, hop_length=hop_size).T
+
+        # Convert frames to torch tensor: (1, n_frames, frame_size)
+        tensor = torch.from_numpy(frames).float().unsqueeze(0)
+
+        # Choose device
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        tensor = tensor.to(device)
+
+        # Use or initialize a persistent encoder module (projection + NATTEN)
+        self.encoder_proj_dim = proj_dim or self.encoder_proj_dim
+        if self.encoder is None or self.encoder_frame_size != frame_size or getattr(self.encoder, "proj", None) is None or getattr(self.encoder, "proj").in_features != frame_size or getattr(self.encoder, "proj").out_features != self.encoder_proj_dim:
+            # Lazily create encoder
+            from src.ai.natten_encoder import NattenFrameEncoder
+
+            self.encoder = NattenFrameEncoder(frame_size=frame_size, proj_dim=self.encoder_proj_dim, kernel_size=kernel_size, num_heads=1)
+            self.encoder_frame_size = frame_size
+
+        # Move encoder to device
+        self.encoder = self.encoder.to(device)
+
+        self.encoder.eval()
+        with torch.no_grad():
+            out_tensor = self.encoder(tensor)  # (1, n_frames, proj_dim)
+
+        # Return (n_frames, proj_dim) on CPU as numpy
+        return out_tensor.squeeze(0).cpu().numpy()
+
+    def save_encoder(self, path: str | Path) -> None:
+        """
+        Save the persisted encoder (projection + NATTEN) to disk.
+
+        The saved file contains a dict with keys: `state_dict`, `frame_size`, `proj_dim`.
+
+        Args:
+            path: File path to save the encoder state.
+        """
+        if self.encoder is None:
+            raise RuntimeError("No encoder available to save. Create it by calling extract_attention_features first.")
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "state_dict": self.encoder.state_dict(),
+            "frame_size": self.encoder_frame_size,
+            "proj_dim": self.encoder_proj_dim,
+        }
+
+        # Save on CPU for portability
+        torch.save(payload, str(path))
+
+    def load_encoder(self, path: str | Path, map_location: Optional[str | torch.device] = "cpu") -> None:
+        """
+        Load an encoder saved by `save_encoder` and set it as this analyzer's encoder.
+
+        Args:
+            path: Path to the saved encoder file.
+            map_location: Device mapping for loading (e.g., 'cpu' or torch.device('cuda:0')).
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Encoder file not found: {path}")
+
+        payload = torch.load(str(path), map_location=map_location)
+        frame_size = int(payload.get("frame_size"))
+        proj_dim = int(payload.get("proj_dim"))
+
+        # Lazily import encoder class to avoid top-level import cycles
+        from src.ai.natten_encoder import NattenFrameEncoder
+
+        encoder = NattenFrameEncoder(frame_size=frame_size, proj_dim=proj_dim, kernel_size=7, num_heads=1)
+        encoder.load_state_dict(payload["state_dict"])
+
+        # Set as persisted encoder
+        device = torch.device(map_location if map_location is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.encoder = encoder.to(device)
+        self.encoder_frame_size = frame_size
+        self.encoder_proj_dim = proj_dim
+
+    def set_encoder(self, encoder: torch.nn.Module, frame_size: int, proj_dim: int, device: Optional[torch.device] = None) -> None:
+        """
+        Register an external encoder (e.g., `NattenFrameEncoder`) for use by this analyzer.
+
+        Args:
+            encoder: A PyTorch module that accepts input shape (1, n_frames, frame_size)
+            frame_size: Frame length (in samples) that the encoder expects.
+            proj_dim: Output projection dimension of the encoder.
+            device: Optional device to move the encoder to (defaults to CUDA if available).
+        """
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.encoder = encoder.to(device)
+        self.encoder_frame_size = int(frame_size)
+        self.encoder_proj_dim = int(proj_dim)
+
     def detect_sections(
-        self, audio_data: np.ndarray, num_segments: int = 10
+        self, audio_data: np.ndarray, num_segments: int = 10, use_natten: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Detect structural sections in the audio (intro, verse, chorus, etc.).
@@ -98,17 +267,29 @@ class AudioAnalyzer:
         # Use adaptive hop_length for long files
         target_frames = 5000
         hop_length = max(512, int(len(audio_data) / target_frames))
-        
-        # Compute self-similarity matrix
-        mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, hop_length=hop_length)
-        
-        # Use structural segmentation
-        bounds = librosa.segment.agglomerative(mfcc, num_segments)
-        bound_times = librosa.frames_to_time(bounds, sr=self.sample_rate, hop_length=hop_length)
-        
-        # Generate simple labels
-        labels = np.arange(len(bounds))
-        
+
+        if not use_natten:
+            # Compute self-similarity matrix using MFCCs
+            mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, hop_length=hop_length)
+            # Use structural segmentation
+            bounds = librosa.segment.agglomerative(mfcc, num_segments)
+            bound_times = librosa.frames_to_time(bounds, sr=self.sample_rate, hop_length=hop_length)
+            labels = np.arange(len(bounds))
+            return bound_times, labels
+
+        # Use NATTEN features to create a similarity matrix for segmentation
+        feats = self.extract_attention_features(audio_data, frame_size=256, hop_size=128)
+        # Try to use librosa's segmentation using our features; fallback to MFCCs on error
+        try:
+            bounds = librosa.segment.agglomerative(feats.T, num_segments)
+            bound_times = librosa.frames_to_time(bounds, sr=self.sample_rate, hop_length=128)
+            labels = np.arange(len(bounds))
+        except Exception:
+            mfcc = librosa.feature.mfcc(y=audio_data, sr=self.sample_rate, hop_length=hop_length)
+            bounds = librosa.segment.agglomerative(mfcc, num_segments)
+            bound_times = librosa.frames_to_time(bounds, sr=self.sample_rate, hop_length=hop_length)
+            labels = np.arange(len(bounds))
+
         return bound_times, labels
 
     def get_loudness(self, audio_data: np.ndarray) -> float:

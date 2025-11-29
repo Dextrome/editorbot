@@ -96,6 +96,13 @@ class AIEditor:
 
         # Extract features for ML processing
         analysis["features"] = self.analyzer.extract_features(audio_data)
+        # NATTEN-based contextual features (optional; guarded)
+        try:
+            analysis["natten_features"] = self.analyzer.extract_attention_features(
+                audio_data, frame_size=256, hop_size=128, proj_dim=8, kernel_size=7
+            )
+        except Exception:
+            analysis["natten_features"] = None
 
         # Detect sections
         sections, labels = self.analyzer.detect_sections(audio_data)
