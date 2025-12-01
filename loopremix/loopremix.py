@@ -71,6 +71,15 @@ class Phrase:
     start_energy: float = 0.0  # energy at the start of the phrase (for transition matching)
     end_energy: float = 0.0    # energy at the end of the phrase (for transition matching)
     spectral_centroid: float = 0.0  # brightness measure for progression tracking
+    # Harmonic/melodic features from lead stem
+    avg_chroma: Optional[np.ndarray] = None  # 12-element pitch class distribution
+    start_chroma: Optional[np.ndarray] = None  # chroma at phrase start (for transitions)
+    end_chroma: Optional[np.ndarray] = None  # chroma at phrase end (for transitions)
+    dominant_pitch_class: int = 0  # most prominent pitch class (0-11, C=0)
+    # Rhythmic texture features
+    onset_density: float = 0.0  # onsets per second (how busy/active the phrase is)
+    spectral_flux: float = 0.0  # spectral change rate (sustained vs staccato)
+    end_onset_density: float = 0.0  # onset density at phrase end (for transition matching)
 
 
 def separate_stems(audio_path: str, device: str = 'cuda') -> Optional[StemData]:
@@ -374,6 +383,20 @@ class PhraseDetector:
                 spectral_cent = librosa.feature.spectral_centroid(y=phrase_mono, sr=self.sample_rate)[0]
                 avg_centroid = np.mean(spectral_cent) if len(spectral_cent) > 0 else 1000.0
                 
+                # Extract chroma features from lead stem for harmonic analysis
+                # Use lead_mono if available, otherwise phrase_mono
+                chroma_audio = lead_mono[start_sample:end_sample] if lead_mono is not None and end_sample <= len(lead_mono) else phrase_mono
+                avg_chroma, start_chroma, end_chroma, dominant_pitch = self._extract_chroma_features(
+                    chroma_audio, edge_samples
+                )
+                
+                # Extract rhythmic texture features (onset density, spectral flux)
+                # Use lead stem for cleaner onset detection
+                texture_audio = lead_mono[start_sample:end_sample] if lead_mono is not None and end_sample <= len(lead_mono) else phrase_mono
+                onset_density, spectral_flux, end_onset_density = self._extract_rhythmic_texture(
+                    texture_audio, edge_samples, duration
+                )
+                
                 # Quality score based on energy consistency and alignment
                 # When stems available, also factor in lead activity (more lead = more interesting)
                 energy_var = np.var(librosa.feature.rms(y=phrase_mono)[0])
@@ -399,19 +422,124 @@ class PhraseDetector:
                     backing_energy=backing_energy,
                     start_energy=start_energy,
                     end_energy=end_energy,
-                    spectral_centroid=avg_centroid
+                    spectral_centroid=avg_centroid,
+                    avg_chroma=avg_chroma,
+                    start_chroma=start_chroma,
+                    end_chroma=end_chroma,
+                    dominant_pitch_class=dominant_pitch,
+                    onset_density=onset_density,
+                    spectral_flux=spectral_flux,
+                    end_onset_density=end_onset_density
                 ))
             
             i = best_end
         
         logger.info(f"  Found {len(phrases)} phrases")
+        pitch_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
         for i, p in enumerate(phrases[:5]):  # Show first 5
             lead_info = f", lead={p.lead_energy:.3f}" if p.lead_energy > 0 else ""
-            logger.info(f"    [{i}] {p.start_time:.1f}s - {p.end_time:.1f}s ({p.bars} bars, quality={p.quality_score:.2f}{lead_info})")
+            pitch_info = f", key~{pitch_names[p.dominant_pitch_class]}" if p.avg_chroma is not None else ""
+            density_info = f", density={p.onset_density:.1f}/s" if p.onset_density > 0 else ""
+            # Normalize brightness to 0-100% for readability
+            bright_pct = min(100, max(0, p.spectral_centroid / 50))  # ~5000 Hz = 100%
+            bright_info = f", bright={bright_pct:.0f}%"
+            logger.info(f"    [{i}] {p.start_time:.1f}s - {p.end_time:.1f}s ({p.bars} bars, quality={p.quality_score:.2f}{lead_info}{pitch_info}{density_info}{bright_info})")
         if len(phrases) > 5:
             logger.info(f"    ... and {len(phrases) - 5} more")
         
         return phrases
+    
+    def _extract_chroma_features(
+        self, 
+        audio: np.ndarray, 
+        edge_samples: int
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], int]:
+        """
+        Extract chroma (pitch class) features from audio.
+        
+        Returns:
+            avg_chroma: 12-element array of average pitch class energy
+            start_chroma: chroma at phrase start
+            end_chroma: chroma at phrase end  
+            dominant_pitch_class: most prominent pitch (0-11)
+        """
+        try:
+            # Compute chromagram
+            chroma = librosa.feature.chroma_cqt(
+                y=audio, 
+                sr=self.sample_rate,
+                hop_length=512,
+                n_chroma=12
+            )
+            
+            if chroma.size == 0:
+                return None, None, None, 0
+            
+            # Average chroma across time
+            avg_chroma = np.mean(chroma, axis=1)
+            avg_chroma = avg_chroma / (np.sum(avg_chroma) + 1e-8)  # Normalize
+            
+            # Edge chroma for transition matching
+            # Use ~0.5s at start/end (convert to frames)
+            edge_frames = max(1, edge_samples // 512)
+            
+            start_chroma = np.mean(chroma[:, :edge_frames], axis=1)
+            start_chroma = start_chroma / (np.sum(start_chroma) + 1e-8)
+            
+            end_chroma = np.mean(chroma[:, -edge_frames:], axis=1)
+            end_chroma = end_chroma / (np.sum(end_chroma) + 1e-8)
+            
+            # Find dominant pitch class
+            dominant_pitch = int(np.argmax(avg_chroma))
+            
+            return avg_chroma, start_chroma, end_chroma, dominant_pitch
+            
+        except Exception as e:
+            logger.debug(f"Chroma extraction failed: {e}")
+            return None, None, None, 0
+    
+    def _extract_rhythmic_texture(
+        self,
+        audio: np.ndarray,
+        edge_samples: int,
+        duration: float
+    ) -> Tuple[float, float, float]:
+        """
+        Extract rhythmic texture features from audio.
+        
+        Returns:
+            onset_density: onsets per second (how busy the phrase is)
+            spectral_flux: average spectral change (sustained vs staccato)
+            end_onset_density: onset density at phrase end
+        """
+        try:
+            # Detect onsets (note attacks)
+            onset_env = librosa.onset.onset_strength(y=audio, sr=self.sample_rate)
+            onsets = librosa.onset.onset_detect(
+                onset_envelope=onset_env, 
+                sr=self.sample_rate,
+                units='time'
+            )
+            
+            # Overall onset density (onsets per second)
+            onset_density = len(onsets) / duration if duration > 0 else 0.0
+            
+            # Spectral flux (how much the spectrum changes over time)
+            # High flux = staccato/busy, low flux = sustained notes
+            spectral_flux = np.mean(onset_env) if len(onset_env) > 0 else 0.0
+            
+            # End onset density (last ~1 second)
+            # This helps match phrase endings to beginnings
+            end_time = duration
+            start_time = max(0, duration - 1.0)
+            end_onsets = [o for o in onsets if start_time <= o <= end_time]
+            end_onset_density = len(end_onsets) / (end_time - start_time) if (end_time - start_time) > 0 else onset_density
+            
+            return onset_density, spectral_flux, end_onset_density
+            
+        except Exception as e:
+            logger.debug(f"Rhythmic texture extraction failed: {e}")
+            return 0.0, 0.0, 0.0
 
 
 class SongBuilder:
@@ -426,7 +554,7 @@ class SongBuilder:
         phrases: List[Phrase],
         loop_info: LoopInfo,
         target_duration: float = 300.0,
-        crossfade_bars: float = 0.5
+        crossfade_bars: float = 0.25
     ) -> np.ndarray:
         """
         Build a remix by selecting and arranging the best phrases.
@@ -436,7 +564,7 @@ class SongBuilder:
             phrases: Detected phrases
             loop_info: Loop structure info
             target_duration: Target output duration in seconds
-            crossfade_bars: Crossfade duration in bars
+            crossfade_bars: Crossfade duration in bars (default 0.25 = ~1 beat)
             
         Returns:
             Remixed audio
@@ -599,6 +727,8 @@ class SongBuilder:
             - Smooth energy transitions (small jumps)
             - Energy arcs (building or releasing, not random)
             - Brightness changes that match energy (brighter = more intense)
+            - Harmonic compatibility (chroma similarity at transitions)
+            - Sensible key/pitch progressions
             - Quality maintained throughout
             """
             if len(sequence) < 2:
@@ -616,7 +746,58 @@ class SongBuilder:
             transition_penalty /= (len(sequence) - 1)
             score -= transition_penalty * 0.3  # Penalize harsh transitions
             
-            # 2. Energy arc coherence - reward consistent direction
+            # 2. Harmonic transition smoothness - chroma matching at boundaries
+            harmonic_score = 0.0
+            harmonic_count = 0
+            for i in range(len(sequence) - 1):
+                curr_phrase = sequence[i]
+                next_phrase = sequence[i + 1]
+                
+                if curr_phrase.end_chroma is not None and next_phrase.start_chroma is not None:
+                    # Cosine similarity between end chroma of current and start chroma of next
+                    chroma_sim = chroma_similarity(curr_phrase.end_chroma, next_phrase.start_chroma)
+                    harmonic_score += chroma_sim
+                    harmonic_count += 1
+                    
+            if harmonic_count > 0:
+                harmonic_score /= harmonic_count
+                score += harmonic_score * 0.25  # Reward harmonic continuity
+            
+            # 3. Key/pitch progression - favor musically related keys
+            key_score = 0.0
+            key_count = 0
+            for i in range(len(sequence) - 1):
+                curr_key = sequence[i].dominant_pitch_class
+                next_key = sequence[i + 1].dominant_pitch_class
+                
+                # Calculate interval between keys
+                interval = (next_key - curr_key) % 12
+                
+                # Reward musically related key movements:
+                # - Same key (0): very good
+                # - Perfect fifth (7) or fourth (5): classic progression
+                # - Minor/major third (3, 4): smooth movement
+                # - Whole step (2): common modulation
+                key_bonus = {
+                    0: 1.0,   # Same key
+                    7: 0.9,   # Perfect 5th up (e.g., C->G)
+                    5: 0.9,   # Perfect 4th up / 5th down (e.g., C->F)
+                    4: 0.7,   # Major 3rd
+                    3: 0.7,   # Minor 3rd
+                    2: 0.6,   # Whole step
+                    10: 0.6,  # Whole step down
+                    9: 0.7,   # Minor 3rd down
+                    8: 0.7,   # Major 3rd down
+                }.get(interval, 0.3)  # Other intervals less favorable
+                
+                key_score += key_bonus
+                key_count += 1
+            
+            if key_count > 0:
+                key_score /= key_count
+                score += key_score * 0.2  # Reward good key progressions
+            
+            # 4. Energy arc coherence - reward consistent direction
             energy_changes = []
             for i in range(len(sequence) - 1):
                 e1 = normalize_energy(sequence[i].energy)
@@ -630,7 +811,7 @@ class SongBuilder:
                 consistent = sum(1 for i in range(len(signs)-1) if signs[i] == signs[i+1] and signs[i] != 0)
                 score += consistent * 0.1  # Reward consistent movement
             
-            # 3. Peak/climax handling - high energy phrases should be surrounded by buildups
+            # 5. Peak/climax handling - high energy phrases should be surrounded by buildups
             for i, phrase in enumerate(sequence):
                 norm_e = normalize_energy(phrase.energy)
                 if norm_e > 0.7:  # High energy phrase (potential climax)
@@ -645,7 +826,7 @@ class SongBuilder:
                         if next_e < norm_e:
                             score += 0.1  # Good release from peak
             
-            # 4. Brightness-energy correlation - brighter phrases should be higher energy
+            # 6. Brightness-energy correlation - brighter phrases should be higher energy
             energy_list = [normalize_energy(p.energy) for p in sequence]
             bright_list = [normalize_centroid(p.spectral_centroid) for p in sequence]
             if len(energy_list) >= 2:
@@ -653,11 +834,59 @@ class SongBuilder:
                 if not np.isnan(correlation):
                     score += correlation * 0.1  # Reward brightness-energy correlation
             
-            # 5. Quality bonus
+            # 7. Quality bonus
             avg_quality = sum(p.quality_score for p in sequence) / len(sequence)
-            score += avg_quality * 0.2
+            score += avg_quality * 0.15
+            
+            # 8. Rhythmic texture continuity - penalize jarring changes in activity level
+            # e.g., going from fast solo (high density) to held chord (low density)
+            texture_penalty = 0.0
+            texture_count = 0
+            for i in range(len(sequence) - 1):
+                curr_density = sequence[i].end_onset_density
+                next_density = sequence[i + 1].onset_density
+                
+                if curr_density > 0 and next_density > 0:
+                    # Calculate relative difference in onset density
+                    # Large jumps (e.g., 8 onsets/s -> 1 onset/s) are penalized
+                    ratio = max(curr_density, next_density) / (min(curr_density, next_density) + 0.1)
+                    if ratio > 3.0:  # More than 3x difference is jarring
+                        texture_penalty += (ratio - 3.0) * 0.1
+                    texture_count += 1
+            
+            if texture_count > 0:
+                texture_penalty /= texture_count
+                score -= texture_penalty  # Penalize jarring texture changes
+            
+            # 9. Brightness continuity - penalize jarring brightness jumps at transitions
+            # e.g., bright intense lead -> muddy noodling is jarring
+            brightness_penalty = 0.0
+            brightness_count = 0
+            for i in range(len(sequence) - 1):
+                curr_bright = normalize_centroid(sequence[i].spectral_centroid)
+                next_bright = normalize_centroid(sequence[i + 1].spectral_centroid)
+                
+                # Penalize large brightness differences between adjacent phrases
+                brightness_diff = abs(curr_bright - next_bright)
+                if brightness_diff > 0.3:  # More than 30% brightness jump
+                    # Quadratic penalty for extreme jumps
+                    brightness_penalty += (brightness_diff - 0.3) ** 2 * 2.0
+                brightness_count += 1
+            
+            if brightness_count > 0:
+                brightness_penalty /= brightness_count
+                score -= brightness_penalty  # Penalize jarring brightness changes
             
             return score
+        
+        def chroma_similarity(chroma1: np.ndarray, chroma2: np.ndarray) -> float:
+            """Compute cosine similarity between two chroma vectors."""
+            dot = np.dot(chroma1, chroma2)
+            norm1 = np.linalg.norm(chroma1)
+            norm2 = np.linalg.norm(chroma2)
+            if norm1 > 0 and norm2 > 0:
+                return dot / (norm1 * norm2)
+            return 0.0
         
         def evaluate_with_lookahead(current_sequence: List[Phrase], candidates: List[Phrase]) -> int:
             """
