@@ -1,0 +1,15 @@
+audioread
+cffi
+decorator
+joblib
+librosa
+llvmlite
+numba
+numpy
+pycparser
+pygame
+resampy
+scikit-learn
+scipy
+six
+SoundFile
