@@ -1,0 +1,31 @@
+# StyleTransformer Requirements
+# AI-powered audio style transfer
+
+# Core ML
+torch>=2.1.0
+torchaudio>=2.1.0
+pytorch-lightning>=2.0.0
+
+# Audio Processing
+librosa>=0.10.0
+soundfile>=0.12.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Open-source audio ML libraries
+audiocraft>=1.0.0          # Facebook's MusicGen/AudioGen
+pedalboard>=0.9.0          # Spotify's audio effects library
+# descript-audiotools      # GPU augmentation (install from git)
+
+# Training utilities
+einops>=0.6.0              # Tensor operations
+tqdm>=4.65.0               # Progress bars
+wandb>=0.15.0              # Experiment tracking (optional)
+
+# Data handling
+pandas>=2.0.0
+pyyaml>=6.0
+
+# Optional: Hugging Face for pretrained models
+transformers>=4.30.0
+datasets>=2.14.0

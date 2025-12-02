@@ -66,7 +66,18 @@ dmypy.json
 *.ogg
 *.m4a
 *.aac
+*.m3u
 !data/samples/*.wav
+
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.pdf
+
+desktop.ini
 
 # Model files
 *.pt
