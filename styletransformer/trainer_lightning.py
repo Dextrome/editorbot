@@ -209,6 +209,9 @@ class SongDataset(Dataset):
         # In-memory feature cache (much faster after first epoch)
         self.memory_feature_cache: Dict[int, Dict[str, torch.Tensor]] = {}
         
+        # Track failed file indices (to skip on subsequent iterations)
+        self.failed_indices: set = set()
+        
         # Preloaded audio storage
         self.preloaded_audio: Dict[int, np.ndarray] = {}
         if preload:
@@ -359,7 +362,11 @@ class SongDataset(Dataset):
         
         # 1. Check in-memory feature cache first (fastest)
         if self.cache_features_in_memory and idx in self.memory_feature_cache:
-            cached = self.memory_feature_cache[idx].copy()
+            cached = self.memory_feature_cache[idx]
+            # Check if this is a failed marker
+            if cached.get('_failed'):
+                return self._get_dummy_data()
+            cached = cached.copy()
             cached['path'] = str(audio_path)
             return cached
         
@@ -377,11 +384,15 @@ class SongDataset(Dataset):
                 except Exception:
                     pass
         
-        # 3. Load and process audio
+        # 3. Check if this index previously failed
+        if idx in self.failed_indices:
+            return self._get_dummy_data()
+        
+        # 4. Load and process audio
         audio = self._get_audio_segment(idx, audio_path)
         
         if audio is None:
-            self._move_to_error_dir(audio_path)
+            self._move_to_error_dir(audio_path, idx)
             return self._get_dummy_data()
         
         try:
@@ -414,8 +425,15 @@ class SongDataset(Dataset):
             logger.warning(f"Failed to process {audio_path}: {e}")
             return self._get_dummy_data()
     
-    def _move_to_error_dir(self, audio_path: Path):
-        """Move a failed audio file to the error directory."""
+    def _move_to_error_dir(self, audio_path: Path, idx: int = None):
+        """Move a failed audio file to the error directory and mark index as failed."""
+        # Mark index as failed in memory cache so we skip it on subsequent iterations
+        # This persists across epochs since memory_feature_cache is on the main process
+        if idx is not None:
+            self.failed_indices.add(idx)
+            # Also mark in memory cache with a special "failed" marker
+            self.memory_feature_cache[idx] = {'_failed': True}
+        
         try:
             error_dir = self.data_dir / 'error'
             error_dir.mkdir(exist_ok=True)
@@ -442,29 +460,53 @@ class SongDataset(Dataset):
             indices = np.linspace(0, len(arr) - 1, target_len)
             return np.interp(indices, np.arange(len(arr)), arr)
         
-        # Time features: (3, T)
+        def resample_2d(arr, target_len):
+            """Resample 2D array (n_features, time) to fixed length."""
+            result = np.zeros((arr.shape[0], target_len), dtype=np.float32)
+            for i in range(arr.shape[0]):
+                result[i] = resample_1d(arr[i], target_len)
+            return result
+        
+        # Time features: (6, T) - energy, brightness, onset, ZCR, bandwidth, rolloff
         energy = resample_1d(features.energy_curve, target_length)
         brightness = resample_1d(features.brightness_curve, target_length)
         onset = resample_1d(features.onset_density_curve, target_length)
-        time_features = np.stack([energy, brightness, onset], axis=0).astype(np.float32)
+        zcr = resample_1d(features.zcr_curve, target_length)
+        bandwidth = resample_1d(features.spectral_bandwidth, target_length)
+        rolloff = resample_1d(features.spectral_rolloff, target_length)
+        time_features = np.stack([energy, brightness, onset, zcr, bandwidth, rolloff], axis=0).astype(np.float32)
+        
+        # MFCC features: (13, T)
+        mfcc_features = resample_2d(features.mfcc_sequence, target_length)
+        
+        # Spectral contrast features: (7, T)
+        contrast_features = resample_2d(features.spectral_contrast, target_length)
         
         # Chroma features: (12, T)
-        chroma_resampled = np.zeros((12, target_length), dtype=np.float32)
-        for i in range(12):
-            chroma_resampled[i] = resample_1d(features.chroma_sequence[i], target_length)
+        chroma_features = resample_2d(features.chroma_sequence, target_length)
+        
+        # Tonnetz features: (6, T)
+        tonnetz_features = resample_2d(features.tonnetz_sequence, target_length)
+        
+        # Frequency balance features: (3, T)
+        freqbal_features = resample_2d(features.frequency_balance_curve, target_length)
         
         # Global features
         global_features = self._extract_global_features(features)
         
         return {
             'time_features': torch.from_numpy(time_features),
-            'chroma_features': torch.from_numpy(chroma_resampled),
+            'mfcc_features': torch.from_numpy(mfcc_features),
+            'contrast_features': torch.from_numpy(contrast_features),
+            'chroma_features': torch.from_numpy(chroma_features),
+            'tonnetz_features': torch.from_numpy(tonnetz_features),
+            'freqbal_features': torch.from_numpy(freqbal_features),
             'global_features': torch.from_numpy(global_features),
         }
     
     def _extract_global_features(self, features: StyleFeatures) -> np.ndarray:
         """Extract global features from StyleFeatures."""
-        global_features = np.zeros(16, dtype=np.float32)
+        global_features = np.zeros(20, dtype=np.float32)
         global_features[0] = features.tempo / 200.0
         global_features[1] = features.key / 12.0
         global_features[2] = features.avg_phrase_length / 16.0
@@ -488,14 +530,25 @@ class SongDataset(Dataset):
             global_features[13] = features.transition_types.count("drop") / total
             global_features[14] = features.transition_types.count("sustain") / total
         
+        # New global features
+        global_features[15] = 1.0 - features.tempo_stability  # Tempo variation (inverse of stability)
+        global_features[16] = features.avg_beat_strength  # Beat strength
+        global_features[17] = features.stereo_width  # Stereo width
+        global_features[18] = features.dynamics_range  # Dynamics range
+        global_features[19] = features.tempo_stability  # Tempo stability
+        
         return global_features
     
     def _get_dummy_data(self) -> Dict[str, torch.Tensor]:
         """Return dummy data for failed loads."""
         return {
-            'time_features': torch.zeros((3, 2048), dtype=torch.float32),
+            'time_features': torch.zeros((6, 2048), dtype=torch.float32),
+            'mfcc_features': torch.zeros((13, 2048), dtype=torch.float32),
+            'contrast_features': torch.zeros((7, 2048), dtype=torch.float32),
             'chroma_features': torch.zeros((12, 2048), dtype=torch.float32),
-            'global_features': torch.zeros(16, dtype=torch.float32),
+            'tonnetz_features': torch.zeros((6, 2048), dtype=torch.float32),
+            'freqbal_features': torch.zeros((3, 2048), dtype=torch.float32),
+            'global_features': torch.zeros(20, dtype=torch.float32),
             'path': '',  # Empty path marks this as dummy data
         }
 
@@ -508,14 +561,20 @@ def collate_skip_errors(batch):
     if not valid_batch:
         # All samples failed, return dummy batch
         return {
-            'time_features': torch.zeros((1, 3, 2048), dtype=torch.float32),
+            'time_features': torch.zeros((1, 6, 2048), dtype=torch.float32),
+            'mfcc_features': torch.zeros((1, 13, 2048), dtype=torch.float32),
+            'contrast_features': torch.zeros((1, 7, 2048), dtype=torch.float32),
             'chroma_features': torch.zeros((1, 12, 2048), dtype=torch.float32),
-            'global_features': torch.zeros((1, 16), dtype=torch.float32),
+            'tonnetz_features': torch.zeros((1, 6, 2048), dtype=torch.float32),
+            'freqbal_features': torch.zeros((1, 3, 2048), dtype=torch.float32),
+            'global_features': torch.zeros((1, 20), dtype=torch.float32),
         }
     
     # Stack tensors, exclude 'path' from stacking
     result = {}
-    for key in ['time_features', 'chroma_features', 'global_features']:
+    feature_keys = ['time_features', 'mfcc_features', 'contrast_features', 
+                    'chroma_features', 'tonnetz_features', 'freqbal_features', 'global_features']
+    for key in feature_keys:
         result[key] = torch.stack([b[key] for b in valid_batch])
     
     return result
@@ -548,25 +607,33 @@ class StyleTransferLightning(pl.LightningModule if HAS_LIGHTNING else nn.Module)
         # Temperature for contrastive learning
         self.temperature = nn.Parameter(torch.tensor(0.07))
     
-    def forward(self, time_feat, chroma_feat, global_feat):
-        return self.style_encoder(time_feat, chroma_feat, global_feat)
+    def forward(self, time_feat, mfcc_feat, contrast_feat, chroma_feat, tonnetz_feat, freqbal_feat, global_feat):
+        return self.style_encoder(time_feat, mfcc_feat, contrast_feat, chroma_feat, tonnetz_feat, freqbal_feat, global_feat)
     
     def training_step(self, batch, batch_idx):
         time_feat = batch['time_features']
+        mfcc_feat = batch['mfcc_features']
+        contrast_feat = batch['contrast_features']
         chroma_feat = batch['chroma_features']
+        tonnetz_feat = batch['tonnetz_features']
+        freqbal_feat = batch['freqbal_features']
         global_feat = batch['global_features']
         
         B = time_feat.size(0)
         
         # Get embeddings
-        embeddings = self.style_encoder(time_feat, chroma_feat, global_feat)
+        embeddings = self.style_encoder(time_feat, mfcc_feat, contrast_feat, chroma_feat, tonnetz_feat, freqbal_feat, global_feat)
         
         # Create augmented versions
         time_aug = time_feat + torch.randn_like(time_feat) * 0.1
+        mfcc_aug = mfcc_feat + torch.randn_like(mfcc_feat) * 0.1
+        contrast_aug = contrast_feat + torch.randn_like(contrast_feat) * 0.1
         chroma_aug = chroma_feat + torch.randn_like(chroma_feat) * 0.1
+        tonnetz_aug = tonnetz_feat + torch.randn_like(tonnetz_feat) * 0.1
+        freqbal_aug = freqbal_feat + torch.randn_like(freqbal_feat) * 0.1
         global_aug = global_feat + torch.randn_like(global_feat) * 0.05
         
-        embeddings_aug = self.style_encoder(time_aug, chroma_aug, global_aug)
+        embeddings_aug = self.style_encoder(time_aug, mfcc_aug, contrast_aug, chroma_aug, tonnetz_aug, freqbal_aug, global_aug)
         
         # Contrastive loss (InfoNCE)
         embeddings = F.normalize(embeddings, dim=-1)
@@ -905,7 +972,11 @@ class StyleTransferTrainer:
             for batch in pbar:
                 # Move to device
                 time_feat = batch['time_features'].to(self.device)
+                mfcc_feat = batch['mfcc_features'].to(self.device)
+                contrast_feat = batch['contrast_features'].to(self.device)
                 chroma_feat = batch['chroma_features'].to(self.device)
+                tonnetz_feat = batch['tonnetz_features'].to(self.device)
+                freqbal_feat = batch['freqbal_features'].to(self.device)
                 global_feat = batch['global_features'].to(self.device)
                 
                 B = time_feat.size(0)
@@ -913,14 +984,18 @@ class StyleTransferTrainer:
                     continue
                 
                 # Forward pass
-                embeddings = self.style_encoder(time_feat, chroma_feat, global_feat)
+                embeddings = self.style_encoder(time_feat, mfcc_feat, contrast_feat, chroma_feat, tonnetz_feat, freqbal_feat, global_feat)
                 
                 # Augmented version
                 time_aug = time_feat + torch.randn_like(time_feat) * 0.1
+                mfcc_aug = mfcc_feat + torch.randn_like(mfcc_feat) * 0.1
+                contrast_aug = contrast_feat + torch.randn_like(contrast_feat) * 0.1
                 chroma_aug = chroma_feat + torch.randn_like(chroma_feat) * 0.1
+                tonnetz_aug = tonnetz_feat + torch.randn_like(tonnetz_feat) * 0.1
+                freqbal_aug = freqbal_feat + torch.randn_like(freqbal_feat) * 0.1
                 global_aug = global_feat + torch.randn_like(global_feat) * 0.05
                 
-                embeddings_aug = self.style_encoder(time_aug, chroma_aug, global_aug)
+                embeddings_aug = self.style_encoder(time_aug, mfcc_aug, contrast_aug, chroma_aug, tonnetz_aug, freqbal_aug, global_aug)
                 
                 # Contrastive loss
                 embeddings_norm = F.normalize(embeddings, dim=-1)
@@ -993,10 +1068,14 @@ class StyleTransferTrainer:
                             continue
                         
                         time_feat = batch['time_features'].unsqueeze(0).to(self.device)
+                        mfcc_feat = batch['mfcc_features'].unsqueeze(0).to(self.device)
+                        contrast_feat = batch['contrast_features'].unsqueeze(0).to(self.device)
                         chroma_feat = batch['chroma_features'].unsqueeze(0).to(self.device)
+                        tonnetz_feat = batch['tonnetz_features'].unsqueeze(0).to(self.device)
+                        freqbal_feat = batch['freqbal_features'].unsqueeze(0).to(self.device)
                         global_feat = batch['global_features'].unsqueeze(0).to(self.device)
                         
-                        emb = self.style_encoder(time_feat, chroma_feat, global_feat)
+                        emb = self.style_encoder(time_feat, mfcc_feat, contrast_feat, chroma_feat, tonnetz_feat, freqbal_feat, global_feat)
                         embeddings.append(emb.cpu().numpy())
                     except Exception:
                         continue
@@ -1068,10 +1147,14 @@ class StyleTransferTrainer:
                             continue
                         
                         time_feat = batch['time_features'].unsqueeze(0).to(self.device)
+                        mfcc_feat = batch['mfcc_features'].unsqueeze(0).to(self.device)
+                        contrast_feat = batch['contrast_features'].unsqueeze(0).to(self.device)
                         chroma_feat = batch['chroma_features'].unsqueeze(0).to(self.device)
+                        tonnetz_feat = batch['tonnetz_features'].unsqueeze(0).to(self.device)
+                        freqbal_feat = batch['freqbal_features'].unsqueeze(0).to(self.device)
                         global_feat = batch['global_features'].unsqueeze(0).to(self.device)
                         
-                        emb = self.model.style_encoder(time_feat, chroma_feat, global_feat)
+                        emb = self.model.style_encoder(time_feat, mfcc_feat, contrast_feat, chroma_feat, tonnetz_feat, freqbal_feat, global_feat)
                         embeddings.append(emb.cpu().numpy())
                     except Exception:
                         continue
