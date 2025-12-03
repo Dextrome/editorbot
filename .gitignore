@@ -59,7 +59,7 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
-# Audio files (keep samples, ignore large files)
+# Audio files
 *.wav
 *.mp3
 *.flac
@@ -67,7 +67,9 @@ dmypy.json
 *.m4a
 *.aac
 *.m3u
-!data/samples/*.wav
+
+# Data folder (samples, training data, etc.)
+data/
 
 # Image files
 *.jpg
