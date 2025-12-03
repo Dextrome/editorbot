@@ -19,6 +19,9 @@ from tqdm import tqdm
 import logging
 from typing import List, Tuple, Dict, Optional
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 from align_by_search import RobustAligner
 from edit_policy import SegmentFeatureExtractor
@@ -29,6 +32,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Number of parallel workers (per-track parallelism)
+NUM_WORKERS = max(1, os.cpu_count() - 2)
 
 
 # =============================================================================
@@ -339,6 +345,108 @@ class ContrastiveLoss(nn.Module):
 
 
 # =============================================================================
+# PARALLEL TRACK PROCESSING
+# =============================================================================
+
+def _process_track_worker(args: Tuple) -> Dict:
+    """
+    Worker function to process a single track pair in a separate process.
+    This runs completely independently - no shared state.
+    
+    Args:
+        args: (raw_path, edit_path, segment_duration, hop_duration, num_neighbors, similarity_threshold)
+    
+    Returns:
+        Dict with track results or error info
+    """
+    import time
+    start_time = time.time()
+    
+    raw_path, edit_path, segment_duration, hop_duration, num_neighbors, similarity_threshold = args
+    raw_path = Path(raw_path)
+    edit_path = Path(edit_path)
+    
+    try:
+        # Create local instances (no shared state)
+        aligner = RobustAligner()
+        feature_extractor = ContextFeatureExtractor(
+            segment_duration=segment_duration,
+            hop_duration=hop_duration,
+            num_neighbors=num_neighbors
+        )
+        
+        # Load audio
+        raw_audio, sr = librosa.load(str(raw_path), sr=22050, mono=True)
+        edit_audio, _ = librosa.load(str(edit_path), sr=22050, mono=True)
+        
+        raw_duration = len(raw_audio) / sr
+        
+        # Get alignment
+        matches = aligner.align(
+            str(raw_path),
+            str(edit_path),
+            similarity_threshold=similarity_threshold
+        )
+        
+        # Get kept segments
+        kept_segments = aligner.get_kept_raw_segments(
+            matches, raw_duration, segment_duration
+        )
+        
+        # Extract features for raw segments
+        raw_segments = feature_extractor.extract_all_segments(raw_audio)
+        
+        # Build labels
+        labels = []
+        for start, end, _ in raw_segments:
+            is_kept = False
+            for k_start, k_end, kept in kept_segments:
+                if kept and start < k_end and end > k_start:
+                    is_kept = True
+                    break
+            labels.append(1.0 if is_kept else 0.0)
+        
+        # Extract edit segments
+        edit_segments = feature_extractor.extract_all_segments(edit_audio)
+        
+        # Build context features
+        raw_base_features = [f for _, _, f in raw_segments]
+        edit_base_features = [f for _, _, f in edit_segments]
+        
+        track_features = []
+        for i in range(len(raw_base_features)):
+            context_features = feature_extractor.get_context_features(raw_base_features, i)
+            track_features.append(context_features)
+        
+        track_edit_features = []
+        for i in range(len(edit_base_features)):
+            context_features = feature_extractor.get_context_features(edit_base_features, i)
+            track_edit_features.append(context_features)
+        
+        elapsed = time.time() - start_time
+        
+        return {
+            'success': True,
+            'track_name': raw_path.stem,
+            'features': track_features,
+            'labels': labels,
+            'edit_features': track_edit_features,
+            'elapsed': elapsed,
+            'n_raw': len(track_features),
+            'n_edit': len(track_edit_features),
+            'kept_pct': 100 * sum(labels) / len(labels) if labels else 0
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'track_name': raw_path.stem,
+            'error': str(e),
+            'elapsed': time.time() - start_time
+        }
+
+
+# =============================================================================
 # TRAINER V3
 # =============================================================================
 
@@ -474,39 +582,66 @@ class EditPolicyTrainerV3:
     def prepare_training_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Prepare training data with context features.
+        Uses parallel processing - one worker per track.
         
         Returns:
             X: features with context
             y: labels
             X_edit: features from edit files (for contrastive)
         """
+        import time
         pairs = self.find_pairs()
+        
+        # Limit workers to number of pairs or NUM_WORKERS
+        n_workers = min(len(pairs), NUM_WORKERS)
+        
+        print("\n" + "=" * 70)
+        print(f"PROCESSING {len(pairs)} TRAINING PAIRS ({n_workers} parallel workers)")
+        print("=" * 70)
+        
+        # Prepare args for workers
+        worker_args = [
+            (
+                str(raw_path),
+                str(edit_path),
+                self.segment_duration,
+                self.hop_duration,
+                self.num_neighbors,
+                self.similarity_threshold
+            )
+            for raw_path, edit_path in pairs
+        ]
         
         all_features = []
         all_labels = []
         all_edit_features = []
         
-        for raw_path, edit_path in tqdm(pairs, desc="Processing pairs"):
-            result = self.analyze_pair(raw_path, edit_path)
+        total_start = time.time()
+        
+        # Process tracks in parallel
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            # Submit all tasks
+            futures = {executor.submit(_process_track_worker, args): i 
+                      for i, args in enumerate(worker_args)}
             
-            # Get base features
-            raw_base_features = [f for _, _, f in result['raw_segments']]
-            edit_base_features = [f for _, _, f in result['edit_segments']]
-            
-            # Add context to raw features
-            for i, (start, end, _) in enumerate(result['raw_segments']):
-                context_features = self.feature_extractor.get_context_features(
-                    raw_base_features, i
-                )
-                all_features.append(context_features)
-                all_labels.append(result['labels'][i])
-            
-            # Add context to edit features (all positive)
-            for i in range(len(edit_base_features)):
-                context_features = self.feature_extractor.get_context_features(
-                    edit_base_features, i
-                )
-                all_edit_features.append(context_features)
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                
+                if result['success']:
+                    all_features.extend(result['features'])
+                    all_labels.extend(result['labels'])
+                    all_edit_features.extend(result['edit_features'])
+                    
+                    print(f"[{completed}/{len(pairs)}] {result['track_name']}")
+                    print(f"      Segments: {result['n_raw']} raw, {result['n_edit']} edit")
+                    print(f"      Kept: {int(sum(result['labels']))}/{result['n_raw']} ({result['kept_pct']:.1f}%)")
+                    print(f"      Time: {result['elapsed']:.1f}s")
+                else:
+                    print(f"[{completed}/{len(pairs)}] {result['track_name']} - FAILED: {result['error']}")
+        
+        total_elapsed = time.time() - total_start
         
         X = np.array(all_features)
         y = np.array(all_labels)
@@ -514,9 +649,12 @@ class EditPolicyTrainerV3:
         
         self.feature_dim = X.shape[1]
         
-        logger.info(f"Prepared {len(X)} raw segments, {y.sum():.0f} kept ({y.mean()*100:.1f}%)")
-        logger.info(f"Prepared {len(X_edit) if X_edit is not None else 0} edit segments (positive examples)")
-        logger.info(f"Feature dimension (with context): {self.feature_dim}")
+        print("=" * 70)
+        print(f"TOTAL: {len(X)} raw segments, {int(y.sum())} kept ({y.mean()*100:.1f}%)")
+        print(f"       {len(X_edit) if X_edit is not None else 0} edit segments (positive examples)")
+        print(f"       Feature dimension (with context): {self.feature_dim}")
+        print(f"       Total time: {total_elapsed:.1f}s ({total_elapsed/len(pairs):.1f}s/track avg)")
+        print("=" * 70 + "\n")
         
         return X, y, X_edit
     
@@ -580,9 +718,13 @@ class EditPolicyTrainerV3:
         )
         
         best_loss = float('inf')
+        best_acc = 0
+        best_f1 = 0
         best_state = None
         
         logger.info("Training with Transformer + Contrastive learning...")
+        logger.info(f"Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
+        logger.info("-" * 70)
         
         for epoch in range(epochs):
             self.classifier.train()
@@ -625,39 +767,44 @@ class EditPolicyTrainerV3:
             avg_bce = total_bce / len(loader)
             avg_contrast = total_contrast / len(loader)
             
+            # Evaluate every epoch
+            self.classifier.eval()
+            with torch.no_grad():
+                all_logits = self.classifier(X_tensor)
+                probs = torch.sigmoid(all_logits).squeeze()
+                preds = (probs > 0.5).float()
+                labels = y_tensor.squeeze()
+                
+                acc = (preds == labels).float().mean().item()
+                
+                tp = ((preds == 1) & (labels == 1)).sum().item()
+                fp = ((preds == 1) & (labels == 0)).sum().item()
+                fn = ((preds == 0) & (labels == 1)).sum().item()
+                
+                prec = tp / (tp + fp + 1e-8)
+                rec = tp / (tp + fn + 1e-8)
+                f1 = 2 * prec * rec / (prec + rec + 1e-8)
+            
+            # Track best
+            is_best = False
             if avg_loss < best_loss:
                 best_loss = avg_loss
+                best_acc = acc
+                best_f1 = f1
                 best_state = self.classifier.state_dict().copy()
+                is_best = True
             
-            # Log every 20 epochs
-            if (epoch + 1) % 20 == 0:
-                self.classifier.eval()
-                with torch.no_grad():
-                    all_logits = self.classifier(X_tensor)
-                    probs = torch.sigmoid(all_logits).squeeze()
-                    preds = (probs > 0.5).float()
-                    labels = y_tensor.squeeze()
-                    
-                    acc = (preds == labels).float().mean().item()
-                    
-                    tp = ((preds == 1) & (labels == 1)).sum().item()
-                    fp = ((preds == 1) & (labels == 0)).sum().item()
-                    fn = ((preds == 0) & (labels == 1)).sum().item()
-                    
-                    prec = tp / (tp + fp + 1e-8)
-                    rec = tp / (tp + fn + 1e-8)
-                    f1 = 2 * prec * rec / (prec + rec + 1e-8)
-                
-                logger.info(
-                    f"Epoch {epoch+1}: loss={avg_loss:.4f} (bce={avg_bce:.4f}, "
-                    f"contrast={avg_contrast:.4f}), acc={acc:.3f}, f1={f1:.3f}"
-                )
+            # Log every epoch
+            best_marker = " *BEST*" if is_best else ""
+            print(f"Epoch {epoch+1:3d}/{epochs}: loss={avg_loss:.4f} acc={acc:.3f} f1={f1:.3f} prec={prec:.3f} rec={rec:.3f}{best_marker}")
         
         # Restore best
         if best_state is not None:
             self.classifier.load_state_dict(best_state)
         
-        logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+        logger.info("-" * 70)
+        logger.info(f"Training complete!")
+        logger.info(f"Best: loss={best_loss:.4f}, acc={best_acc:.3f}, f1={best_f1:.3f}")
         self.save_models()
     
     def save_models(self):
