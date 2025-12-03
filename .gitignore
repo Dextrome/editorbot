@@ -85,7 +85,10 @@ desktop.ini
 *.pt
 *.pth
 *.onnx
+*.npy
+*.pkl
 models/
+feature_cache/
 
 # Temporary files
 temp/
