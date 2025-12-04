@@ -594,6 +594,10 @@ class EditPolicyTrainerV9:
         y_style = data['y_style']
         X_ref = data['X_ref_raw']
         
+        # Debug: check shapes
+        print(f"DEBUG: X shape: {X.shape}")
+        print(f"DEBUG: X_ref shape: {X_ref.shape}")
+        
         # Split
         n_val = int(len(X) * val_split)
         indices = np.random.permutation(len(X))
@@ -727,26 +731,39 @@ class EditPolicyTrainerV9:
         if best_state is not None:
             self.model.load_state_dict(best_state)
         
-        # Compute reference centroid (average style embedding of all reference segments)
-        print("\nComputing reference centroid...")
-        self.model.eval()
-        X_ref_windowed = create_context_windows(X_ref) if len(X_ref.shape) == 2 else X_ref
-        X_ref_t = torch.FloatTensor(X_ref_windowed).to(self.device)
-        
-        with torch.no_grad():
-            ref_embeddings = self.model.get_style_embedding(X_ref_t)
-            self.reference_centroid = ref_embeddings.mean(dim=0).cpu().numpy()
-        
-        print(f"Reference centroid shape: {self.reference_centroid.shape}")
-        
-        # Save everything
+        # SAVE MODEL FIRST (before centroid computation, in case it fails)
         model_path = self.model_dir / "classifier_v9_best.pt"
         torch.save(self.model.state_dict(), model_path)
         logger.info(f"Saved model to {model_path}")
         
         np.save(self.model_dir / "feature_dim_v9.npy", self.base_feature_dim)
-        np.save(self.model_dir / "reference_centroid_v9.npy", self.reference_centroid)
         np.save(self.model_dir / "similarity_weight_v9.npy", self.similarity_weight)
+        
+        # Compute reference centroid (average style embedding of all reference segments)
+        print("\nComputing reference centroid...")
+        print(f"X_ref shape: {X_ref.shape}")  # Debug
+        self.model.eval()
+        
+        # Filter reference samples from the training data using y_style labels
+        # X_ref from prepare_training_data is already context-windowed
+        X_ref_t = torch.FloatTensor(X_ref).to(self.device)
+        
+        with torch.no_grad():
+            # Process in batches if needed
+            batch_size = 512
+            all_embeddings = []
+            for i in range(0, len(X_ref_t), batch_size):
+                batch = X_ref_t[i:i+batch_size]
+                emb = self.model.get_style_embedding(batch)
+                all_embeddings.append(emb)
+            
+            ref_embeddings = torch.cat(all_embeddings, dim=0)
+            self.reference_centroid = ref_embeddings.mean(dim=0).cpu().numpy()
+        
+        print(f"Reference centroid shape: {self.reference_centroid.shape}")
+        
+        # Save centroid
+        np.save(self.model_dir / "reference_centroid_v9.npy", self.reference_centroid)
         
         # Save scaler
         import pickle
