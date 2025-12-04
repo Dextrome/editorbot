@@ -1,20 +1,24 @@
 """
-Edit Policy V12 - Beat-Level Editing with Phrase Context
-Based on V11's imitation learning, but operates at BEAT resolution for musical edits.
+Edit Policy V13 - Guitar-Focused Beat-Level Editing with Stem Separation
 
-Key innovations over V11:
-1. BEAT DETECTION: Edit points align with musical beats, not arbitrary time windows
-2. PHRASE CONTEXT: Model sees surrounding bars for musical phrase awareness  
-3. DOWNBEAT PREFERENCE: Cuts prefer landing on bar boundaries (beat 1)
-4. TEMPO/KEY CONTINUITY: Transition scoring ensures musical flow
+Based on V12's beat-level editing with phrase context, but uses Demucs stem separation
+to focus on the "other" stem (guitar/lead instruments) for more coherent melodic phrases.
+
+Key innovations over V12:
+1. STEM SEPARATION: Uses Demucs to isolate guitar/lead from drums/bass/vocals
+2. GUITAR-FOCUSED FEATURES: Extract spectral features from "other" stem
+3. MELODIC PHRASE AWARENESS: Model learns guitar phrase boundaries, not drum hits
+4. PHRASE CONTEXT: Model sees surrounding bars for musical phrase awareness  
+5. DOWNBEAT PREFERENCE: Cuts prefer landing on bar boundaries (beat 1)
 
 Architecture:
-- Beat-level feature extraction (per-beat instead of per-3s-segment)
-- Phrase context window (16 beats = ~4 bars on each side)
+- Demucs stem separation (htdemucs model)
+- Beat-level feature extraction from "other" stem
+- Phrase context window (60 beats bidirectional LSTM)
 - Position encoding: beat-in-bar, bar-in-phrase, position-in-song
-- Same imitation learning + trajectory LSTM from V11
+- Same imitation learning + trajectory LSTM from V12
 
-This should produce more musical edits that respect rhythmic structure.
+This should produce more musical edits that respect melodic phrase structure.
 """
 
 import numpy as np
@@ -37,6 +41,11 @@ import pickle
 import hashlib
 import warnings
 from dataclasses import dataclass
+import sys
+
+# Add shared module path for Demucs wrapper
+sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
+from demucs_wrapper import DemucsSeparator
 
 warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -51,9 +60,136 @@ NUM_WORKERS = max(1, os.cpu_count() - 2)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 USE_AMP = torch.cuda.is_available()  # Mixed precision on GPU
 
-# Feature cache directory
-CACHE_DIR = Path("./feature_cache/v12")
+# Feature cache directory - V13 uses separate cache for stem-based features
+CACHE_DIR = Path("./feature_cache/v13")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Stem cache directory for Demucs-separated stems
+STEM_CACHE_DIR = Path("./feature_cache/v13_stems")
+STEM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# STEM SEPARATION (V13 ADDITION)
+# =============================================================================
+
+class StemSeparator:
+    """
+    Manages Demucs stem separation with caching.
+    
+    For guitar-focused editing, we combine vocals + other stems.
+    This isolates the melodic content (guitar, keys, vocals) from
+    drums and bass, allowing the model to learn phrase boundaries
+    based on melodic content rather than rhythm section.
+    """
+    
+    def __init__(self, sr: int = 22050, cache_dir: Path = STEM_CACHE_DIR):
+        self.sr = sr
+        self.cache_dir = cache_dir
+        self._separator = None  # Lazy initialization
+        
+    @property
+    def separator(self):
+        """Lazy load Demucs separator (heavy model)."""
+        if self._separator is None:
+            logger.info("Loading Demucs separator (htdemucs)...")
+            self._separator = DemucsSeparator(model="htdemucs")
+            logger.info("Demucs loaded.")
+        return self._separator
+    
+    def _get_cache_path(self, audio_path: Path) -> Path:
+        """Get cache path for separated stems."""
+        # Create hash from file path and modification time
+        stat = audio_path.stat()
+        cache_key = f"{audio_path.name}_{stat.st_mtime}_{stat.st_size}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+        return self.cache_dir / f"{audio_path.stem}_{cache_hash}_stems.npz"
+    
+    def separate_stems(self, audio: np.ndarray, audio_path: Optional[Path] = None) -> Dict[str, np.ndarray]:
+        """
+        Separate audio into stems using Demucs.
+        
+        Returns dict with keys: 'drums', 'bass', 'other', 'vocals'
+        Each stem is a numpy array at self.sr sample rate (mono).
+        """
+        # Check cache if path provided
+        if audio_path is not None:
+            cache_path = self._get_cache_path(audio_path)
+            if cache_path.exists():
+                try:
+                    cached = np.load(cache_path)
+                    logger.info(f"Loaded cached stems for {audio_path.name}")
+                    return {k: cached[k] for k in cached.files}
+                except Exception as e:
+                    logger.warning(f"Cache load failed: {e}")
+        
+        # Write audio to temp file (Demucs requires file input)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            tmp_path = tmp.name
+            sf.write(tmp_path, audio, self.sr)
+        
+        try:
+            # Perform separation - resample output to our sr
+            stems_raw = self.separator.separate(tmp_path, resample_to=self.sr)
+            
+            # Convert to mono if stereo and ensure consistent format
+            stems = {}
+            for key in ['drums', 'bass', 'other', 'vocals']:
+                if key in stems_raw:
+                    stem = stems_raw[key]
+                    # Convert to mono if stereo
+                    if stem.ndim == 2:
+                        stem = stem.mean(axis=1)
+                    stems[key] = stem.astype(np.float32)
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        
+        # Cache results if path provided
+        if audio_path is not None:
+            try:
+                np.savez_compressed(cache_path, **stems)
+                logger.info(f"Cached stems for {audio_path.name}")
+            except Exception as e:
+                logger.warning(f"Cache save failed: {e}")
+        
+        return stems
+    
+    def get_guitar_focused_audio(self, audio: np.ndarray, audio_path: Optional[Path] = None) -> np.ndarray:
+        """
+        Get the guitar/melodic-focused audio by combining vocals + other stems.
+        
+        This removes drums and bass, leaving melodic content (guitar, keys, vocals).
+        For instrumental music, this is mostly the "other" stem (guitar/lead).
+        """
+        stems = self.separate_stems(audio, audio_path)
+        
+        # Combine vocals + other for melodic content
+        # This gives us: lead guitar, keys, synths, vocal melodies
+        # We exclude: drums, bass (rhythm section)
+        melodic = stems['vocals'] + stems['other']
+        
+        return melodic
+    
+    def get_all_stems_combined(self, audio: np.ndarray, audio_path: Optional[Path] = None,
+                                include_drums: bool = False, include_bass: bool = False) -> np.ndarray:
+        """
+        Get customizable stem combination.
+        
+        By default returns vocals + other (melodic content).
+        Can optionally include drums and/or bass.
+        """
+        stems = self.separate_stems(audio, audio_path)
+        
+        result = stems['vocals'] + stems['other']
+        if include_drums:
+            result = result + stems['drums']
+        if include_bass:
+            result = result + stems['bass']
+        
+        return result
 
 
 # =============================================================================
@@ -569,6 +705,106 @@ class BeatLevelAligner:
         
         return {
             'beat_features': raw_features,
+            'keep_labels': keep_labels,
+            'match_scores': match_scores,
+            'beat_positions': beat_positions[:n_raw],
+            'beat_info': raw_beats,
+            'n_beats': n_raw,
+            'keep_ratio': keep_ratio,
+            'expected_keep_ratio': expected_keep_ratio
+        }
+    
+    def align_beats_with_stems(self, raw_melodic: np.ndarray, edit_melodic: np.ndarray,
+                               raw_beats: BeatInfo, edit_beats: BeatInfo,
+                               verbose: bool = False) -> Dict:
+        """
+        V13: Align raw beats to edit beats using STEM-SEPARATED melodic audio.
+        
+        Same as align_beats, but audio is already stem-separated (vocals + other).
+        Beat times come from full mix, but features are extracted from melodic content.
+        This focuses alignment on guitar/lead phrases rather than drums.
+        
+        Args:
+            raw_melodic: Melodic content (vocals + other) from raw audio
+            edit_melodic: Melodic content (vocals + other) from edit audio  
+            raw_beats: Beat info detected from FULL raw mix
+            edit_beats: Beat info detected from FULL edit mix
+        """
+        # Get beat audio from melodic content using beat times from full mix
+        raw_beat_audio = self.get_beats_audio(raw_melodic, raw_beats)
+        edit_beat_audio = self.get_beats_audio(edit_melodic, edit_beats)
+        
+        n_raw = len(raw_beat_audio)
+        n_edit = len(edit_beat_audio)
+        
+        if verbose:
+            print(f"  Raw beats: {n_raw}, Edit beats: {n_edit} (melodic features)")
+        
+        if n_raw == 0 or n_edit == 0:
+            # Fallback if beat detection failed
+            return {
+                'beat_features': np.zeros((1, 56), dtype=np.float32),
+                'keep_labels': np.array([1.0]),
+                'beat_positions': [(0, len(raw_melodic))],
+                'beat_info': raw_beats,
+                'n_beats': 1
+            }
+        
+        # Extract features from MELODIC content (guitar/lead focused)
+        # Use parallel extraction for larger beat counts
+        if n_raw > 20:
+            raw_features = extract_features_parallel(raw_beat_audio, self.sr)
+        else:
+            raw_features = np.array([self.extract_beat_features(b) for b in raw_beat_audio])
+        
+        if n_edit > 20:
+            edit_features = extract_features_parallel(edit_beat_audio, self.sr)
+        else:
+            edit_features = np.array([self.extract_beat_features(b) for b in edit_beat_audio])
+        
+        # Expected keep ratio
+        expected_keep_ratio = len(edit_melodic) / len(raw_melodic)
+        expected_n_keep = int(n_raw * expected_keep_ratio)
+        
+        if verbose:
+            print(f"  Expected keep ratio: {expected_keep_ratio:.1%} ({expected_n_keep} beats)")
+        
+        # Normalize for cosine similarity
+        raw_norm = raw_features / (np.linalg.norm(raw_features, axis=1, keepdims=True) + 1e-8)
+        edit_norm = edit_features / (np.linalg.norm(edit_features, axis=1, keepdims=True) + 1e-8)
+        
+        # Compute similarity matrix
+        similarity_matrix = raw_norm @ edit_norm.T  # (n_raw, n_edit)
+        
+        # Best match score for each raw beat
+        match_scores = similarity_matrix.max(axis=1).astype(np.float32)
+        
+        # Adaptive threshold
+        sorted_scores = np.sort(match_scores)[::-1]
+        n_keep_target = max(1, int(expected_n_keep * 1.1))
+        
+        if n_keep_target < len(sorted_scores):
+            adaptive_threshold = sorted_scores[n_keep_target]
+        else:
+            adaptive_threshold = sorted_scores[-1] if len(sorted_scores) > 0 else 0.9
+        
+        final_threshold = max(adaptive_threshold, 0.88)  # Lower threshold for beats
+        keep_labels = (match_scores >= final_threshold).astype(np.float32)
+        
+        # Beat positions in samples (from melodic audio)
+        beat_samples = (raw_beats.beat_times * self.sr).astype(int)
+        beat_positions = []
+        for i in range(len(beat_samples) - 1):
+            beat_positions.append((beat_samples[i], beat_samples[i + 1]))
+        if len(beat_samples) > 0:
+            beat_positions.append((beat_samples[-1], len(raw_melodic)))
+        
+        keep_ratio = keep_labels.mean()
+        if verbose:
+            print(f"  Threshold: {final_threshold:.3f}, Keep ratio: {keep_ratio:.1%} ({int(keep_labels.sum())}/{len(keep_labels)})")
+        
+        return {
+            'beat_features': raw_features,  # Features from melodic content
             'keep_labels': keep_labels,
             'match_scores': match_scores,
             'beat_positions': beat_positions[:n_raw],
@@ -1159,8 +1395,13 @@ class BeatLevelDataset(Dataset):
 # V12 TRAINER: Beat-Level Training
 # =============================================================================
 
-class V12Trainer:
-    """Train beat-level policy from aligned human edits."""
+class V13Trainer:
+    """
+    Train beat-level policy from aligned human edits with STEM SEPARATION.
+    
+    V13 extracts features from Demucs-separated stems (vocals + other)
+    to focus on melodic/guitar content rather than drums/bass.
+    """
     
     def __init__(self, 
                  input_dir: str = "./training_data/input",
@@ -1175,6 +1416,9 @@ class V12Trainer:
         self.model_dir.mkdir(exist_ok=True)
         
         self.sr = 22050
+        
+        # V13: Add stem separator for guitar-focused features
+        self.stem_separator = StemSeparator(sr=self.sr)
         
         self.beat_aligner = BeatLevelAligner(sr=self.sr)
         self.segment_aligner = FastAudioAligner(sr=self.sr)  # For reference
@@ -1209,7 +1453,16 @@ class V12Trainer:
         return refs
     
     def prepare_training_data(self) -> Dict:
-        """Prepare training data with beat-level alignment."""
+        """
+        Prepare training data with beat-level alignment and STEM SEPARATION.
+        
+        V13: Extracts features from vocals+other stems (melodic content)
+        instead of the full mix, to focus on guitar/lead phrase boundaries.
+        
+        Optimized with:
+        - Pre-caching of all stems (Demucs is GPU-bound, runs sequentially but caches)
+        - Parallel beat feature extraction after stems are cached
+        """
         pairs = self.find_pairs()
         reference_files = self.find_reference_files()
         
@@ -1217,53 +1470,103 @@ class V12Trainer:
             raise ValueError("No input/output pairs found!")
         
         print("\n" + "=" * 70)
-        print("V12: BEAT-LEVEL ALIGNMENT")
+        print("V13: STEM-SEPARATED BEAT-LEVEL ALIGNMENT")
         print("=" * 70)
+        print("Using Demucs to extract vocals + other stems (melodic content)")
+        print("=" * 70)
+        
+        # =================================================================
+        # PHASE 1: Pre-cache all stems (Demucs is GPU-bound, sequential)
+        # This ensures all stems are cached before parallel processing
+        # =================================================================
+        print("\n--- PHASE 1: Pre-caching stems with Demucs ---")
+        all_audio_paths = []
+        for raw_path, edit_path in pairs:
+            all_audio_paths.extend([raw_path, edit_path])
+        
+        ref_files = reference_files[:50]  # Limit references
+        all_audio_paths.extend(ref_files)
+        
+        # Check which files need stem separation
+        uncached = []
+        for path in all_audio_paths:
+            cache_path = self.stem_separator._get_cache_path(path)
+            if not cache_path.exists():
+                uncached.append(path)
+        
+        if uncached:
+            print(f"  {len(uncached)} files need stem separation (out of {len(all_audio_paths)})")
+            for path in tqdm(uncached, desc="Separating stems"):
+                try:
+                    audio = load_audio_fast(path, self.sr)
+                    self.stem_separator.separate_stems(audio, path)
+                except Exception as e:
+                    logger.warning(f"  Stem separation failed for {path.name}: {e}")
+        else:
+            print(f"  All {len(all_audio_paths)} files already cached!")
+        
+        # =================================================================
+        # PHASE 2: Sequential beat detection and alignment (memory-safe)
+        # Process one pair at a time to avoid memory issues
+        # =================================================================
+        print("\n--- PHASE 2: Beat detection and alignment ---")
+        
+        import gc
         
         alignments = []
         all_features = []
         
-        for raw_path, edit_path in tqdm(pairs, desc="Aligning pairs"):
-            print(f"\n{raw_path.name}")
-            
-            raw_audio = load_audio_fast(raw_path, self.sr)
-            edit_audio = load_audio_fast(edit_path, self.sr)
-            
-            print(f"  Raw: {len(raw_audio)/self.sr:.1f}s, Edit: {len(edit_audio)/self.sr:.1f}s")
-            
-            # Detect beats in both
-            print("  Detecting beats...")
-            raw_beats = detect_beats(raw_audio, self.sr)
-            edit_beats = detect_beats(edit_audio, self.sr)
-            
-            print(f"  Raw: {len(raw_beats.beat_times)} beats @ {raw_beats.tempo:.1f} BPM")
-            print(f"  Edit: {len(edit_beats.beat_times)} beats @ {edit_beats.tempo:.1f} BPM")
-            
-            # Align at beat level
-            alignment = self.beat_aligner.align_beats(
-                raw_audio, edit_audio, raw_beats, edit_beats, verbose=True
-            )
-            alignments.append(alignment)
-            all_features.append(alignment['beat_features'])
+        for raw_path, edit_path in tqdm(pairs, desc="Processing pairs"):
+            try:
+                # Load audio
+                raw_audio = load_audio_fast(raw_path, self.sr)
+                edit_audio = load_audio_fast(edit_path, self.sr)
+                
+                # Get cached melodic stems (should be instant from cache)
+                raw_melodic = self.stem_separator.get_guitar_focused_audio(raw_audio, raw_path)
+                edit_melodic = self.stem_separator.get_guitar_focused_audio(edit_audio, edit_path)
+                
+                # Detect beats from full mix
+                raw_beats = detect_beats(raw_audio, self.sr)
+                edit_beats = detect_beats(edit_audio, self.sr)
+                
+                # Align using melodic content
+                alignment = self.beat_aligner.align_beats_with_stems(
+                    raw_melodic, edit_melodic, raw_beats, edit_beats, verbose=False
+                )
+                
+                alignments.append(alignment)
+                all_features.append(alignment['beat_features'])
+                print(f"  {raw_path.name}: {len(raw_beats.beat_times)} beats @ {raw_beats.tempo:.0f} BPM")
+                
+                # Free memory
+                del raw_audio, edit_audio, raw_melodic, edit_melodic
+                gc.collect()
+                
+            except Exception as e:
+                logger.warning(f"Failed to process {raw_path.name}: {e}")
         
-        # Extract reference features using segment-based approach
-        print("\n" + "=" * 70)
-        print("EXTRACTING REFERENCE FEATURES")
-        print("=" * 70)
+        # =================================================================
+        # PHASE 3: Sequential reference feature extraction (memory-safe)
+        # =================================================================
+        print("\n--- PHASE 3: Reference feature extraction ---")
         
         reference_features = []
-        ref_files = reference_files[:50]  # Limit
-        
         for ref_path in tqdm(ref_files, desc="Processing references"):
             try:
                 audio = load_audio_fast(ref_path, self.sr)
-                # Use beat-based feature extraction for consistency
+                melodic = self.stem_separator.get_guitar_focused_audio(audio, ref_path)
                 beats = detect_beats(audio, self.sr)
-                beat_audio = self.beat_aligner.get_beats_audio(audio, beats)[:20]  # Limit
+                beat_audio = self.beat_aligner.get_beats_audio(melodic, beats)[:20]
                 
                 if beat_audio:
                     feats = np.array([extract_features_fast(b, self.sr) for b in beat_audio])
                     reference_features.extend(feats)
+                
+                # Free memory
+                del audio, melodic, beat_audio
+                gc.collect()
+                
             except Exception as e:
                 logger.warning(f"Failed: {ref_path.name}: {e}")
         
@@ -1287,17 +1590,17 @@ class V12Trainer:
         print(f"\nTotal beats: {total_beats}")
         print(f"Total kept: {int(total_kept)} ({total_kept/total_beats:.1%})")
         
-        # Save reference centroid
+        # Save reference centroid - V13
         ref_scaled = self.scaler.transform(reference_features)
         ref_centroid = ref_scaled.mean(axis=0)
-        np.save(self.model_dir / "reference_centroid_v12.npy", ref_centroid)
+        np.save(self.model_dir / "reference_centroid_v13.npy", ref_centroid)
         
         return {
             'alignments': alignments,
             'reference_features': reference_features
         }
     
-    def train(self, epochs: int = 100, batch_tracks: int = 4, lr: float = 1e-3,
+    def train(self, epochs: int = 120, batch_tracks: int = 4, lr: float = 1e-3,
                resume: bool = True) -> None:
         """
         Train V12 beat-level policy.
@@ -1313,7 +1616,7 @@ class V12Trainer:
         data = self.prepare_training_data()
         
         print("\n" + "=" * 70)
-        print(f"TRAINING V12 BEAT-LEVEL POLICY (device={DEVICE})")
+        print(f"TRAINING V13 STEM-SEPARATED BEAT-LEVEL POLICY (device={DEVICE})")
         print("=" * 70)
         
         dataset = BeatLevelDataset(
@@ -1344,7 +1647,7 @@ class V12Trainer:
         best_acc = 0
         
         if resume:
-            checkpoint_path = self.model_dir / "policy_v12_best.pt"
+            checkpoint_path = self.model_dir / "policy_v13_best.pt"
             if checkpoint_path.exists():
                 try:
                     checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
@@ -1425,23 +1728,37 @@ class V12Trainer:
             if epoch % 10 == 0 or epoch == epochs - 1:
                 print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, Acc={accuracy:.1%}")
             
+            # Save checkpoint on best epoch
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 best_acc = accuracy
-                self.save_model("policy_v12_best.pt", epoch=epoch, best_loss=best_loss, best_acc=best_acc)
+                self.save_model("policy_v13_best.pt", epoch=epoch, best_loss=best_loss, best_acc=best_acc)
+                print(f"  -> New best! Saved checkpoint.")
+            
+            # Also save periodic checkpoint every 20 epochs
+            if (epoch + 1) % 20 == 0:
+                self.save_model(f"policy_v13_epoch{epoch+1}.pt", epoch=epoch, best_loss=best_loss, best_acc=best_acc)
+                print(f"  -> Periodic checkpoint saved (epoch {epoch+1})")
         
         print(f"\nBest: Loss={best_loss:.4f}, Acc={best_acc:.1%}")
-        self.save_model("policy_v12_final.pt")
+        self.save_model("policy_v13_final.pt", epoch=epochs-1, best_loss=best_loss, best_acc=best_acc)
     
-    def train_with_trajectory(self, data: Dict, epochs: int = 50, lr: float = 5e-4) -> None:
+    def train_with_trajectory(self, data: Dict, epochs: int = 60, lr: float = 5e-4,
+                               resume: bool = True) -> None:
         """
         Fine-tune with sequential trajectory context using Truncated BPTT.
         
         This trains the model to consider beats_since_keep and make 
         sequential decisions that maintain musical flow.
+        
+        Args:
+            data: Training data dict from prepare_training_data()
+            epochs: Number of trajectory training epochs
+            lr: Learning rate
+            resume: If True, resume from last trajectory checkpoint if available
         """
         print("\n" + "=" * 70)
-        print("V12 TRAINING WITH TRAJECTORY CONTEXT (TBPTT)")
+        print("V13 TRAINING WITH TRAJECTORY CONTEXT (TBPTT)")
         print("=" * 70)
         
         if self.model is None:
@@ -1455,10 +1772,30 @@ class V12Trainer:
         
         ref_centroid = seq_dataset.reference_centroid.to(DEVICE)
         
+        # Try to resume from trajectory checkpoint
+        start_epoch = 0
         best_loss = float('inf')
+        best_acc = 0
+        
+        if resume:
+            checkpoint_path = self.model_dir / "policy_v13_trajectory_best.pt"
+            if checkpoint_path.exists():
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+                    self.model.load_state_dict(checkpoint['model_state_dict'])
+                    if 'epoch' in checkpoint:
+                        start_epoch = checkpoint['epoch'] + 1
+                    if 'best_loss' in checkpoint:
+                        best_loss = checkpoint['best_loss']
+                    if 'best_acc' in checkpoint:
+                        best_acc = checkpoint['best_acc']
+                    print(f"Resumed trajectory training from epoch {start_epoch}, best_loss={best_loss:.4f}")
+                except Exception as e:
+                    logger.warning(f"Could not load trajectory checkpoint: {e}")
+        
         window_size = 32  # TBPTT window size (beats)
         
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             self.model.train()
             total_loss = 0
             total_correct = 0
@@ -1538,14 +1875,22 @@ class V12Trainer:
             if epoch % 10 == 0 or epoch == epochs - 1:
                 print(f"Epoch {epoch+1}/{epochs}: Loss={avg_loss:.4f}, Acc={accuracy:.1%}")
             
+            # Save checkpoint on best epoch
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                self.save_model("policy_v12_trajectory_best.pt")
+                best_acc = accuracy
+                self.save_model("policy_v13_trajectory_best.pt", epoch=epoch, best_loss=best_loss, best_acc=best_acc)
+                print(f"  -> New best! Saved trajectory checkpoint.")
+            
+            # Also save periodic checkpoint every 20 epochs
+            if (epoch + 1) % 20 == 0:
+                self.save_model(f"policy_v13_trajectory_epoch{epoch+1}.pt", epoch=epoch, best_loss=best_loss, best_acc=best_acc)
+                print(f"  -> Periodic checkpoint saved (epoch {epoch+1})")
         
-        self.save_model("policy_v12_trajectory_final.pt")
+        self.save_model("policy_v13_trajectory_final.pt", epoch=epochs-1, best_loss=best_loss, best_acc=best_acc)
         
         print("\n" + "=" * 70)
-        print("V12 TRAINING COMPLETE")
+        print("V13 TRAJECTORY TRAINING COMPLETE")
         print("=" * 70)
     
     def save_model(self, filename: str, epoch: int = 0, best_loss: float = float('inf'),
@@ -1560,10 +1905,10 @@ class V12Trainer:
             'best_acc': best_acc,
         }, self.model_dir / filename)
         
-        with open(self.model_dir / "scaler_v12.pkl", 'wb') as f:
+        with open(self.model_dir / "scaler_v13.pkl", 'wb') as f:
             pickle.dump(self.scaler, f)
         
-        np.save(self.model_dir / "feature_dim_v12.npy", self.feature_dim)
+        np.save(self.model_dir / "feature_dim_v13.npy", self.feature_dim)
 
 
 # =============================================================================
@@ -2180,34 +2525,41 @@ class V11Editor:
 # V12 EDITOR: Beat-Level Inference
 # =============================================================================
 
-class V12Editor:
+class V13Editor:
     """
-    V12 Beat-level editor with phrase context.
+    V13 Beat-level editor with phrase context and STEM SEPARATION.
     
     Makes keep/cut decisions at the beat level using:
+    - DEMUCS STEM SEPARATION: Extracts vocals + other for melodic focus
     - Bidirectional phrase context (looks at surrounding beats)
     - Rhythmic position encoding (beat-in-bar, downbeat detection)
     - Reference style matching
+    
+    V13 extracts features from the melodic content (vocals + other stems)
+    instead of the full mix, helping identify guitar phrase boundaries.
     """
     
     def __init__(self, model_dir: str = "./models"):
         self.model_dir = Path(model_dir)
         self.sr = 22050
         
+        # V13: Add stem separator
+        self.stem_separator = StemSeparator(sr=self.sr)
+        
         self._load_model()
     
     def _load_model(self):
-        """Load trained V12 model."""
-        self.feature_dim = int(np.load(self.model_dir / "feature_dim_v12.npy"))
+        """Load trained V13 model."""
+        self.feature_dim = int(np.load(self.model_dir / "feature_dim_v13.npy"))
         
-        with open(self.model_dir / "scaler_v12.pkl", 'rb') as f:
+        with open(self.model_dir / "scaler_v13.pkl", 'rb') as f:
             self.scaler = pickle.load(f)
         
         # Load context_beats from checkpoint if available
         context_beats = DEFAULT_CONTEXT_BEATS
         checkpoint_loaded = False
         
-        for model_file in ["policy_v12_best.pt", "policy_v12_final.pt"]:
+        for model_file in ["policy_v13_trajectory_best.pt", "policy_v13_best.pt", "policy_v13_final.pt"]:
             path = self.model_dir / model_file
             if path.exists():
                 checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
@@ -2230,7 +2582,7 @@ class V12Editor:
         
         self.model.eval()
         
-        ref_path = self.model_dir / "reference_centroid_v12.npy"
+        ref_path = self.model_dir / "reference_centroid_v13.npy"
         if ref_path.exists():
             self.reference_centroid = np.load(ref_path)
         else:
@@ -2239,15 +2591,21 @@ class V12Editor:
     def process_track(self, input_path: str, output_path: str,
                      keep_ratio: float = 0.35) -> Dict:
         """
-        Process a track using V12 beat-level policy.
+        Process a track using V13 beat-level policy with stem separation.
         
-        Makes decisions at beat granularity with phrase context.
+        V13 uses Demucs to extract melodic content (vocals + other) for feature
+        extraction, while using full mix for beat detection and output.
         """
-        audio = load_audio_fast(Path(input_path), self.sr)
+        input_path_obj = Path(input_path)
+        audio = load_audio_fast(input_path_obj, self.sr)
         duration = len(audio) / self.sr
         
-        # Detect beats
-        logger.info("Detecting beats...")
+        # V13: Separate stems and get melodic content for features
+        logger.info("Separating stems with Demucs...")
+        melodic_audio = self.stem_separator.get_guitar_focused_audio(audio, input_path_obj)
+        
+        # Detect beats from FULL MIX (better transient detection)
+        logger.info("Detecting beats from full mix...")
         beat_info = detect_beats(audio, self.sr)
         n_beats = len(beat_info.beat_times) - 1  # -1 because we use intervals
         
@@ -2257,20 +2615,22 @@ class V12Editor:
         
         logger.info(f"Detected {n_beats} beats @ {beat_info.tempo:.1f} BPM")
         
-        # Extract beat audio
+        # Extract beat audio from MELODIC content for features
         beat_samples = (beat_info.beat_times * self.sr).astype(int)
-        beat_audio_list = []
-        beat_positions = []
+        melodic_beat_list = []  # For features
+        beat_positions = []      # For cutting from full audio
         
         for i in range(n_beats):
             start = beat_samples[i]
             end = beat_samples[i + 1] if i + 1 < len(beat_samples) else len(audio)
-            if start < len(audio) and end > start:
-                beat_audio_list.append(audio[start:end])
+            if start < len(melodic_audio) and end > start:
+                # Features from melodic content
+                melodic_beat_list.append(melodic_audio[start:min(end, len(melodic_audio))])
                 beat_positions.append((start, end))
         
-        # Extract features
-        features = np.array([extract_features_fast(b, self.sr) for b in beat_audio_list])
+        # V13: Extract features from MELODIC content (guitar-focused)
+        logger.info("Extracting features from melodic content (vocals + other)...")
+        features = np.array([extract_features_fast(b, self.sr) for b in melodic_beat_list])
         features_scaled = self.scaler.transform(features)
         features_tensor = torch.tensor(features_scaled, dtype=torch.float32).to(DEVICE)
         
@@ -2666,6 +3026,176 @@ class HybridV12Editor:
                 'mean': float(hybrid_scores.mean()),
                 'std': float(hybrid_scores.std())
             }
+        }
+
+
+# =============================================================================
+# HYBRID V13 EDITOR: V9 base + V13 stem-separated beat-level
+# =============================================================================
+
+class HybridV13Editor:
+    """
+    Hybrid editor combining V9 quality + V13 stem-separated beat-level.
+    """
+    
+    def __init__(self, model_dir: str = "./models", v9_weight: float = 0.5, v13_weight: float = 0.5):
+        self.model_dir = Path(model_dir)
+        self.sr = 22050
+        self.v9_weight = v9_weight
+        self.v13_weight = v13_weight
+        self.stem_separator = StemSeparator(sr=self.sr)
+        self._load_v9_model()
+        self._load_v13_model()
+        logger.info(f"Hybrid V13 Editor loaded (V9={v9_weight}, V13={v13_weight})")
+    
+    def _load_v9_model(self):
+        from train_edit_policy_v9 import DualHeadModel
+        self.v9_feature_dim = int(np.load(self.model_dir / "feature_dim_v9.npy"))
+        self.v9_reference_centroid = np.load(self.model_dir / "reference_centroid_v9.npy")
+        self.v9_similarity_weight = float(np.load(self.model_dir / "similarity_weight_v9.npy"))
+        self.v9_model = DualHeadModel(self.v9_feature_dim, len(self.v9_reference_centroid)).to(DEVICE)
+        checkpoint = torch.load(self.model_dir / "classifier_v9_best.pt", weights_only=True)
+        self.v9_model.load_state_dict(checkpoint)
+        self.v9_model.eval()
+        self.v9_ref_centroid_t = torch.FloatTensor(self.v9_reference_centroid).to(DEVICE)
+        from train_edit_policy_v10_simple import SegmentFeatureExtractor
+        self.v9_extractor = SegmentFeatureExtractor(self.sr)
+        logger.info("Loaded V9 model")
+    
+    def _load_v13_model(self):
+        try:
+            self.v13_feature_dim = int(np.load(self.model_dir / "feature_dim_v13.npy"))
+            with open(self.model_dir / "scaler_v13.pkl", 'rb') as f:
+                self.v13_scaler = pickle.load(f)
+            context_beats = DEFAULT_CONTEXT_BEATS
+            for model_file in ["policy_v13_trajectory_best.pt", "policy_v13_best.pt", "policy_v13_final.pt"]:
+                path = self.model_dir / model_file
+                if path.exists():
+                    checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+                    if 'context_beats' in checkpoint:
+                        context_beats = checkpoint['context_beats']
+                    self.v13_model = BeatLevelPolicy(self.v13_feature_dim, 64, 256, context_beats).to(DEVICE)
+                    self.v13_model.load_state_dict(checkpoint['model_state_dict'])
+                    logger.info(f"Loaded V13 model: {model_file}")
+                    break
+            self.v13_model.eval()
+            ref_path = self.model_dir / "reference_centroid_v13.npy"
+            self.v13_reference_centroid = np.load(ref_path) if ref_path.exists() else np.zeros(self.v13_feature_dim)
+            self.v13_loaded = True
+        except Exception as e:
+            logger.warning(f"Could not load V13: {e}")
+            self.v13_loaded = False
+    
+    def compute_v9_scores_for_beats(self, beat_positions, audio):
+        segment_samples = int(3.0 * self.sr)
+        hop_samples = int(1.5 * self.sr)
+        segments, segment_positions = [], []
+        start = 0
+        while start + segment_samples <= len(audio):
+            segments.append(audio[start:start + segment_samples])
+            segment_positions.append((start, start + segment_samples))
+            start += hop_samples
+        if not segments:
+            return np.full(len(beat_positions), 0.5)
+        features = np.array([self.v9_extractor.extract(seg) for seg in segments])
+        from train_edit_policy_v10_simple import create_context_windows
+        windowed = create_context_windows(features)
+        windowed_tensor = torch.FloatTensor(windowed).to(DEVICE)
+        with torch.no_grad():
+            quality_logits, style_emb = self.v9_model(windowed_tensor)
+            quality = torch.sigmoid(quality_logits).squeeze().cpu().numpy()
+            ref_sim = torch.mm(style_emb, self.v9_ref_centroid_t.unsqueeze(1)).squeeze()
+            ref_sim = ((ref_sim + 1) / 2).cpu().numpy()
+        segment_scores = quality + self.v9_similarity_weight * ref_sim
+        beat_scores = []
+        for beat_start, beat_end in beat_positions:
+            best_seg, best_overlap = 0, 0
+            for seg_idx, (seg_start, seg_end) in enumerate(segment_positions):
+                overlap = max(0, min(beat_end, seg_end) - max(beat_start, seg_start))
+                if overlap > best_overlap:
+                    best_overlap, best_seg = overlap, seg_idx
+            beat_scores.append(segment_scores[best_seg])
+        return np.array(beat_scores)
+    
+    def compute_v13_scores(self, features_tensor, beat_info):
+        if not self.v13_loaded:
+            return np.zeros(len(features_tensor))
+        ref_scaled = self.v13_scaler.transform(self.v13_reference_centroid.reshape(1, -1))
+        ref_tensor = torch.tensor(ref_scaled[0], dtype=torch.float32).to(DEVICE)
+        with torch.no_grad():
+            style_emb = self.v13_model.compute_style_embedding(ref_tensor)
+            scores, beats_since_keep = [], 0
+            for i in range(len(features_tensor)):
+                logit, _ = self.v13_model.forward_single(features_tensor, i, style_emb, beat_info, beats_since_keep)
+                score = torch.sigmoid(logit).item()
+                scores.append(score)
+                beats_since_keep = 0 if score > 0.5 else beats_since_keep + 1
+        return np.array(scores)
+    
+    def process_track(self, input_path, output_path, keep_ratio=0.35):
+        input_path_obj = Path(input_path)
+        audio = load_audio_fast(input_path_obj, self.sr)
+        duration = len(audio) / self.sr
+        logger.info("Separating stems...")
+        melodic_audio = self.stem_separator.get_guitar_focused_audio(audio, input_path_obj)
+        logger.info("Detecting beats...")
+        beat_info = detect_beats(audio, self.sr)
+        n_beats = len(beat_info.beat_times) - 1
+        if n_beats <= 0:
+            raise ValueError("Beat detection failed")
+        logger.info(f"Detected {n_beats} beats @ {beat_info.tempo:.1f} BPM")
+        beat_samples = (beat_info.beat_times * self.sr).astype(int)
+        melodic_beat_list, beat_positions = [], []
+        for i in range(n_beats):
+            start, end = beat_samples[i], beat_samples[i+1] if i+1 < len(beat_samples) else len(audio)
+            if start < len(melodic_audio) and end > start:
+                melodic_beat_list.append(melodic_audio[start:min(end, len(melodic_audio))])
+                beat_positions.append((start, end))
+        logger.info("Extracting features...")
+        features = np.array([extract_features_fast(b, self.sr) for b in melodic_beat_list])
+        features_scaled = self.v13_scaler.transform(features)
+        features_tensor = torch.tensor(features_scaled, dtype=torch.float32).to(DEVICE)
+        logger.info("Computing V9 scores...")
+        v9_scores = self.compute_v9_scores_for_beats(beat_positions, audio)
+        v9_min, v9_max = v9_scores.min(), v9_scores.max()
+        v9_normalized = (v9_scores - v9_min) / (v9_max - v9_min) if v9_max > v9_min else np.full(len(v9_scores), 0.5)
+        logger.info("Computing V13 scores...")
+        v13_scores = self.compute_v13_scores(features_tensor, beat_info)
+        hybrid_scores = self.v9_weight * v9_normalized + self.v13_weight * v13_scores
+        n_keep = max(1, int(n_beats * keep_ratio))
+        threshold = np.sort(hybrid_scores)[::-1][min(n_keep - 1, len(hybrid_scores) - 1)]
+        keep_mask = hybrid_scores >= threshold
+        kept_regions, in_region, region_start = [], False, 0
+        for i, keep in enumerate(keep_mask):
+            if i < len(beat_positions):
+                if keep and not in_region:
+                    region_start, in_region = beat_positions[i][0], True
+                elif not keep and in_region:
+                    kept_regions.append((region_start, beat_positions[i-1][1]))
+                    in_region = False
+        if in_region and beat_positions:
+            kept_regions.append((region_start, beat_positions[-1][1]))
+        avg_beat = (beat_info.beat_times[1] - beat_info.beat_times[0]) if len(beat_info.beat_times) > 1 else 0.5
+        min_gap = int(2 * avg_beat * self.sr)
+        merged_regions = []
+        for start, end in kept_regions:
+            if merged_regions and start - merged_regions[-1][1] < min_gap:
+                merged_regions[-1] = (merged_regions[-1][0], end)
+            else:
+                merged_regions.append((start, end))
+        output_segments = [audio[s:e] for s, e in merged_regions]
+        output_audio = np.concatenate(output_segments) if output_segments else audio[:int(30*self.sr)]
+        sf.write(output_path, output_audio, self.sr)
+        return {
+            'input_duration': duration,
+            'output_duration': len(output_audio) / self.sr,
+            'n_beats': n_beats,
+            'tempo': beat_info.tempo,
+            'n_regions': len(merged_regions),
+            'keep_ratio_actual': len(output_audio) / len(audio),
+            'v9_score_stats': {'min': float(v9_normalized.min()), 'max': float(v9_normalized.max()), 'mean': float(v9_normalized.mean())},
+            'v13_score_stats': {'min': float(v13_scores.min()), 'max': float(v13_scores.max()), 'mean': float(v13_scores.mean())},
+            'hybrid_score_stats': {'min': float(hybrid_scores.min()), 'max': float(hybrid_scores.max()), 'mean': float(hybrid_scores.mean())}
         }
 
 
@@ -3082,23 +3612,26 @@ if __name__ == "__main__":
     import sys
     import argparse
     
-    parser = argparse.ArgumentParser(description="V12 Beat-Level Editor Training & Testing")
-    parser.add_argument("--mode", choices=["train", "train_trajectory", "test", "test_hybrid"],
-                       default="train", help="Mode: train, train_trajectory, test, test_hybrid")
+    parser = argparse.ArgumentParser(description="V13 Stem-Separated Beat-Level Editor Training & Testing")
+    parser.add_argument("--mode", choices=["train", "train_trajectory", "test"],
+                       default="train", help="Mode: train, train_trajectory, test")
     parser.add_argument("--input", type=str, help="Input file for test mode")
     parser.add_argument("--output", type=str, help="Output file for test mode")
     parser.add_argument("--keep-ratio", type=float, default=0.35, help="Keep ratio (default: 0.35)")
-    parser.add_argument("--v9-weight", type=float, default=0.5, help="V9 weight for hybrid (default: 0.5)")
-    parser.add_argument("--v12-weight", type=float, default=0.5, help="V12 weight for hybrid (default: 0.5)")
-    parser.add_argument("--epochs", type=int, default=100, help="Training epochs")
-    parser.add_argument("--trajectory-epochs", type=int, default=50, help="Trajectory training epochs")
+    parser.add_argument("--epochs", type=int, default=120, help="Training epochs")
+    parser.add_argument("--trajectory-epochs", type=int, default=60, help="Trajectory training epochs")
     parser.add_argument("--model-dir", type=str, default="./models", help="Model directory")
     
     args = parser.parse_args()
     
     if args.mode == "train":
-        # Standard V12 beat-level training
-        trainer = V12Trainer(
+        # V13 beat-level training with stem separation
+        print("=" * 70)
+        print("V13 STEM-SEPARATED TRAINING")
+        print("Uses Demucs to extract vocals + other (melodic content)")
+        print("=" * 70)
+        
+        trainer = V13Trainer(
             input_dir="./training_data/input",
             output_dir="./training_data/desired_output",
             reference_dir="./training_data/reference",
@@ -3109,10 +3642,10 @@ if __name__ == "__main__":
     elif args.mode == "train_trajectory":
         # Trajectory training (TBPTT) for sequential context
         print("=" * 70)
-        print("V12 TRAJECTORY TRAINING (TBPTT)")
+        print("V13 TRAJECTORY TRAINING (TBPTT) with Stem Separation")
         print("=" * 70)
         
-        trainer = V12Trainer(
+        trainer = V13Trainer(
             input_dir="./training_data/input",
             output_dir="./training_data/desired_output",
             reference_dir="./training_data/reference",
@@ -3132,28 +3665,28 @@ if __name__ == "__main__":
         print(f"Initialized model with feature_dim={trainer.feature_dim}")
         
         # Load best weights if available
-        for model_file in ["policy_v12_best.pt", "policy_v12_final.pt"]:
+        for model_file in ["policy_v13_best.pt", "policy_v13_final.pt"]:
             path = Path(args.model_dir) / model_file
             if path.exists():
                 checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
                 trainer.model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"Loaded existing V12 model weights: {model_file}")
+                print(f"Loaded existing V13 model weights: {model_file}")
                 break
         
         trainer.train_with_trajectory(training_data, epochs=args.trajectory_epochs)
         
     elif args.mode == "test":
-        # Test V12 editor
+        # Test V13 editor (with stem separation)
         if not args.input:
             parser.error("--input required for test mode")
         
-        output = args.output or args.input.replace(".wav", "_v12_out.wav")
+        output = args.output or args.input.replace(".wav", "_v13_out.wav")
         
-        editor = V12Editor(args.model_dir)
+        editor = V13Editor(args.model_dir)
         result = editor.process_track(args.input, output, keep_ratio=args.keep_ratio)
         
         print("\n" + "=" * 70)
-        print("V12 EDIT RESULT")
+        print("V13 STEM-SEPARATED EDIT RESULT")
         print("=" * 70)
         print(f"Input:  {result['input_duration']:.1f}s")
         print(f"Output: {result['output_duration']:.1f}s ({result['keep_ratio_actual']*100:.1f}% kept)")
@@ -3163,29 +3696,4 @@ if __name__ == "__main__":
             stats = result['score_stats']
             print(f"\nScores: min={stats['min']:.3f}, max={stats['max']:.3f}, "
                   f"mean={stats['mean']:.3f}, std={stats['std']:.3f}")
-        print(f"\nOutput saved to: {output}")
-        
-    elif args.mode == "test_hybrid":
-        # Test Hybrid V12 editor
-        if not args.input:
-            parser.error("--input required for test_hybrid mode")
-        
-        output = args.output or args.input.replace(".wav", "_hybrid_v12_out.wav")
-        
-        editor = HybridV12Editor(args.model_dir, v9_weight=args.v9_weight, v12_weight=args.v12_weight)
-        result = editor.process_track(args.input, output, keep_ratio=args.keep_ratio)
-        
-        print("\n" + "=" * 70)
-        print(f"HYBRID V12 EDIT RESULT (V9={args.v9_weight}, V12={args.v12_weight})")
-        print("=" * 70)
-        print(f"Input:  {result['input_duration']:.1f}s")
-        print(f"Output: {result['output_duration']:.1f}s ({result['keep_ratio_actual']*100:.1f}% kept)")
-        print(f"Beats:  {result['n_beats']} @ {result['tempo']:.1f} BPM")
-        print(f"Regions: {result['n_regions']}")
-        print(f"\nV9 Scores:  min={result['v9_score_stats']['min']:.3f}, max={result['v9_score_stats']['max']:.3f}, "
-              f"std={result['v9_score_stats']['std']:.3f}")
-        print(f"V12 Scores: min={result['v12_score_stats']['min']:.3f}, max={result['v12_score_stats']['max']:.3f}, "
-              f"std={result['v12_score_stats']['std']:.3f}")
-        print(f"Hybrid:     min={result['hybrid_score_stats']['min']:.3f}, max={result['hybrid_score_stats']['max']:.3f}, "
-              f"std={result['hybrid_score_stats']['std']:.3f}")
         print(f"\nOutput saved to: {output}")
