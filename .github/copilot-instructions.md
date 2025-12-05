@@ -87,6 +87,10 @@ Three complementary signals:
 - stable-baselines3 or custom PPO/DPO - RL algorithms
 
 ## Development Guidelines
+- ALWAYS try to use CUDA if available (don't fall back to CPU)
+- No shortcuts - write clean, modular, well-documented code
+- No simplifying assumptions about music structure
+- As much machine learning as possible (minimize hard-coded rules)
 - Use type hints for all functions
 - Follow PEP 8 style guidelines
 - Write unit tests for new features
