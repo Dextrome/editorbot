@@ -80,11 +80,18 @@ class NATTENLayer(nn.Module):
         qkv = qkv.permute(2, 0, 1, 3, 4)  # (3, B, L, H, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (B, L, H, head_dim)
         
+        # Determine effective kernel size (must be <= sequence length, odd, and >= 3)
+        effective_kernel = min(self.kernel_size, L)
+        if effective_kernel % 2 == 0:
+            effective_kernel = max(3, effective_kernel - 1)
+        effective_kernel = max(3, effective_kernel)  # NATTEN requires kernel >= 2, we use 3 for safety
+        
         # Apply NATTEN neighborhood attention or sliding window fallback
-        if NATTEN_AVAILABLE:
-            out = natten.na1d(q, k, v, kernel_size=self.kernel_size, dilation=self.dilation)
+        if NATTEN_AVAILABLE and L >= effective_kernel:
+            out = natten.na1d(q, k, v, kernel_size=effective_kernel, dilation=self.dilation)
         else:
             # Sliding window attention fallback (provides same locality as NATTEN)
+            # Used when NATTEN unavailable OR sequence too short for kernel
             out = self._sliding_window_attention(q, k, v)
         
         # Reshape and project
