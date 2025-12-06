@@ -492,4 +492,49 @@ def main():
                 cached += 1
             else:
                 errors += 1
-   
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Stems: {computed} computed, {cached} cached, {errors} errors ({elapsed:.1f}s)")
+    
+    # === Phase 3: Cache Edit Labels ===
+    if not args.no_labels and pairs:
+        logger.info("\n=== Phase 3: Caching Edit Labels ===")
+        start_time = time.time()
+        
+        computed = 0
+        cached = 0
+        errors = 0
+        
+        for i, (raw_path, edited_path) in enumerate(pairs):
+            result = cache_pair_labels(
+                raw_path, edited_path, cache, config, force=args.force
+            )
+            
+            if result["status"] == "computed":
+                computed += 1
+                logger.info(
+                    f"[{i+1}/{len(pairs)}] Labels: {raw_path.name} "
+                    f"(keep ratio: {result.get('keep_ratio', 0):.1%})"
+                )
+            elif result["status"] == "cached":
+                cached += 1
+            else:
+                errors += 1
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Labels: {computed} computed, {cached} cached, {errors} errors ({elapsed:.1f}s)")
+    
+    # === Summary ===
+    stats = cache.get_stats()
+    logger.info("\n=== Cache Summary ===")
+    logger.info(f"Cache directory: {stats['cache_dir']}")
+    logger.info(f"Total files: {stats['total_files']}")
+    logger.info(f"Total size: {stats['total_size_mb']:.1f} MB")
+    for subdir, info in stats['subdirs'].items():
+        logger.info(f"  {subdir}: {info['files']} files ({info['size_mb']:.1f} MB)")
+    
+    logger.info("\nPre-caching complete!")
+
+
+if __name__ == "__main__":
+    main()

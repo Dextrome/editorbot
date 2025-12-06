@@ -14,7 +14,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import multiprocessing as mp
 from dataclasses import dataclass
@@ -35,6 +35,7 @@ from .agent import Agent
 from .state import AudioState, EditHistory
 from .reward import compute_trajectory_return
 from .logging_utils import TrainingLogger, create_logger
+from .learned_reward_integration import LearnedRewardIntegration
 
 logger = logging.getLogger(__name__)
 
@@ -140,17 +141,28 @@ class RolloutBuffer:
 class VectorizedEnvWrapper:
     """Wrapper for running multiple environments in parallel."""
     
-    def __init__(self, config: Config, n_envs: int = 4):
+    def __init__(self, config: Config, n_envs: int = 4, learned_reward_model: Optional[Any] = None):
         self.config = config
         self.n_envs = n_envs
         self.envs: List[Optional[AudioEditingEnv]] = [None] * n_envs
         self.audio_states: List[Optional[AudioState]] = [None] * n_envs
+        self.learned_reward_model = learned_reward_model
+        
+    def set_learned_reward_model(self, model: Any) -> None:
+        """Set the learned reward model for all environments."""
+        self.learned_reward_model = model
+        for env in self.envs:
+            if env is not None:
+                env.set_learned_reward_model(model)
         
     def set_audio_states(self, audio_states: List[AudioState]):
         """Set audio states for all environments."""
         for i, state in enumerate(audio_states[:self.n_envs]):
             self.audio_states[i] = state
-            self.envs[i] = AudioEditingEnv(self.config, audio_state=state)
+            self.envs[i] = AudioEditingEnv(
+                self.config, audio_state=state, 
+                learned_reward_model=self.learned_reward_model
+            )
     
     def reset_all(self) -> Tuple[List[np.ndarray], List[dict]]:
         """Reset all environments."""
@@ -164,7 +176,11 @@ class VectorizedEnvWrapper:
         return obs_list, info_list
     
     def step_all(self, actions: List[int]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
-        """Step all environments with given actions."""
+        """Step all environments with given actions.
+        
+        When trajectory rewards are enabled, adds end-of-episode quality reward.
+        When learned rewards are enabled, also adds learned reward model output.
+        """
         next_obs_list = []
         reward_list = []
         terminated_list = []
@@ -174,6 +190,22 @@ class VectorizedEnvWrapper:
         for env, action in zip(self.envs, actions):
             if env is not None:
                 next_obs, reward, terminated, truncated, info = env.step(action)
+                
+                # Add trajectory reward at episode end if enabled
+                if (terminated or truncated) and self.config.reward.use_trajectory_rewards:
+                    trajectory_reward = env.compute_trajectory_reward()
+                    reward += trajectory_reward
+                    info['trajectory_reward'] = trajectory_reward
+                
+                # Add learned reward at episode end if enabled
+                if (terminated or truncated) and self.config.reward.use_learned_rewards:
+                    learned_reward = env.compute_learned_episode_reward()
+                    # Scale learned reward to be in similar range as trajectory
+                    learned_reward_scale = self.config.reward.trajectory_reward_scale * 0.5
+                    scaled_learned_reward = learned_reward * learned_reward_scale
+                    reward += scaled_learned_reward
+                    info['learned_reward'] = scaled_learned_reward
+                
                 next_obs_list.append(next_obs)
                 reward_list.append(reward)
                 terminated_list.append(terminated)
@@ -218,6 +250,7 @@ class ParallelPPOTrainer:
         prefetch_factor: int = 2,
         total_epochs: int = 1000,
         keep_cut_only: bool = True,  # Default to KEEP/CUT only for stability
+        learned_reward_model: Optional[Any] = None,
     ):
         self.config = config
         self.n_envs = n_envs
@@ -225,10 +258,16 @@ class ParallelPPOTrainer:
         self.total_epochs = total_epochs
         self.current_epoch = 0
         self.keep_cut_only = keep_cut_only  # Restrict to KEEP/CUT actions
+        self.learned_reward_model = learned_reward_model
         self.device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         
-        # Vectorized environments
-        self.vec_env = VectorizedEnvWrapper(config, n_envs)
+        # Entropy coefficient (can decay over training)
+        self.initial_entropy_coeff = config.ppo.entropy_coeff
+        self.entropy_coeff_min = getattr(config.ppo, 'entropy_coeff_min', 0.01)
+        self.entropy_coeff_decay = getattr(config.ppo, 'entropy_coeff_decay', True)
+        
+        # Vectorized environments (pass learned reward model if provided)
+        self.vec_env = VectorizedEnvWrapper(config, n_envs, learned_reward_model=learned_reward_model)
         
         # Agent (initialized later when we know input dimensions)
         self.agent: Optional[Agent] = None
@@ -249,6 +288,14 @@ class ParallelPPOTrainer:
         self.episode_rewards = []
         self.episode_lengths = []
         
+        # Reward normalization (running statistics)
+        self.reward_mean = 0.0
+        self.reward_var = 1.0
+        self.reward_count = 0
+        
+        # Target KL for early stopping
+        self.target_kl = getattr(config.ppo, 'target_kl', 0.01)
+        
         # Logging
         self.training_logger: Optional[TrainingLogger] = None
         if config.training.use_tensorboard or config.training.use_wandb:
@@ -259,6 +306,7 @@ class ParallelPPOTrainer:
         
         logger.info(f"Initialized ParallelPPOTrainer with {n_envs} environments on {self.device}")
         logger.info(f"Action mode: {'KEEP/CUT only' if keep_cut_only else 'Full action space'}")
+        logger.info(f"Target KL for early stopping: {self.target_kl}")
         if config.ppo.lr_decay:
             logger.info(f"LR decay enabled: {config.ppo.lr_decay_type}, warmup={config.ppo.lr_warmup_epochs}, min_ratio={config.ppo.lr_min_ratio}")
     
@@ -293,18 +341,55 @@ class ParallelPPOTrainer:
             self.value_scheduler.step()
         self.current_epoch += 1
         
-        # Log current learning rate
+        # Log current learning rate and entropy coefficient
         if self.policy_optimizer:
             current_lr = self.policy_optimizer.param_groups[0]['lr']
             if self.training_logger:
                 self.training_logger.log_scalar("learning_rate", current_lr, self.current_epoch)
-            logger.info(f"Epoch {self.current_epoch}: LR = {current_lr:.2e}")
+                self.training_logger.log_scalar("entropy_coeff", self.get_current_entropy_coeff(), self.current_epoch)
+    
+    def get_current_entropy_coeff(self) -> float:
+        """Get current entropy coefficient with decay."""
+        if not self.entropy_coeff_decay:
+            return self.initial_entropy_coeff
+        
+        # Linear decay from initial to min
+        progress = self.current_epoch / max(self.total_epochs, 1)
+        decay_range = self.initial_entropy_coeff - self.entropy_coeff_min
+        current = self.initial_entropy_coeff - progress * decay_range
+        return max(current, self.entropy_coeff_min)
     
     def get_current_lr(self) -> float:
         """Get the current learning rate."""
         if self.policy_optimizer:
             return self.policy_optimizer.param_groups[0]['lr']
         return self.config.ppo.learning_rate
+    
+    def normalize_rewards(self, rewards: np.ndarray) -> np.ndarray:
+        """Normalize rewards using running statistics (Welford's algorithm).
+        
+        This reduces reward variance and helps stabilize training.
+        """
+        # Update running statistics
+        for r in rewards.flatten():
+            self.reward_count += 1
+            delta = r - self.reward_mean
+            self.reward_mean += delta / self.reward_count
+            delta2 = r - self.reward_mean
+            self.reward_var += delta * delta2
+        
+        # Compute standard deviation
+        if self.reward_count > 1:
+            std = np.sqrt(self.reward_var / (self.reward_count - 1))
+        else:
+            std = 1.0
+        
+        # Normalize with small epsilon for stability
+        std = max(std, 1e-8)
+        normalized = (rewards - self.reward_mean) / std
+        
+        # Clip to prevent extreme values
+        return np.clip(normalized, -10.0, 10.0)
     
     def collect_rollouts_parallel(
         self,
@@ -392,6 +477,10 @@ class ParallelPPOTrainer:
                 if terminated or truncated:
                     self.episode_rewards.append(episode_rewards[i])
                     self.episode_lengths.append(episode_lengths[i])
+                    # Log episode completion with learned reward if applicable
+                    if self.config.reward.use_learned_rewards:
+                        learned_r = infos[i].get('learned_reward', 0.0) if i < len(infos) else 0.0
+                        logger.debug(f"Episode complete: len={episode_lengths[i]}, total_r={episode_rewards[i]:.2f}, learned_r={learned_r:.2f}")
                     episode_rewards[i] = 0.0
                     episode_lengths[i] = 0
                     # Reset this environment
@@ -453,10 +542,16 @@ class ParallelPPOTrainer:
         policy_losses = []
         value_losses = []
         entropy_losses = []
+        approx_kl_divs = []  # Track KL divergence
         nan_batches_skipped = 0
+        early_stop_epoch = False
         
         for epoch in range(ppo_config.n_epochs):
+            if early_stop_epoch:
+                break
+                
             indices = np.random.permutation(n_samples)
+            epoch_kl_divs = []
             
             for start in range(0, n_samples, batch_size):
                 end = min(start + batch_size, n_samples)
@@ -489,24 +584,31 @@ class ParallelPPOTrainer:
                 log_ratio = torch.clamp(log_ratio, -10.0, 10.0)  # Prevent extreme ratios
                 ratio = torch.exp(log_ratio)
                 
+                # Compute approximate KL divergence for early stopping
+                # KL(old || new) ≈ (ratio - 1) - log(ratio)
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                    epoch_kl_divs.append(approx_kl)
+                
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - ppo_config.clip_ratio, 1 + ppo_config.clip_ratio) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                # Value loss
+                # Value loss with clipping for stability
                 values = self.agent.compute_value_batch(batch_states)
                 if torch.isnan(values).any():
                     values = torch.nan_to_num(values, nan=0.0)
                 value_loss = nn.functional.mse_loss(values, batch_returns)
                 
-                # Entropy bonus (encourage exploration)
+                # Entropy bonus (encourage exploration) - use dynamic entropy coeff
                 entropy_loss = -entropy.mean()
+                current_entropy_coeff = self.get_current_entropy_coeff()
                 
                 # Combined loss
                 loss = (
                     policy_loss 
                     + ppo_config.value_loss_coeff * value_loss 
-                    + ppo_config.entropy_coeff * entropy_loss
+                    + current_entropy_coeff * entropy_loss
                 )
                 
                 # Final NaN check - skip only if still NaN after all handling
@@ -530,6 +632,14 @@ class ParallelPPOTrainer:
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
+            
+            # Check KL divergence after each epoch for early stopping
+            if epoch_kl_divs:
+                mean_kl = np.mean(epoch_kl_divs)
+                approx_kl_divs.append(mean_kl)
+                if mean_kl > 1.5 * self.target_kl:
+                    logger.debug(f"Early stopping at PPO epoch {epoch+1} due to KL divergence: {mean_kl:.4f}")
+                    early_stop_epoch = True
         
         # Log warning if many batches were skipped
         if nan_batches_skipped > 0:
@@ -545,6 +655,7 @@ class ParallelPPOTrainer:
                 "entropy_loss": 0.0,
                 "episode_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0.0,
                 "total_loss": 999.0,
+                "approx_kl": 0.0,
             }
         
         metrics = {
@@ -553,6 +664,8 @@ class ParallelPPOTrainer:
             "entropy_loss": np.mean(entropy_losses),
             "episode_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0.0,
             "total_loss": np.mean(policy_losses) + ppo_config.value_loss_coeff * np.mean(value_losses),
+            "approx_kl": np.mean(approx_kl_divs) if approx_kl_divs else 0.0,
+            "n_episodes": len(self.episode_rewards),
         }
         
         # Log metrics
@@ -565,6 +678,8 @@ class ParallelPPOTrainer:
                 episode_reward=metrics["episode_reward"],
                 episode_length=int(np.mean(self.episode_lengths[-100:])) if self.episode_lengths else 0,
             )
+            # Log KL divergence
+            self.training_logger.log_scalar("approx_kl", metrics["approx_kl"], self.global_step)
         
         return metrics
     
@@ -643,8 +758,19 @@ def train_parallel(
     
     logger.info(f"Loaded {len(dataset)} training samples ({len(dataset.pairs)} pairs, {len(dataset.reference_files)} reference)")
     
+    # Load learned reward model if enabled
+    learned_reward_model = None
+    if config.reward.use_learned_rewards:
+        reward_integration = LearnedRewardIntegration(config)
+        if reward_integration.load_model():
+            learned_reward_model = reward_integration.model
+            logger.info("✓ Learned reward model loaded for RLHF training")
+        else:
+            logger.warning("Could not load learned reward model - using dense rewards only")
+            config.reward.use_learned_rewards = False
+    
     # Create trainer with total_epochs for LR scheduling
-    trainer = ParallelPPOTrainer(config, n_envs=n_envs, total_epochs=n_epochs)
+    trainer = ParallelPPOTrainer(config, n_envs=n_envs, total_epochs=n_epochs, learned_reward_model=learned_reward_model)
     
     # Load checkpoint if provided
     if checkpoint_path and Path(checkpoint_path).exists():
@@ -714,10 +840,11 @@ def train_parallel(
         current_lr = trainer.get_current_lr()
         
         # Log progress
+        n_eps = metrics.get('n_episodes', 0)
         logger.info(
             f"Epoch {epoch + 1}/{n_epochs} | "
             f"Loss: {metrics['total_loss']:.4f} (P: {metrics['policy_loss']:.4f}, V: {metrics['value_loss']:.4f}) | "
-            f"Reward: {metrics['episode_reward']:.2f} | "
+            f"Reward: {metrics['episode_reward']:.2f} (eps: {n_eps}) | "
             f"LR: {current_lr:.2e} | "
             f"Steps: {trainer.global_step:,} | "
             f"Time: {epoch_time:.1f}s"
@@ -759,6 +886,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=2048, help="Steps per epoch")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument("--target_loss", type=float, default=0.01, help="Target loss to stop training")
+    parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model (RLHF)")
     
     args = parser.parse_args()
     
@@ -769,6 +897,11 @@ if __name__ == "__main__":
     )
     
     config = get_default_config()
+    
+    # Enable learned rewards if requested
+    if args.use_learned_rewards:
+        config.reward.use_learned_rewards = True
+        logger.info("Learned rewards ENABLED (RLHF mode)")
     
     train_parallel(
         config=config,

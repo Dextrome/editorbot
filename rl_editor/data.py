@@ -468,6 +468,18 @@ class PairedAudioDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.pairs) + len(self.reference_files)
+    
+    def is_reference_track(self, idx: int) -> bool:
+        """Check if index corresponds to a reference track (not a paired track)."""
+        return idx >= len(self.pairs)
+    
+    def get_num_paired(self) -> int:
+        """Get number of paired (input/output) tracks."""
+        return len(self.pairs)
+    
+    def get_num_reference(self) -> int:
+        """Get number of reference tracks."""
+        return len(self.reference_files)
 
     def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str, Dict]]:
         """Get paired item from dataset.
@@ -957,4 +969,16 @@ def create_dataloader(
     """Create a DataLoader for the dataset."""
     
     def collate_fn(batch):
-        # Custom collate to handle variable length aud
+        # Custom collate to handle variable length audio/features
+        # For now, just return list of dicts or pad
+        # Simple version: return list
+        return batch
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True if torch.cuda.is_available() else False
+    )

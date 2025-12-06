@@ -56,7 +56,10 @@ class RewardConfig:
     use_sparse_rewards: bool = True
     use_dense_rewards: bool = True
     use_learned_rewards: bool = False
-    target_keep_ratio: float = 0.35  # Legacy, not used with duration-based rewards
+    use_trajectory_rewards: bool = True  # NEW: End-of-episode audio quality reward
+    trajectory_reward_scale: float = 100.0  # Scale factor for trajectory rewards
+    step_reward_scale: float = 0.01  # Scale down step rewards when using trajectory
+    target_keep_ratio: float = 0.35  # Target ratio of beats to keep (~35%)
     target_max_duration_s: float = 600.0  # 10 minutes max output duration
     duration_penalty_weight: float = 0.5  # Penalty multiplier for exceeding target
     max_loop_ratio: float = 0.15  # Max fraction of beats that should be looped (15%)
@@ -65,6 +68,8 @@ class RewardConfig:
     energy_flow_weight: float = 1.0
     phrase_completeness_weight: float = 0.8
     transition_quality_weight: float = 0.9
+    keep_ratio_weight: float = 1.0  # Weight for hitting target keep ratio
+    transition_smoothness_weight: float = 1.5  # Weight for smooth transitions (no clicks)
 
 
 @dataclass
@@ -86,7 +91,7 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 1e-4  # Standard LR
+    learning_rate: float = 3e-5  # Lower LR for stability (was 1e-4)
     lr_decay: bool = True  # Enable learning rate decay
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
     lr_min_ratio: float = 0.1  # Minimum LR as ratio of initial
@@ -96,8 +101,11 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.2  # Standard PPO clipping
-    entropy_coeff: float = 0.05  # Moderate entropy for exploration
+    clip_ratio: float = 0.1  # Tighter clipping for stability (was 0.2)
+    target_kl: float = 0.01  # Target KL divergence for early stopping
+    entropy_coeff: float = 0.05  # Reduced entropy for stability (was 0.1)
+    entropy_coeff_decay: bool = True  # Decay entropy over training
+    entropy_coeff_min: float = 0.01  # Minimum entropy coefficient
     value_loss_coeff: float = 0.5
     max_grad_norm: float = 0.5  # Standard grad clipping
     n_epochs: int = 3  # PPO epochs per update

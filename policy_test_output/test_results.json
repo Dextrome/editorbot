@@ -1,0 +1,77 @@
+[
+  {
+    "song_id": "test_song_000",
+    "n_beats": 45,
+    "duration_orig": 22.5,
+    "old_policy": {
+      "keep_ratio": 0.5805751478368133,
+      "duration": 12.5,
+      "file": "policy_test_output\\test_song_000_old_policy.wav"
+    },
+    "new_policy": {
+      "keep_ratio": 0.3904745443537483,
+      "duration": 8.5,
+      "file": "policy_test_output\\test_song_000_new_policy.wav"
+    }
+  },
+  {
+    "song_id": "test_song_001",
+    "n_beats": 43,
+    "duration_orig": 21.5,
+    "old_policy": {
+      "keep_ratio": 0.6236926702868011,
+      "duration": 12.5,
+      "file": "policy_test_output\\test_song_001_old_policy.wav"
+    },
+    "new_policy": {
+      "keep_ratio": 0.39833650897577233,
+      "duration": 8.5,
+      "file": "policy_test_output\\test_song_001_new_policy.wav"
+    }
+  },
+  {
+    "song_id": "test_song_002",
+    "n_beats": 49,
+    "duration_orig": 24.5,
+    "old_policy": {
+      "keep_ratio": 0.6461167155021847,
+      "duration": 15.0,
+      "file": "policy_test_output\\test_song_002_old_policy.wav"
+    },
+    "new_policy": {
+      "keep_ratio": 0.2996127143293804,
+      "duration": 7.0,
+      "file": "policy_test_output\\test_song_002_new_policy.wav"
+    }
+  },
+  {
+    "song_id": "test_song_003",
+    "n_beats": 34,
+    "duration_orig": 17.0,
+    "old_policy": {
+      "keep_ratio": 0.4824628486790153,
+      "duration": 7.5,
+      "file": "policy_test_output\\test_song_003_old_policy.wav"
+    },
+    "new_policy": {
+      "keep_ratio": 0.28643788001467896,
+      "duration": 4.0,
+      "file": "policy_test_output\\test_song_003_new_policy.wav"
+    }
+  },
+  {
+    "song_id": "test_song_004",
+    "n_beats": 36,
+    "duration_orig": 18.0,
+    "old_policy": {
+      "keep_ratio": 0.46142542808916465,
+      "duration": 8.0,
+      "file": "policy_test_output\\test_song_004_old_policy.wav"
+    },
+    "new_policy": {
+      "keep_ratio": 0.33077416398569837,
+      "duration": 5.0,
+      "file": "policy_test_output\\test_song_004_new_policy.wav"
+    }
+  }
+]

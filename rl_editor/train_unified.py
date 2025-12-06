@@ -27,6 +27,7 @@ from .agent import Agent
 from .state import AudioState, EditHistory, StateRepresentation
 from .train_parallel import ParallelPPOTrainer, train_parallel
 from .logging_utils import TrainingLogger, create_logger
+from .train_reward_model import LearnedRewardModel
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,7 @@ def run_rl_phase(
     n_envs: int = 4,
     steps_per_epoch: int = 2048,
     save_dir: str = "./models",
+    reward_model_path: Optional[str] = None,
 ) -> Dict[str, float]:
     """Run RL fine-tuning phase.
     
@@ -284,6 +286,7 @@ def run_rl_phase(
         n_envs: Number of parallel environments
         steps_per_epoch: Steps per epoch
         save_dir: Directory to save checkpoints
+        reward_model_path: Optional path to learned reward model checkpoint
         
     Returns:
         Training metrics
@@ -292,9 +295,32 @@ def run_rl_phase(
     logger.info("PHASE 2: RL Fine-tuning (PPO)")
     logger.info("=" * 60)
     
-    # Create trainer with the pre-trained agent
+    # Load learned reward model if enabled and path provided
+    learned_reward_model = None
+    if config.reward.use_learned_rewards and reward_model_path:
+        try:
+            reward_checkpoint = torch.load(reward_model_path, map_location='cpu')
+            # Get input dim from first layer weight shape
+            input_dim = reward_checkpoint['model_state_dict']['input_proj.weight'].shape[1]
+            learned_reward_model = LearnedRewardModel(
+                input_dim=input_dim,
+                hidden_dim=config.model.value_hidden_dim,
+            )
+            learned_reward_model.load_state_dict(reward_checkpoint['model_state_dict'])
+            device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
+            learned_reward_model.to(device)
+            learned_reward_model.eval()
+            logger.info(f"Loaded learned reward model from {reward_model_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load reward model: {e}")
+            learned_reward_model = None
+    
+    # Create trainer with the pre-trained agent and optional reward model
     # Use full action space so agent can learn LOOP/CROSSFADE/REORDER
-    trainer = ParallelPPOTrainer(config, n_envs=n_envs, total_epochs=n_epochs, keep_cut_only=False)
+    trainer = ParallelPPOTrainer(
+        config, n_envs=n_envs, total_epochs=n_epochs, 
+        keep_cut_only=False, learned_reward_model=learned_reward_model
+    )
     
     # Copy pre-trained weights to trainer's agent (once initialized)
     # We'll do this after the first rollout initializes the agent
@@ -341,6 +367,8 @@ def run_rl_phase(
             raw_data = item["raw"]
             beat_times = raw_data["beat_times"].numpy()
             beat_features = raw_data["beat_features"].numpy()
+            raw_audio = raw_data["audio"].numpy() if "audio" in raw_data else None
+            sample_rate = raw_data.get("sample_rate", 22050)
             
             edit_labels = item.get("edit_labels")
             if edit_labels is not None:
@@ -352,6 +380,11 @@ def run_rl_phase(
                 beat_features = beat_features[start_idx:start_idx + MAX_BEATS]
                 if edit_labels is not None and len(edit_labels) > MAX_BEATS:
                     edit_labels = edit_labels[start_idx:start_idx + MAX_BEATS]
+                # Also slice raw audio if available
+                if raw_audio is not None:
+                    start_sample = int(beat_times[0] * sample_rate) if start_idx > 0 else 0
+                    end_sample = int((beat_times[-1] + 0.5) * sample_rate)  # Add buffer
+                    raw_audio = raw_audio[start_sample:min(end_sample, len(raw_audio))]
                 beat_times = beat_times - beat_times[0]
             
             audio_state = AudioState(
@@ -360,6 +393,8 @@ def run_rl_phase(
                 beat_features=beat_features,
                 tempo=raw_data["tempo"].item(),
                 target_labels=edit_labels,
+                raw_audio=raw_audio,
+                sample_rate=sample_rate if isinstance(sample_rate, int) else int(sample_rate),
             )
             audio_states.append(audio_state)
         
@@ -467,6 +502,7 @@ def train_unified(
     save_dir: str = "./models",
     skip_bc: bool = False,
     bc_checkpoint: Optional[str] = None,
+    reward_model_path: Optional[str] = None,
 ):
     """Run unified BC + RL training workflow.
     
@@ -482,6 +518,7 @@ def train_unified(
         save_dir: Directory to save checkpoints
         skip_bc: Skip BC phase (use existing checkpoint)
         bc_checkpoint: Path to BC checkpoint to load
+        reward_model_path: Path to learned reward model checkpoint
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = Path(save_dir)
@@ -555,6 +592,7 @@ def train_unified(
             n_envs=n_envs,
             steps_per_epoch=steps_per_epoch,
             save_dir=str(save_path),
+            reward_model_path=reward_model_path,
         )
     
     logger.info("=" * 60)
@@ -570,10 +608,16 @@ def main():
     parser.add_argument("--bc_lr", type=float, default=1e-4, help="BC learning rate")
     parser.add_argument("--bc_batch_size", type=int, default=64, help="BC batch size")
     parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel RL environments")
-    parser.add_argument("--steps", type=int, default=2048, help="RL steps per epoch")
+    parser.add_argument("--steps", type=int, default=2048, help="RL steps per epoch (try 4096 or 8192 for longer episodes)")
     parser.add_argument("--save_dir", type=str, default="./models", help="Save directory")
     parser.add_argument("--skip_bc", action="store_true", help="Skip BC phase")
     parser.add_argument("--bc_checkpoint", type=str, default=None, help="BC checkpoint to load")
+    parser.add_argument("--entropy_coeff", type=float, default=None, help="Entropy coefficient for exploration (default: 0.1)")
+    parser.add_argument("--lr", type=float, default=None, help="Override RL learning rate")
+    parser.add_argument("--trajectory_rewards", action="store_true", default=True, help="Use trajectory-based rewards (audio quality)")
+    parser.add_argument("--no_trajectory_rewards", action="store_true", help="Disable trajectory rewards, use supervised step rewards")
+    parser.add_argument("--reward_model_path", type=str, default=None, help="Path to learned reward model checkpoint")
+    parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model")
     
     args = parser.parse_args()
     
@@ -584,6 +628,37 @@ def main():
     )
     
     config = get_default_config()
+    
+    # Override config with CLI args
+    if args.entropy_coeff is not None:
+        config.ppo.entropy_coeff = args.entropy_coeff
+        logger.info(f"Using entropy coefficient: {args.entropy_coeff}")
+    if args.lr is not None:
+        config.ppo.learning_rate = args.lr
+        logger.info(f"Using RL learning rate: {args.lr}")
+    
+    # Trajectory rewards setting
+    if args.no_trajectory_rewards:
+        config.reward.use_trajectory_rewards = False
+        logger.info("Using supervised step rewards (trajectory rewards disabled)")
+    else:
+        config.reward.use_trajectory_rewards = True
+        logger.info("Using trajectory-based audio quality rewards")
+    
+    # Learned reward model settings
+    if args.use_learned_rewards:
+        config.reward.use_learned_rewards = True
+        logger.info("Learned reward model ENABLED")
+        if args.reward_model_path:
+            logger.info(f"Reward model path: {args.reward_model_path}")
+        else:
+            # Try default path
+            default_reward_path = "./models/reward_model/reward_model_best.pt"
+            if Path(default_reward_path).exists():
+                args.reward_model_path = default_reward_path
+                logger.info(f"Using default reward model: {default_reward_path}")
+            else:
+                logger.warning("No reward model path provided and default not found!")
     
     train_unified(
         config=config,
@@ -597,6 +672,7 @@ def main():
         save_dir=args.save_dir,
         skip_bc=args.skip_bc,
         bc_checkpoint=args.bc_checkpoint,
+        reward_model_path=args.reward_model_path,
     )
 
 

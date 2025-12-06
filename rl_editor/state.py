@@ -24,6 +24,8 @@ class AudioState:
     tempo: Optional[float] = None
     energy_contour: Optional[np.ndarray] = None  # Shape: (n_frames,)
     target_labels: Optional[np.ndarray] = None  # Shape: (n_beats,) - Ground truth KEEP=1/CUT=0 from human edits
+    raw_audio: Optional[np.ndarray] = None  # Shape: (n_samples,) - Raw audio for trajectory reward
+    sample_rate: int = 22050  # Audio sample rate
 
 
 @dataclass
