@@ -1,6 +1,8 @@
 """Policy and value networks for RL agent.
 
-Includes transformer-based option for better context understanding.
+Uses hybrid NATTEN encoder: local neighborhood attention + global pooling.
+This provides efficient local context (O(n*k) instead of O(n²)) while
+maintaining global awareness through pooled summary features.
 """
 
 from typing import Optional, Tuple
@@ -13,61 +15,272 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
+# Check if NATTEN is available and has a working backend
+NATTEN_AVAILABLE = False
+try:
+    import natten
+    # Test if NATTEN actually works (has backend)
+    _test_q = torch.randn(1, 8, 1, 8)
+    try:
+        natten.na1d(_test_q, _test_q, _test_q, kernel_size=3)
+        NATTEN_AVAILABLE = True
+        logger.info("NATTEN available with working backend")
+    except (NotImplementedError, RuntimeError):
+        logger.warning("NATTEN installed but no working backend (needs PyTorch 2.7+ or build from source). Using sliding window fallback.")
+    del _test_q
+except ImportError:
+    logger.info("NATTEN not installed. Using sliding window attention fallback.")
 
-class TransformerEncoder(nn.Module):
-    """Transformer encoder for sequence modeling."""
 
+class NATTENLayer(nn.Module):
+    """Single NATTEN layer with neighborhood attention.
+    
+    Performs local self-attention within a sliding window (kernel_size),
+    which is O(n*k) instead of O(n²) for standard attention.
+    """
+    
     def __init__(
-        self, input_dim: int, hidden_dim: int, n_heads: int = 4, n_layers: int = 2
+        self, 
+        dim: int, 
+        n_heads: int = 4, 
+        kernel_size: int = 31,
+        dilation: int = 1,
+        dropout: float = 0.1
     ) -> None:
-        """Initialize transformer encoder.
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        
+        assert dim % n_heads == 0, f"dim ({dim}) must be divisible by n_heads ({n_heads})"
+        
+        # Q, K, V projections
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with neighborhood attention.
+        
+        Args:
+            x: Input tensor (batch, seq_len, dim)
+            
+        Returns:
+            Output tensor (batch, seq_len, dim)
+        """
+        B, L, D = x.shape
+        residual = x
+        
+        # QKV projection
+        qkv = self.qkv(x)  # (B, L, 3*D)
+        qkv = qkv.reshape(B, L, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 1, 3, 4)  # (3, B, L, H, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (B, L, H, head_dim)
+        
+        # Apply NATTEN neighborhood attention or sliding window fallback
+        if NATTEN_AVAILABLE:
+            out = natten.na1d(q, k, v, kernel_size=self.kernel_size, dilation=self.dilation)
+        else:
+            # Sliding window attention fallback (provides same locality as NATTEN)
+            out = self._sliding_window_attention(q, k, v)
+        
+        # Reshape and project
+        out = out.reshape(B, L, D)
+        out = self.proj(out)
+        out = self.dropout(out)
+        
+        # Residual + LayerNorm
+        out = self.norm(out + residual)
+        
+        return out
+    
+    def _sliding_window_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Sliding window attention fallback when NATTEN is not available.
+        
+        This provides the same locality benefits as NATTEN - each position
+        only attends to its local neighborhood (kernel_size positions).
+        
+        Args:
+            q, k, v: Query, Key, Value tensors (B, L, H, head_dim)
+            
+        Returns:
+            Output tensor (B, L, H, head_dim)
+        """
+        B, L, H, D = q.shape
+        kernel = self.kernel_size
+        half_k = kernel // 2
+        
+        # Create sliding window attention mask
+        # Each position i attends to positions [i - half_k, i + half_k]
+        positions = torch.arange(L, device=q.device)
+        # Distance matrix: |i - j|
+        dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
+        # Mask: True where distance <= half_k (within window)
+        mask = dist <= half_k  # (L, L)
+        
+        # Apply dilation if specified
+        if self.dilation > 1:
+            # With dilation, we attend to every dilation-th position within window
+            dilated_dist = dist // self.dilation
+            mask = (dilated_dist <= half_k) & (dist % self.dilation == 0)
+        
+        # Transpose for attention computation: (B, H, L, D)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention scores
+        scale = D ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, L, L)
+        
+        # Apply sliding window mask (set non-neighbor positions to -inf)
+        attn = attn.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        # Softmax over keys
+        attn = F.softmax(attn, dim=-1)
+        
+        # Handle all-masked rows (shouldn't happen with proper kernel size)
+        attn = torch.nan_to_num(attn, nan=0.0)
+        
+        # Apply attention to values
+        out = torch.matmul(attn, v)  # (B, H, L, D)
+        
+        # Transpose back: (B, L, H, D)
+        out = out.transpose(1, 2)
+        
+        return out
 
+
+class HybridNATTENEncoder(nn.Module):
+    """Hybrid encoder combining local NATTEN attention with global pooling.
+    
+    Architecture:
+    1. Project input features to hidden dimension
+    2. Apply N layers of NATTEN (local neighborhood attention)
+    3. Pool global summary (mean over sequence)
+    4. Concatenate local features with global summary
+    5. Final projection to output dimension
+    
+    This gives:
+    - Sharp local context from NATTEN (efficient gradients for local patterns)
+    - Global awareness from pooled summary (duration, overall energy, etc.)
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        kernel_size: int = 31,
+        dilation: int = 1,
+        dropout: float = 0.1,
+    ) -> None:
+        """Initialize hybrid NATTEN encoder.
+        
         Args:
             input_dim: Input feature dimension
-            hidden_dim: Hidden dimension
+            hidden_dim: Hidden dimension for NATTEN layers
             n_heads: Number of attention heads
-            n_layers: Number of transformer layers
+            n_layers: Number of NATTEN layers
+            kernel_size: Neighborhood size for local attention (odd number)
+            dilation: Dilation factor (1 = no dilation)
+            dropout: Dropout rate
         """
         super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        
+        # Input projection
         self.input_projection = nn.Linear(input_dim, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=0.1,
-            batch_first=True,
+        
+        # Stack of NATTEN layers for local context
+        self.natten_layers = nn.ModuleList([
+            NATTENLayer(
+                dim=hidden_dim,
+                n_heads=n_heads,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                dropout=dropout,
+            )
+            for _ in range(n_layers)
+        ])
+        
+        # Global pooling projection (projects pooled features)
+        self.global_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Final combination: local (hidden_dim) + global (hidden_dim) -> hidden_dim
+        self.combine_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        
+        # Feed-forward network after combination
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Dropout(dropout),
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        
+        logger.info(
+            f"HybridNATTENEncoder: input={input_dim}, hidden={hidden_dim}, "
+            f"heads={n_heads}, layers={n_layers}, kernel={kernel_size}, dilation={dilation}"
+        )
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
+        """Forward pass with hybrid local-global encoding.
+        
         Args:
-            x: Input tensor (batch_size, seq_len, input_dim) or (batch_size, input_dim)
-
+            x: Input tensor (batch_size, input_dim) or (batch_size, seq_len, input_dim)
+            
         Returns:
-            Encoded tensor (batch_size, seq_len, hidden_dim) or (batch_size, hidden_dim)
+            Encoded tensor (batch_size, hidden_dim) or (batch_size, seq_len, hidden_dim)
         """
-        # Handle both 2D and 3D input
+        # Handle 2D input (single position, no sequence)
         if x.dim() == 2:
-            # Add sequence dimension
-            x = x.unsqueeze(1)
+            x = x.unsqueeze(1)  # (B, 1, D)
             squeeze_output = True
         else:
             squeeze_output = False
-
-        x = self.input_projection(x)
-        x = self.transformer(x)
-
+            
+        B, L, _ = x.shape
+        
+        # Project to hidden dimension
+        x = self.input_projection(x)  # (B, L, hidden_dim)
+        
+        # Apply NATTEN layers for local context
+        local_features = x
+        for layer in self.natten_layers:
+            local_features = layer(local_features)  # (B, L, hidden_dim)
+        
+        # Global pooling: mean over sequence dimension
+        global_summary = x.mean(dim=1, keepdim=True)  # (B, 1, hidden_dim)
+        global_summary = self.global_proj(global_summary)  # (B, 1, hidden_dim)
+        global_summary = global_summary.expand(-1, L, -1)  # (B, L, hidden_dim)
+        
+        # Combine local and global
+        combined = torch.cat([local_features, global_summary], dim=-1)  # (B, L, hidden_dim*2)
+        combined = self.combine_proj(combined)  # (B, L, hidden_dim)
+        
+        # Feed-forward + residual
+        out = combined + self.ffn(combined)
+        out = self.final_norm(out)
+        
         if squeeze_output:
-            x = x.squeeze(1)
-
-        return x
+            out = out.squeeze(1)  # (B, hidden_dim)
+            
+        return out
 
 
 class PolicyNetwork(nn.Module):
     """Policy network for action selection.
 
+    Uses hybrid NATTEN encoder for efficient local-global context.
     Outputs action logits for discrete action space.
     """
 
@@ -88,27 +301,17 @@ class PolicyNetwork(nn.Module):
 
         model_config = config.model
 
-        if model_config.policy_use_transformer:
-            # Transformer-based policy
-            self.encoder = TransformerEncoder(
-                input_dim=input_dim,
-                hidden_dim=model_config.policy_hidden_dim,
-                n_heads=model_config.transformer_n_heads,
-                n_layers=model_config.transformer_n_layers,
-            )
-            self.head = nn.Linear(model_config.policy_hidden_dim, n_actions)
-        else:
-            # MLP-based policy
-            layers = []
-            prev_dim = input_dim
-            for _ in range(model_config.policy_n_layers):
-                layers.append(nn.Linear(prev_dim, model_config.policy_hidden_dim))
-                layers.append(nn.ReLU())
-                layers.append(nn.Dropout(model_config.policy_dropout))
-                prev_dim = model_config.policy_hidden_dim
-
-            self.encoder = nn.Sequential(*layers)
-            self.head = nn.Linear(prev_dim, n_actions)
+        # Hybrid NATTEN encoder (local attention + global pooling)
+        self.encoder = HybridNATTENEncoder(
+            input_dim=input_dim,
+            hidden_dim=model_config.policy_hidden_dim,
+            n_heads=model_config.natten_n_heads,
+            n_layers=model_config.natten_n_layers,
+            kernel_size=model_config.natten_kernel_size,
+            dilation=model_config.natten_dilation,
+            dropout=model_config.policy_dropout,
+        )
+        self.head = nn.Linear(model_config.policy_hidden_dim, n_actions)
 
     def forward(
         self, state: torch.Tensor, mask: Optional[torch.Tensor] = None, temperature: float = 1.0
@@ -213,6 +416,7 @@ class PolicyNetwork(nn.Module):
 class ValueNetwork(nn.Module):
     """Value network for state evaluation.
 
+    Uses hybrid NATTEN encoder for consistent feature extraction with policy.
     Outputs state value for TD learning.
     """
 
@@ -229,18 +433,19 @@ class ValueNetwork(nn.Module):
 
         model_config = config.model
 
-        # MLP architecture for value network (transformer typically used for policy only)
-        layers = []
-        prev_dim = input_dim
-        for _ in range(model_config.value_n_layers):
-            layers.append(nn.Linear(prev_dim, model_config.value_hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(model_config.value_dropout))
-            prev_dim = model_config.value_hidden_dim
-
-        layers.append(nn.Linear(prev_dim, 1))
-
-        self.network = nn.Sequential(*layers)
+        # Hybrid NATTEN encoder (same architecture as policy for consistency)
+        self.encoder = HybridNATTENEncoder(
+            input_dim=input_dim,
+            hidden_dim=model_config.value_hidden_dim,
+            n_heads=model_config.natten_n_heads,
+            n_layers=model_config.natten_n_layers,
+            kernel_size=model_config.natten_kernel_size,
+            dilation=model_config.natten_dilation,
+            dropout=model_config.value_dropout,
+        )
+        
+        # Value head
+        self.head = nn.Linear(model_config.value_hidden_dim, 1)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -251,7 +456,8 @@ class ValueNetwork(nn.Module):
         Returns:
             State value tensor (batch_size,)
         """
-        value = self.network(state).squeeze(-1)
+        encoded = self.encoder(state)
+        value = self.head(encoded).squeeze(-1)
         return value
 
 

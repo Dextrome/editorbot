@@ -79,9 +79,14 @@ class ModelConfig:
     policy_hidden_dim: int = 256
     policy_n_layers: int = 3
     policy_dropout: float = 0.1
-    policy_use_transformer: bool = True
-    transformer_n_heads: int = 4
-    transformer_n_layers: int = 2
+    
+    # NATTEN Hybrid Encoder (local attention + global pooling)
+    natten_kernel_size: int = 31  # Local neighborhood size (odd number)
+    natten_n_heads: int = 4  # Number of attention heads
+    natten_n_layers: int = 2  # Number of NATTEN layers
+    natten_dilation: int = 1  # Dilation for sparse global context (1 = no dilation)
+    
+    # Value network
     value_hidden_dim: int = 256
     value_n_layers: int = 3
     value_dropout: float = 0.1
