@@ -53,23 +53,43 @@ class StateConfig:
 class RewardConfig:
     """Reward signal configuration."""
 
+    # === MONTE CARLO MODE ===
+    # When True: Zero step rewards, episode-only rewards, mean-baseline advantages
+    # This forces true multi-step credit assignment
+    use_monte_carlo: bool = True  # NEW: Pure Monte Carlo learning
+    
     use_sparse_rewards: bool = True
     use_dense_rewards: bool = True
-    use_learned_rewards: bool = False
-    use_trajectory_rewards: bool = True  # NEW: End-of-episode audio quality reward
+    use_learned_rewards: bool = False  # Disabled - needs real audio features to be useful
+    use_trajectory_rewards: bool = True  # End-of-episode audio quality reward
     trajectory_reward_scale: float = 100.0  # Scale factor for trajectory rewards
-    step_reward_scale: float = 0.01  # Scale down step rewards when using trajectory
+    step_reward_scale: float = 0.0  # ZERO step rewards in Monte Carlo mode
     target_keep_ratio: float = 0.35  # Target ratio of beats to keep (~35%)
     target_max_duration_s: float = 600.0  # 10 minutes max output duration
-    duration_penalty_weight: float = 0.5  # Penalty multiplier for exceeding target
-    max_loop_ratio: float = 0.15  # Max fraction of beats that should be looped (15%)
-    loop_penalty_weight: float = 0.5  # Penalty for exceeding max loop ratio
+    duration_penalty_weight: float = 0.1  # Penalty multiplier for exceeding target (reduced from 0.5)
+    max_loop_ratio: float = 0.12  # Max fraction of beats that should be looped (12%, reduced from 15%)
+    loop_penalty_weight: float = 0.6  # Penalty for exceeding max loop ratio (increased from 0.5)
+    loop_repetition_penalty: float = 0.2  # Penalty for looping beats near other looped beats
+    loop_proximity_window: int = 8  # Beats within this window count as "nearby" loops
     tempo_consistency_weight: float = 1.0
     energy_flow_weight: float = 1.0
     phrase_completeness_weight: float = 0.8
     transition_quality_weight: float = 0.9
     keep_ratio_weight: float = 1.0  # Weight for hitting target keep ratio
     transition_smoothness_weight: float = 1.5  # Weight for smooth transitions (no clicks)
+    
+    # === PURE AUDIO QUALITY REWARDS ===
+    # NO ground truth labels - model learns what sounds good
+    spectral_continuity_weight: float = 1.2  # Penalize spectral discontinuities at edit points
+    beat_alignment_quality_weight: float = 1.0  # Reward for clean beat-aligned cuts
+    section_coherence_weight: float = 1.0  # Reward for keeping consecutive beats together
+    flow_continuity_weight: float = 1.0  # Beat-to-beat transition flow
+    ground_truth_weight: float = 0.0  # DISABLED - force learning from audio quality, not copying labels
+    
+    # Step rewards (only used if use_monte_carlo=False)
+    step_phrase_boundary_bonus: float = 0.3  # Bonus for cutting at phrase boundaries
+    step_coherence_bonus: float = 0.2  # Bonus for keeping beats adjacent to other kept beats
+    step_energy_continuity_weight: float = 0.15  # Penalty for sudden energy jumps
 
 
 @dataclass
@@ -107,10 +127,10 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_ratio: float = 0.1  # Tighter clipping for stability (was 0.2)
-    target_kl: float = 0.01  # Target KL divergence for early stopping
-    entropy_coeff: float = 0.05  # Reduced entropy for stability (was 0.1)
+    target_kl: float = 0.02  # Target KL divergence for early stopping (increased from 0.01)
+    entropy_coeff: float = 0.15  # Higher entropy to prevent premature convergence
     entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.01  # Minimum entropy coefficient
+    entropy_coeff_min: float = 0.05  # Minimum entropy coefficient (increased)
     value_loss_coeff: float = 0.5
     max_grad_norm: float = 0.5  # Standard grad clipping
     n_epochs: int = 3  # PPO epochs per update

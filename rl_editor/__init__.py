@@ -20,6 +20,10 @@ from .cache import FeatureCache, get_cache
 from .evaluation import Evaluator
 from .logging_utils import TrainingLogger, create_logger
 
+# V2 imports (section-level actions + episode rewards)
+from .actions_v2 import ActionTypeV2, ActionSpaceV2, EditHistoryV2
+from .environment_v2 import AudioEditingEnvV2
+
 __all__ = [
     # Config
     "Config",
@@ -60,4 +64,9 @@ __all__ = [
     # Logging
     "TrainingLogger",
     "create_logger",
+    # V2 (section-level actions + episode rewards)
+    "ActionTypeV2",
+    "ActionSpaceV2",
+    "EditHistoryV2",
+    "AudioEditingEnvV2",
 ]

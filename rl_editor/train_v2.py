@@ -1,12 +1,18 @@
-"""Optimized parallel training for RL audio editor.
+"""V2 Training Script - Section-level actions with episode rewards.
 
-Uses:
-- Multiple parallel environments (vectorized)
-- Multi-worker DataLoader for audio preprocessing
-- Batch processing on GPU
-- Mixed precision training
-- Efficient memory management
-- Learning rate scheduling with warmup
+Based on train_parallel.py with these key changes:
+1. Uses AudioEditingEnvV2 with section-level actions (13 actions vs 9)
+2. Episode-level rewards (minimize step rewards, maximize end-of-episode quality)
+3. Can load V1 weights for transfer learning (encoder transfers, policy head reinitialized)
+4. Full action space enabled by default (not restricted to KEEP/CUT)
+
+Key V2 Actions:
+- Beat-level: KEEP_BEAT, CUT_BEAT
+- Bar-level (4 beats): KEEP_BAR, CUT_BAR
+- Phrase-level (8 beats): KEEP_PHRASE, CUT_PHRASE
+- Looping: LOOP_2X, LOOP_4X, LOOP_BAR_2X
+- Navigation: JUMP_BACK_4, JUMP_BACK_8
+- Transitions: MARK_SOFT_TRANSITION, MARK_HARD_CUT
 """
 
 import logging
@@ -30,7 +36,8 @@ from torch.cuda.amp import autocast
 
 from .config import Config, get_default_config
 from .data import PairedAudioDataset, AudioDataset
-from .environment import AudioEditingEnv
+from .environment_v2 import AudioEditingEnvV2
+from .actions_v2 import ActionSpaceV2, ActionTypeV2
 from .agent import Agent
 from .state import AudioState, EditHistory
 from .reward import compute_trajectory_return
@@ -41,20 +48,14 @@ logger = logging.getLogger(__name__)
 
 # Set multiprocessing start method for Windows compatibility
 if sys.platform == 'win32':
-    mp.set_start_method('spawn', force=True)
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
 
 
 def get_lr_scheduler(optimizer: optim.Optimizer, config: Config, total_epochs: int) -> Optional[LambdaLR]:
-    """Create learning rate scheduler based on config.
-    
-    Args:
-        optimizer: The optimizer to schedule
-        config: Configuration with LR decay settings
-        total_epochs: Total number of training epochs
-        
-    Returns:
-        LambdaLR scheduler or None if lr_decay is disabled
-    """
+    """Create learning rate scheduler based on config."""
     ppo_config = config.ppo
     
     if not ppo_config.lr_decay:
@@ -75,36 +76,26 @@ def get_lr_scheduler(optimizer: optim.Optimizer, config: Config, total_epochs: i
         decay_epochs = total_epochs - warmup_epochs
         
         if decay_type == "cosine":
-            # Cosine annealing: smooth decay to min_ratio
             progress = epochs_after_warmup / max(decay_epochs, 1)
             return min_ratio + (1.0 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
-        
         elif decay_type == "linear":
-            # Linear decay to min_ratio
             progress = epochs_after_warmup / max(decay_epochs, 1)
             return max(min_ratio, 1.0 - (1.0 - min_ratio) * progress)
-        
         elif decay_type == "exponential":
-            # Exponential decay
             decay_rate = -math.log(min_ratio) / max(ppo_config.lr_decay_epochs, 1)
             return max(min_ratio, math.exp(-decay_rate * epochs_after_warmup))
-        
         elif decay_type == "step":
-            # Step decay: multiply by step_factor every step_interval epochs
             n_steps = epochs_after_warmup // ppo_config.lr_step_interval
             return max(min_ratio, ppo_config.lr_step_factor ** n_steps)
-        
         else:
-            # Unknown type, no decay
-            logger.warning(f"Unknown lr_decay_type: {decay_type}, using constant LR")
             return 1.0
     
     return LambdaLR(optimizer, lr_lambda)
 
 
 @dataclass
-class RolloutBuffer:
-    """Buffer for storing rollout data across multiple environments."""
+class RolloutBufferV2:
+    """Buffer for storing rollout data with V2 action masks."""
     states: List[np.ndarray]
     actions: List[int]
     rewards: List[float]
@@ -112,6 +103,10 @@ class RolloutBuffer:
     log_probs: List[float]
     dones: List[bool]
     masks: List[np.ndarray]
+    # V2 specific: track episode-level info
+    episode_rewards: List[float]
+    episode_lengths: List[int]
+    section_decisions: List[int]  # How many section-level actions taken
     
     def __init__(self):
         self.clear()
@@ -124,6 +119,9 @@ class RolloutBuffer:
         self.log_probs = []
         self.dones = []
         self.masks = []
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.section_decisions = []
     
     def add(self, state, action, reward, value, log_prob, done, mask):
         self.states.append(state)
@@ -138,13 +136,13 @@ class RolloutBuffer:
         return len(self.states)
 
 
-class VectorizedEnvWrapper:
-    """Wrapper for running multiple environments in parallel."""
+class VectorizedEnvV2Wrapper:
+    """Wrapper for running multiple V2 environments in parallel."""
     
     def __init__(self, config: Config, n_envs: int = 4, learned_reward_model: Optional[Any] = None):
         self.config = config
         self.n_envs = n_envs
-        self.envs: List[Optional[AudioEditingEnv]] = [None] * n_envs
+        self.envs: List[Optional[AudioEditingEnvV2]] = [None] * n_envs
         self.audio_states: List[Optional[AudioState]] = [None] * n_envs
         self.learned_reward_model = learned_reward_model
         
@@ -152,17 +150,14 @@ class VectorizedEnvWrapper:
         """Set the learned reward model for all environments."""
         self.learned_reward_model = model
         for env in self.envs:
-            if env is not None:
+            if env is not None and hasattr(env, 'set_learned_reward_model'):
                 env.set_learned_reward_model(model)
         
     def set_audio_states(self, audio_states: List[AudioState]):
         """Set audio states for all environments."""
         for i, state in enumerate(audio_states[:self.n_envs]):
             self.audio_states[i] = state
-            self.envs[i] = AudioEditingEnv(
-                self.config, audio_state=state, 
-                learned_reward_model=self.learned_reward_model
-            )
+            self.envs[i] = AudioEditingEnvV2(self.config, audio_state=state)
     
     def reset_all(self) -> Tuple[List[np.ndarray], List[dict]]:
         """Reset all environments."""
@@ -178,8 +173,7 @@ class VectorizedEnvWrapper:
     def step_all(self, actions: List[int]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
         """Step all environments with given actions.
         
-        When trajectory rewards are enabled, adds end-of-episode quality reward.
-        When learned rewards are enabled, also adds learned reward model output.
+        V2 uses episode-level rewards primarily - step rewards are minimal.
         """
         next_obs_list = []
         reward_list = []
@@ -191,20 +185,8 @@ class VectorizedEnvWrapper:
             if env is not None:
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 
-                # Add trajectory reward at episode end if enabled
-                if (terminated or truncated) and self.config.reward.use_trajectory_rewards:
-                    trajectory_reward = env.compute_trajectory_reward()
-                    reward += trajectory_reward
-                    info['trajectory_reward'] = trajectory_reward
-                
-                # Add learned reward at episode end if enabled
-                if (terminated or truncated) and self.config.reward.use_learned_rewards:
-                    learned_reward = env.compute_learned_episode_reward()
-                    # Scale learned reward to be in similar range as trajectory
-                    learned_reward_scale = self.config.reward.trajectory_reward_scale * 0.5
-                    scaled_learned_reward = learned_reward * learned_reward_scale
-                    reward += scaled_learned_reward
-                    info['learned_reward'] = scaled_learned_reward
+                # V2: Episode reward is computed in environment at episode end
+                # No additional trajectory reward computation needed here
                 
                 next_obs_list.append(next_obs)
                 reward_list.append(reward)
@@ -214,34 +196,18 @@ class VectorizedEnvWrapper:
         
         return next_obs_list, reward_list, terminated_list, truncated_list, info_list
     
-    def get_action_masks(self, keep_cut_only: bool = False) -> List[np.ndarray]:
-        """Get action masks for all environments.
-        
-        Args:
-            keep_cut_only: If True, only allow KEEP and CUT actions
-        """
+    def get_action_masks(self) -> List[np.ndarray]:
+        """Get action masks for all V2 environments."""
         masks = []
         for env in self.envs:
             if env is not None:
-                if keep_cut_only:
-                    mask = env.action_space.get_keep_cut_only_mask(
-                        current_beat_index=env.audio_state.beat_index,
-                        edited_beats=env.edit_history.get_edited_beats(),
-                        total_beats=len(env.audio_state.beat_times),
-                    )
-                else:
-                    mask = env.action_space.get_action_mask(
-                        current_beat_index=env.audio_state.beat_index,
-                        remaining_duration=env._get_remaining_duration(),
-                        edited_beats=env.edit_history.get_edited_beats(),
-                        total_beats=len(env.audio_state.beat_times),
-                    )
+                mask = env.get_action_mask()
                 masks.append(mask)
         return masks
 
 
-class ParallelPPOTrainer:
-    """Optimized PPO trainer with parallel environments and batch processing."""
+class ParallelPPOTrainerV2:
+    """PPO trainer for V2 environment with section-level actions and episode rewards."""
     
     def __init__(
         self,
@@ -249,7 +215,6 @@ class ParallelPPOTrainer:
         n_envs: int = 4,
         prefetch_factor: int = 2,
         total_epochs: int = 1000,
-        keep_cut_only: bool = True,  # Default to KEEP/CUT only for stability
         learned_reward_model: Optional[Any] = None,
     ):
         self.config = config
@@ -257,17 +222,16 @@ class ParallelPPOTrainer:
         self.prefetch_factor = prefetch_factor
         self.total_epochs = total_epochs
         self.current_epoch = 0
-        self.keep_cut_only = keep_cut_only  # Restrict to KEEP/CUT actions
         self.learned_reward_model = learned_reward_model
         self.device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         
-        # Entropy coefficient (can decay over training)
+        # Entropy coefficient (decay over training to reduce exploration as policy improves)
         self.initial_entropy_coeff = config.ppo.entropy_coeff
         self.entropy_coeff_min = getattr(config.ppo, 'entropy_coeff_min', 0.01)
         self.entropy_coeff_decay = getattr(config.ppo, 'entropy_coeff_decay', True)
         
-        # Vectorized environments (pass learned reward model if provided)
-        self.vec_env = VectorizedEnvWrapper(config, n_envs, learned_reward_model=learned_reward_model)
+        # Vectorized V2 environments
+        self.vec_env = VectorizedEnvV2Wrapper(config, n_envs, learned_reward_model=learned_reward_model)
         
         # Agent (initialized later when we know input dimensions)
         self.agent: Optional[Agent] = None
@@ -280,7 +244,7 @@ class ParallelPPOTrainer:
         self.scaler = torch.amp.GradScaler('cuda', enabled=config.ppo.use_mixed_precision and torch.cuda.is_available())
         
         # Rollout buffer
-        self.buffer = RolloutBuffer()
+        self.buffer = RolloutBufferV2()
         
         # Tracking
         self.global_step = 0
@@ -304,11 +268,11 @@ class ParallelPPOTrainer:
         # Create directories
         Path(config.training.save_dir).mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Initialized ParallelPPOTrainer with {n_envs} environments on {self.device}")
-        logger.info(f"Action mode: {'KEEP/CUT only' if keep_cut_only else 'Full action space'}")
+        logger.info(f"Initialized ParallelPPOTrainerV2 with {n_envs} environments on {self.device}")
+        logger.info(f"V2 Action space: {ActionSpaceV2.N_ACTIONS} actions (section-level)")
         logger.info(f"Target KL for early stopping: {self.target_kl}")
         if config.ppo.lr_decay:
-            logger.info(f"LR decay enabled: {config.ppo.lr_decay_type}, warmup={config.ppo.lr_warmup_epochs}, min_ratio={config.ppo.lr_min_ratio}")
+            logger.info(f"LR decay enabled: {config.ppo.lr_decay_type}, warmup={config.ppo.lr_warmup_epochs}")
     
     def _init_agent(self, input_dim: int, n_actions: int):
         """Initialize agent and optimizers."""
@@ -332,6 +296,75 @@ class ParallelPPOTrainer:
         
         if self.policy_scheduler:
             logger.info(f"LR schedulers initialized for {self.total_epochs} epochs")
+    
+    def load_v1_weights(self, v1_checkpoint_path: str, strict_encoder: bool = True) -> bool:
+        """Load V1 weights for transfer learning.
+        
+        The encoder (feature extraction) can transfer directly.
+        The value network can transfer directly.
+        The policy head must be reinitialized for the new action space.
+        
+        Args:
+            v1_checkpoint_path: Path to V1 checkpoint
+            strict_encoder: If True, fail if encoder weights don't match exactly
+            
+        Returns:
+            True if weights were loaded successfully
+        """
+        if not Path(v1_checkpoint_path).exists():
+            logger.warning(f"V1 checkpoint not found: {v1_checkpoint_path}")
+            return False
+        
+        try:
+            checkpoint = torch.load(v1_checkpoint_path, map_location=self.device, weights_only=False)
+            v1_policy_state = checkpoint.get("policy_state_dict", checkpoint.get("policy_net_state_dict"))
+            v1_value_state = checkpoint.get("value_state_dict", checkpoint.get("value_net_state_dict"))
+            
+            if v1_policy_state is None or v1_value_state is None:
+                logger.warning("V1 checkpoint missing policy or value state dict")
+                return False
+            
+            # Load encoder weights (should match)
+            encoder_keys = [k for k in v1_policy_state.keys() if 'encoder' in k]
+            encoder_state = {k: v for k, v in v1_policy_state.items() if 'encoder' in k}
+            
+            if encoder_state:
+                # Load encoder into policy network
+                missing, unexpected = self.agent.policy_net.load_state_dict(encoder_state, strict=False)
+                if strict_encoder and missing:
+                    missing_encoder = [k for k in missing if 'encoder' in k]
+                    if missing_encoder:
+                        logger.warning(f"Missing encoder keys: {missing_encoder}")
+                        return False
+                
+                logger.info(f"Loaded {len(encoder_state)} encoder weights from V1")
+            
+            # Load value network (should match exactly)
+            missing, unexpected = self.agent.value_net.load_state_dict(v1_value_state, strict=False)
+            if not missing:
+                logger.info("Value network weights loaded from V1")
+            else:
+                logger.warning(f"Value network partial load - missing: {len(missing)} keys")
+            
+            # Policy head is NOT loaded - it's reinitialized for V2 action space
+            logger.info("Policy head reinitialized for V2 action space (13 actions)")
+            
+            # Also copy encoder weights to value network if it has one
+            if hasattr(self.agent.value_net, 'encoder'):
+                value_encoder_state = {k.replace('encoder.', ''): v 
+                                       for k, v in encoder_state.items()}
+                try:
+                    self.agent.value_net.encoder.load_state_dict(value_encoder_state, strict=False)
+                    logger.info("Encoder weights also copied to value network")
+                except Exception as e:
+                    logger.debug(f"Could not copy encoder to value net: {e}")
+            
+            logger.info(f"✓ V1 weights loaded for transfer learning from {v1_checkpoint_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load V1 weights: {e}")
+            return False
     
     def step_schedulers(self):
         """Step the learning rate schedulers after each epoch."""
@@ -366,11 +399,7 @@ class ParallelPPOTrainer:
         return self.config.ppo.learning_rate
     
     def normalize_rewards(self, rewards: np.ndarray) -> np.ndarray:
-        """Normalize rewards using running statistics (Welford's algorithm).
-        
-        This reduces reward variance and helps stabilize training.
-        """
-        # Update running statistics
+        """Normalize rewards using running statistics (Welford's algorithm)."""
         for r in rewards.flatten():
             self.reward_count += 1
             delta = r - self.reward_mean
@@ -378,17 +407,13 @@ class ParallelPPOTrainer:
             delta2 = r - self.reward_mean
             self.reward_var += delta * delta2
         
-        # Compute standard deviation
         if self.reward_count > 1:
             std = np.sqrt(self.reward_var / (self.reward_count - 1))
         else:
             std = 1.0
         
-        # Normalize with small epsilon for stability
         std = max(std, 1e-8)
         normalized = (rewards - self.reward_mean) / std
-        
-        # Clip to prevent extreme values
         return np.clip(normalized, -10.0, 10.0)
     
     def collect_rollouts_parallel(
@@ -396,39 +421,33 @@ class ParallelPPOTrainer:
         audio_states: List[AudioState],
         n_steps: int,
     ) -> Dict[str, np.ndarray]:
-        """Collect rollouts from multiple environments in parallel.
-        
-        Args:
-            audio_states: List of audio states for each environment
-            n_steps: Number of steps to collect per environment
-            
-        Returns:
-            Dictionary with batched trajectory data
-        """
+        """Collect rollouts from multiple V2 environments in parallel."""
         # Setup environments
         self.vec_env.set_audio_states(audio_states)
         obs_list, _ = self.vec_env.reset_all()
         
-        # Initialize agent if needed
+        # Initialize agent if needed (V2 has different action count)
         if self.agent is None:
             input_dim = obs_list[0].shape[0]
-            n_actions = self.vec_env.envs[0].action_space.n_discrete_actions
+            n_actions = ActionSpaceV2.N_ACTIONS  # V2 action space
             self._init_agent(input_dim, n_actions)
         
         self.buffer.clear()
         episode_rewards = [0.0] * len(obs_list)
         episode_lengths = [0] * len(obs_list)
+        section_decisions = [0] * len(obs_list)
         
-        # Exploration rate decays over training
-        exploration_rate = max(0.1, 0.5 - self.global_step / 500000)
+        # V2: Higher exploration to prevent premature convergence
+        # Slower decay - stays high longer
+        exploration_rate = max(0.15, 0.5 - self.global_step / 2000000)
         
         for step in range(n_steps):
             # Batch observations
             obs_batch = np.stack(obs_list)
             obs_tensor = torch.from_numpy(obs_batch).float().to(self.device)
             
-            # Get action masks
-            masks = self.vec_env.get_action_masks(keep_cut_only=self.keep_cut_only)
+            # Get V2 action masks
+            masks = self.vec_env.get_action_masks()
             mask_batch = np.stack(masks)
             mask_tensor = torch.from_numpy(mask_batch).bool().to(self.device)
             
@@ -437,17 +456,15 @@ class ParallelPPOTrainer:
                 actions, log_probs = self.agent.select_action_batch(obs_tensor, mask_tensor)
                 values = self.agent.compute_value_batch(obs_tensor)
             
-            # Epsilon-greedy exploration: randomly select valid action with probability exploration_rate
+            # Epsilon-greedy exploration
             actions_np = actions.cpu().numpy()
             log_probs_np = log_probs.cpu().numpy()
             for i in range(len(obs_list)):
                 if np.random.random() < exploration_rate:
-                    # Select random valid action
                     valid_actions = np.where(masks[i])[0]
                     if len(valid_actions) > 0:
                         random_action = np.random.choice(valid_actions)
                         actions_np[i] = random_action
-                        # Approximate log prob for random action (uniform over valid)
                         log_probs_np[i] = -np.log(len(valid_actions))
             
             # Convert to lists
@@ -458,7 +475,7 @@ class ParallelPPOTrainer:
             # Step all environments
             next_obs_list, rewards, terminateds, truncateds, infos = self.vec_env.step_all(actions_list)
             
-            # Store in buffer (per-environment)
+            # Store in buffer
             for i in range(len(obs_list)):
                 self.buffer.add(
                     state=obs_list[i],
@@ -471,18 +488,32 @@ class ParallelPPOTrainer:
                 )
                 episode_rewards[i] += rewards[i]
                 episode_lengths[i] += 1
+                
+                # Track section-level decisions
+                action = actions_list[i]
+                if action in [ActionTypeV2.KEEP_BAR.value, ActionTypeV2.CUT_BAR.value,
+                             ActionTypeV2.KEEP_PHRASE.value, ActionTypeV2.CUT_PHRASE.value,
+                             ActionTypeV2.LOOP_BAR_2X.value]:
+                    section_decisions[i] += 1
             
             # Handle episode ends
             for i, (terminated, truncated) in enumerate(zip(terminateds, truncateds)):
                 if terminated or truncated:
                     self.episode_rewards.append(episode_rewards[i])
                     self.episode_lengths.append(episode_lengths[i])
-                    # Log episode completion with learned reward if applicable
-                    if self.config.reward.use_learned_rewards:
-                        learned_r = infos[i].get('learned_reward', 0.0) if i < len(infos) else 0.0
-                        logger.debug(f"Episode complete: len={episode_lengths[i]}, total_r={episode_rewards[i]:.2f}, learned_r={learned_r:.2f}")
+                    self.buffer.section_decisions.append(section_decisions[i])
+                    
+                    # Log V2 episode info
+                    logger.debug(
+                        f"V2 Episode complete: len={episode_lengths[i]}, "
+                        f"reward={episode_rewards[i]:.2f}, "
+                        f"section_decisions={section_decisions[i]}"
+                    )
+                    
                     episode_rewards[i] = 0.0
                     episode_lengths[i] = 0
+                    section_decisions[i] = 0
+                    
                     # Reset this environment
                     obs, _ = self.vec_env.envs[i].reset()
                     next_obs_list[i] = obs
@@ -490,29 +521,38 @@ class ParallelPPOTrainer:
             obs_list = next_obs_list
             self.global_step += len(obs_list)
         
-        # Compute returns and advantages
+        # === MONTE CARLO RETURNS ===
+        # Pure episode returns - NO value function bootstrapping
+        # This forces true multi-step credit assignment
         returns, _ = compute_trajectory_return(
             self.buffer.rewards, 
-            gamma=self.config.ppo.gamma
+            gamma=self.config.ppo.gamma,
+            normalize=False  # Don't normalize yet - do it after advantage computation
         )
         
-        # Convert to numpy arrays with NaN handling at the source
+        # Convert to numpy arrays with NaN handling
         states_arr = np.array(self.buffer.states)
         values_arr = np.array(self.buffer.values)
         returns_arr = np.array(returns)
         log_probs_arr = np.array(self.buffer.log_probs)
         
-        # Handle any NaN/Inf values in buffer data
+        # Handle any NaN/Inf values
         states_arr = np.nan_to_num(states_arr, nan=0.0, posinf=1e6, neginf=-1e6)
         values_arr = np.nan_to_num(values_arr, nan=0.0, posinf=1e6, neginf=-1e6)
         returns_arr = np.nan_to_num(returns_arr, nan=0.0, posinf=1e6, neginf=-1e6)
         log_probs_arr = np.nan_to_num(log_probs_arr, nan=-5.0, posinf=0.0, neginf=-10.0)
         
-        advantages = returns_arr - values_arr
+        # === MONTE CARLO ADVANTAGE ===
+        # Use mean return as baseline instead of learned value function
+        # This reduces variance while keeping Monte Carlo properties
+        mean_return = returns_arr.mean()
+        advantages = returns_arr - mean_return  # Simple baseline subtraction
+        
+        # Normalize advantages for stable gradients
         adv_std = advantages.std()
         if adv_std < 1e-8 or np.isnan(adv_std):
-            adv_std = 1.0  # Prevent division by zero
-        advantages = (advantages - advantages.mean()) / (adv_std + 1e-8)
+            adv_std = 1.0
+        advantages = advantages / (adv_std + 1e-8)
         advantages = np.nan_to_num(advantages, nan=0.0, posinf=1e6, neginf=-1e6)
         
         return {
@@ -542,7 +582,7 @@ class ParallelPPOTrainer:
         policy_losses = []
         value_losses = []
         entropy_losses = []
-        approx_kl_divs = []  # Track KL divergence
+        approx_kl_divs = []
         nan_batches_skipped = 0
         early_stop_epoch = False
         
@@ -563,29 +603,27 @@ class ParallelPPOTrainer:
                 batch_advantages = advantages[batch_indices]
                 batch_old_log_probs = old_log_probs[batch_indices]
                 
-                # Handle NaN in ALL inputs including old_log_probs
+                # Handle NaN in inputs
                 batch_states = torch.nan_to_num(batch_states, nan=0.0)
                 batch_returns = torch.nan_to_num(batch_returns, nan=0.0)
                 batch_advantages = torch.nan_to_num(batch_advantages, nan=0.0)
-                batch_old_log_probs = torch.nan_to_num(batch_old_log_probs, nan=-5.0)  # reasonable default
+                batch_old_log_probs = torch.nan_to_num(batch_old_log_probs, nan=-5.0)
                 
-                # Forward pass (mixed precision disabled for stability)
-                # Policy loss
+                # Forward pass
                 new_log_probs, entropy = self.agent.evaluate_actions(batch_states, batch_actions)
                 
-                # Handle NaN in new log probs
+                # Handle NaN in outputs
                 if torch.isnan(new_log_probs).any():
                     new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0)
                 if torch.isnan(entropy).any():
                     entropy = torch.nan_to_num(entropy, nan=0.0)
                 
-                # Compute ratio with clamping for stability
+                # Compute ratio with clamping
                 log_ratio = new_log_probs - batch_old_log_probs
-                log_ratio = torch.clamp(log_ratio, -10.0, 10.0)  # Prevent extreme ratios
+                log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
                 ratio = torch.exp(log_ratio)
                 
-                # Compute approximate KL divergence for early stopping
-                # KL(old || new) ≈ (ratio - 1) - log(ratio)
+                # Approximate KL divergence for early stopping
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - log_ratio).mean().item()
                     epoch_kl_divs.append(approx_kl)
@@ -594,13 +632,13 @@ class ParallelPPOTrainer:
                 surr2 = torch.clamp(ratio, 1 - ppo_config.clip_ratio, 1 + ppo_config.clip_ratio) * batch_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
-                # Value loss with clipping for stability
+                # Value loss
                 values = self.agent.compute_value_batch(batch_states)
                 if torch.isnan(values).any():
                     values = torch.nan_to_num(values, nan=0.0)
                 value_loss = nn.functional.mse_loss(values, batch_returns)
                 
-                # Entropy bonus (encourage exploration) - use dynamic entropy coeff
+                # Entropy bonus
                 entropy_loss = -entropy.mean()
                 current_entropy_coeff = self.get_current_entropy_coeff()
                 
@@ -611,12 +649,12 @@ class ParallelPPOTrainer:
                     + current_entropy_coeff * entropy_loss
                 )
                 
-                # Final NaN check - skip only if still NaN after all handling
+                # Final NaN check
                 if torch.isnan(loss) or torch.isinf(loss):
                     nan_batches_skipped += 1
                     continue
                 
-                # Backward pass (standard, no mixed precision)
+                # Backward pass
                 self.policy_optimizer.zero_grad()
                 self.value_optimizer.zero_grad()
                 
@@ -633,22 +671,19 @@ class ParallelPPOTrainer:
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
             
-            # Check KL divergence after each epoch for early stopping
+            # Check KL divergence for early stopping
             if epoch_kl_divs:
                 mean_kl = np.mean(epoch_kl_divs)
                 approx_kl_divs.append(mean_kl)
                 if mean_kl > 1.5 * self.target_kl:
-                    logger.debug(f"Early stopping at PPO epoch {epoch+1} due to KL divergence: {mean_kl:.4f}")
+                    logger.debug(f"Early stopping at PPO epoch {epoch+1} due to KL: {mean_kl:.4f}")
                     early_stop_epoch = True
         
-        # Log warning if many batches were skipped
         if nan_batches_skipped > 0:
             logger.warning(f"Skipped {nan_batches_skipped} batches due to NaN/Inf loss")
         
-        # Handle empty loss arrays - this should NOT happen if training is working
         if not policy_losses:
             logger.error("All batches skipped! Training is not functioning properly.")
-            # Return high loss to indicate problem
             return {
                 "policy_loss": 999.0,
                 "value_loss": 999.0, 
@@ -666,6 +701,7 @@ class ParallelPPOTrainer:
             "total_loss": np.mean(policy_losses) + ppo_config.value_loss_coeff * np.mean(value_losses),
             "approx_kl": np.mean(approx_kl_divs) if approx_kl_divs else 0.0,
             "n_episodes": len(self.episode_rewards),
+            "section_decisions_per_ep": np.mean(self.buffer.section_decisions) if self.buffer.section_decisions else 0.0,
         }
         
         # Log metrics
@@ -678,14 +714,15 @@ class ParallelPPOTrainer:
                 episode_reward=metrics["episode_reward"],
                 episode_length=int(np.mean(self.episode_lengths[-100:])) if self.episode_lengths else 0,
             )
-            # Log KL divergence
             self.training_logger.log_scalar("approx_kl", metrics["approx_kl"], self.global_step)
+            self.training_logger.log_scalar("section_decisions_per_ep", metrics["section_decisions_per_ep"], self.global_step)
         
         return metrics
     
     def save_checkpoint(self, path: str):
         """Save training checkpoint."""
         checkpoint = {
+            "version": "v2",  # Mark as V2 checkpoint
             "global_step": self.global_step,
             "best_reward": self.best_reward,
             "current_epoch": self.current_epoch,
@@ -697,16 +734,24 @@ class ParallelPPOTrainer:
             "value_scheduler": self.value_scheduler.state_dict() if self.value_scheduler else None,
             "scaler": self.scaler.state_dict(),
             "config": self.config,
+            "n_actions": ActionSpaceV2.N_ACTIONS,
         }
         torch.save(checkpoint, path)
-        logger.info(f"Saved checkpoint to {path}")
+        logger.info(f"Saved V2 checkpoint to {path}")
     
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        
+        # Check if this is a V2 checkpoint
+        version = checkpoint.get("version", "v1")
+        if version != "v2":
+            logger.warning(f"Loading V1 checkpoint into V2 trainer - use load_v1_weights for transfer learning")
+        
         self.global_step = checkpoint["global_step"]
         self.best_reward = checkpoint["best_reward"]
         self.current_epoch = checkpoint.get("current_epoch", 0)
+        
         if self.agent and checkpoint["policy_state_dict"]:
             self.agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
             self.agent.value_net.load_state_dict(checkpoint["value_state_dict"])
@@ -718,19 +763,21 @@ class ParallelPPOTrainer:
         if self.value_scheduler and checkpoint.get("value_scheduler"):
             self.value_scheduler.load_state_dict(checkpoint["value_scheduler"])
         self.scaler.load_state_dict(checkpoint["scaler"])
+        
         logger.info(f"Loaded checkpoint from {path} (epoch {self.current_epoch}, best_reward={self.best_reward:.2f})")
 
 
-def train_parallel(
+def train_v2(
     config: Config,
     data_dir: str,
     n_epochs: int = 1000,
     n_envs: int = 4,
     steps_per_epoch: int = 2048,
     checkpoint_path: Optional[str] = None,
+    v1_checkpoint_path: Optional[str] = None,
     target_loss: float = 0.01,
 ):
-    """Main training function with parallel environments.
+    """Main V2 training function with parallel environments.
     
     Args:
         config: Configuration object
@@ -738,11 +785,20 @@ def train_parallel(
         n_epochs: Maximum number of epochs
         n_envs: Number of parallel environments
         steps_per_epoch: Steps to collect per epoch
-        checkpoint_path: Optional checkpoint to resume from
+        checkpoint_path: Optional V2 checkpoint to resume from
+        v1_checkpoint_path: Optional V1 checkpoint for transfer learning
         target_loss: Stop training when loss reaches this value
     """
-    logger.info(f"Starting parallel training with {n_envs} environments")
+    logger.info("=" * 60)
+    logger.info("Starting V2 Training (Section Actions + Episode Rewards)")
+    logger.info("=" * 60)
+    logger.info(f"Parallel environments: {n_envs}")
+    logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Target loss: {target_loss}")
+    
+    # V2 reward scaling: minimize step rewards, maximize episode rewards
+    config.reward.step_reward_scale = 0.001  # Very small step rewards
+    config.reward.trajectory_reward_scale = 50.0  # Large episode rewards
     
     # Load dataset with multi-worker DataLoader
     dataset = PairedAudioDataset(
@@ -769,13 +825,23 @@ def train_parallel(
             logger.warning("Could not load learned reward model - using dense rewards only")
             config.reward.use_learned_rewards = False
     
-    # Create trainer with total_epochs for LR scheduling
-    trainer = ParallelPPOTrainer(config, n_envs=n_envs, total_epochs=n_epochs, learned_reward_model=learned_reward_model)
+    # Create V2 trainer
+    trainer = ParallelPPOTrainerV2(
+        config, 
+        n_envs=n_envs, 
+        total_epochs=n_epochs, 
+        learned_reward_model=learned_reward_model
+    )
     
-    # Load checkpoint if provided
+    # Handle checkpoint loading
+    # Priority: V2 checkpoint > V1 transfer learning
     if checkpoint_path and Path(checkpoint_path).exists():
         trainer.load_checkpoint(checkpoint_path)
-    
+    elif v1_checkpoint_path and Path(v1_checkpoint_path).exists():
+        # Need to initialize agent first to load V1 weights
+        # Do a dummy rollout to initialize
+        logger.info("Initializing agent for V1 weight transfer...")
+        
     # Determine starting epoch
     start_epoch = trainer.current_epoch
     if start_epoch > 0:
@@ -783,51 +849,51 @@ def train_parallel(
     
     # Training loop
     start_time = time.time()
+    MAX_BEATS = 500  # Limit beats for tractable action space
     
     for epoch in range(start_epoch, n_epochs):
         epoch_start = time.time()
         
         # Sample audio states for parallel environments
-        # Limit beats to max 500 to keep action space manageable
-        MAX_BEATS = 500
         audio_states = []
         for _ in range(n_envs):
             idx = np.random.randint(len(dataset))
             item = dataset[idx]
             
-            # Use raw audio state for training
             raw_data = item["raw"]
             beat_times = raw_data["beat_times"].numpy()
             beat_features = raw_data["beat_features"].numpy()
             
-            # Get ground truth edit labels for supervised reward
+            # Get ground truth edit labels
             edit_labels = item.get("edit_labels")
             if edit_labels is not None:
                 edit_labels = edit_labels.numpy() if hasattr(edit_labels, 'numpy') else np.array(edit_labels)
             
-            # Limit to MAX_BEATS for tractable action space
+            # Limit to MAX_BEATS
             if len(beat_times) > MAX_BEATS:
-                # Sample a random window
                 start_idx = np.random.randint(0, len(beat_times) - MAX_BEATS)
                 beat_times = beat_times[start_idx:start_idx + MAX_BEATS]
                 beat_features = beat_features[start_idx:start_idx + MAX_BEATS]
-                # Also slice the edit labels if they exist
                 if edit_labels is not None and len(edit_labels) > MAX_BEATS:
                     edit_labels = edit_labels[start_idx:start_idx + MAX_BEATS]
-                # Re-zero beat times
                 beat_times = beat_times - beat_times[0]
             
             audio_state = AudioState(
                 beat_index=0,
                 beat_times=beat_times,
                 beat_features=beat_features,
-                tempo=raw_data["tempo"].item(),
-                target_labels=edit_labels,  # Pass ground truth for supervised reward
+                tempo=raw_data["tempo"].item() if hasattr(raw_data["tempo"], 'item') else raw_data["tempo"],
+                target_labels=edit_labels,
             )
             audio_states.append(audio_state)
         
         # Collect rollouts in parallel
         rollout_data = trainer.collect_rollouts_parallel(audio_states, steps_per_epoch // n_envs)
+        
+        # Load V1 weights after first rollout (agent now initialized)
+        if epoch == start_epoch and v1_checkpoint_path and trainer.agent is not None:
+            if trainer.load_v1_weights(v1_checkpoint_path):
+                logger.info("✓ V1 weights loaded for transfer learning - encoder pretrained, policy head fresh")
         
         # Update networks
         metrics = trainer.update(rollout_data)
@@ -836,15 +902,16 @@ def train_parallel(
         trainer.step_schedulers()
         
         epoch_time = time.time() - epoch_start
-        total_time = time.time() - start_time
         current_lr = trainer.get_current_lr()
         
         # Log progress
         n_eps = metrics.get('n_episodes', 0)
+        section_dec = metrics.get('section_decisions_per_ep', 0)
         logger.info(
             f"Epoch {epoch + 1}/{n_epochs} | "
             f"Loss: {metrics['total_loss']:.4f} (P: {metrics['policy_loss']:.4f}, V: {metrics['value_loss']:.4f}) | "
             f"Reward: {metrics['episode_reward']:.2f} (eps: {n_eps}) | "
+            f"SectionDec: {section_dec:.1f} | "
             f"LR: {current_lr:.2e} | "
             f"Steps: {trainer.global_step:,} | "
             f"Time: {epoch_time:.1f}s"
@@ -857,21 +924,21 @@ def train_parallel(
         
         # Save checkpoint periodically
         if (epoch + 1) % 10 == 0:
-            checkpoint_file = Path(config.training.save_dir) / f"checkpoint_epoch_{epoch + 1}.pt"
+            checkpoint_file = Path(config.training.save_dir) / f"checkpoint_v2_epoch_{epoch + 1}.pt"
             trainer.save_checkpoint(str(checkpoint_file))
         
         # Save best model
         if metrics['episode_reward'] > trainer.best_reward:
             trainer.best_reward = metrics['episode_reward']
-            best_file = Path(config.training.save_dir) / "checkpoint_best.pt"
+            best_file = Path(config.training.save_dir) / "checkpoint_v2_best.pt"
             trainer.save_checkpoint(str(best_file))
     
     # Save final checkpoint
-    final_file = Path(config.training.save_dir) / "checkpoint_final.pt"
+    final_file = Path(config.training.save_dir) / "checkpoint_v2_final.pt"
     trainer.save_checkpoint(str(final_file))
     
     total_time = time.time() - start_time
-    logger.info(f"Training complete in {total_time/60:.1f} minutes")
+    logger.info(f"V2 Training complete in {total_time/60:.1f} minutes")
     logger.info(f"Final loss: {metrics['total_loss']:.4f}")
     logger.info(f"Best reward: {trainer.best_reward:.2f}")
 
@@ -879,16 +946,18 @@ def train_parallel(
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Parallel RL Audio Editor Training")
+    parser = argparse.ArgumentParser(description="V2 RL Audio Editor Training (Section Actions + Episode Rewards)")
     parser.add_argument("--data_dir", type=str, default="./training_data", help="Training data directory")
     parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
     parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--steps", type=int, default=2048, help="Steps per epoch")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
+    parser.add_argument("--checkpoint", type=str, default=None, help="V2 checkpoint to resume from")
+    parser.add_argument("--v1_checkpoint", type=str, default=None, help="V1 checkpoint for transfer learning")
     parser.add_argument("--target_loss", type=float, default=0.01, help="Target loss to stop training")
     parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model (RLHF)")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
-    parser.add_argument("--no_lr_decay", action="store_true", help="Disable learning rate decay (use fixed LR)")
+    parser.add_argument("--no_lr_decay", action="store_true", help="Disable learning rate decay")
+    parser.add_argument("--save_dir", type=str, default="models_v2", help="Directory to save checkpoints")
     
     args = parser.parse_args()
     
@@ -899,6 +968,9 @@ if __name__ == "__main__":
     )
     
     config = get_default_config()
+    
+    # Set save directory
+    config.training.save_dir = args.save_dir
     
     # Override learning rate if specified
     if args.lr is not None:
@@ -915,12 +987,13 @@ if __name__ == "__main__":
         config.reward.use_learned_rewards = True
         logger.info("Learned rewards ENABLED (RLHF mode)")
     
-    train_parallel(
+    train_v2(
         config=config,
         data_dir=args.data_dir,
         n_epochs=args.epochs,
         n_envs=args.n_envs,
         steps_per_epoch=args.steps,
         checkpoint_path=args.checkpoint,
+        v1_checkpoint_path=args.v1_checkpoint,
         target_loss=args.target_loss,
     )

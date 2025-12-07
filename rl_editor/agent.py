@@ -588,10 +588,15 @@ class Agent:
             logger.warning("NaN in logits during evaluate_actions, replacing with zeros")
             logits = torch.nan_to_num(logits, nan=0.0)
         
-        # Add small noise to logits to prevent distribution from collapsing
-        # This keeps some exploration even when policy becomes confident
-        noise = torch.randn_like(logits) * 0.01
+        # Add moderate noise to logits to prevent distribution from collapsing
+        # This keeps exploration active even when policy becomes confident
+        noise = torch.randn_like(logits) * 0.1  # Increased from 0.01
         logits = logits + noise
+        
+        # Temperature scaling - soften distribution to encourage exploration
+        # Higher temperature = more uniform distribution = more exploration
+        training_temperature = 1.5  # > 1.0 means softer distribution
+        logits = logits / training_temperature
         
         dist = torch.distributions.Categorical(logits=logits)
         log_probs = dist.log_prob(actions)

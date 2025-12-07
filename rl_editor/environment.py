@@ -233,16 +233,20 @@ class AudioEditingEnv(gym.Env):
         return self._compute_supervised_step_reward(action)
     
     def _compute_minimal_step_reward(self, action: Action) -> float:
-        """Compute minimal shaping reward for trajectory-based training.
+        """Compute enhanced shaping reward for trajectory-based training (Option A).
         
-        Provides small signals to guide exploration without overwhelming
-        the end-of-episode trajectory reward.
+        Provides richer signals to guide exploration:
+        - Progress reward for making decisions
+        - Ratio tracking (stay near target keep ratio)
+        - NEW: Phrase boundary bonus (encourage musical cuts)
+        - NEW: Section coherence bonus (keep adjacent beats together)
+        - NEW: Energy continuity (avoid sudden jumps)
         
         Args:
             action: Action taken
             
         Returns:
-            Small shaping reward
+            Shaping reward (scaled by step_reward_scale)
         """
         from .actions import KeepAction, CutAction, LoopAction, ReorderAction
         
@@ -271,12 +275,153 @@ class AudioEditingEnv(gym.Env):
             elif ratio_diff > 0.3:
                 reward -= 0.1
         
-        # Small penalty for excessive looping
+        # Penalties for excessive/repetitive looping
         if isinstance(action, LoopAction):
+            # Penalty for exceeding max loop ratio
             loop_penalty = self._compute_loop_ratio_penalty()
-            reward += loop_penalty * 0.5
+            reward += loop_penalty
+            
+            # Penalty for looping beats near other looped beats (repetition)
+            repetition_penalty = self._compute_loop_repetition_penalty(beat_idx)
+            reward += repetition_penalty
+        
+        # === NEW ENHANCED STEP REWARDS (Option A) ===
+        
+        # 1. Phrase boundary bonus for cuts
+        if isinstance(action, CutAction):
+            phrase_bonus = self._compute_step_phrase_boundary_bonus(beat_idx)
+            reward += reward_config.step_phrase_boundary_bonus * phrase_bonus
+        
+        # 2. Section coherence bonus for keeps
+        if isinstance(action, KeepAction):
+            coherence_bonus = self._compute_step_coherence_bonus(beat_idx)
+            reward += reward_config.step_coherence_bonus * coherence_bonus
+        
+        # 3. Energy continuity check (penalty for sudden jumps)
+        if isinstance(action, KeepAction) and len(self.edit_history.kept_beats) > 0:
+            energy_penalty = self._compute_step_energy_penalty(beat_idx)
+            reward -= reward_config.step_energy_continuity_weight * energy_penalty
         
         # Scale down all rewards
+        return reward * scale
+    
+    def _compute_step_phrase_boundary_bonus(self, beat_idx: int) -> float:
+        """Compute bonus for cutting at musical phrase boundaries.
+        
+        Args:
+            beat_idx: Beat index being cut
+            
+        Returns:
+            Bonus value [0, 1] - higher for phrase boundaries
+        """
+        # Common phrase boundary positions (modulo)
+        # Best: end of 8-beat phrase, also good: end of 4-beat bar
+        
+        # Check if we're at end of a phrase (beat 7, 15, 23, etc. -> before beat 0, 8, 16...)
+        # Or at the start of a new phrase
+        
+        position_in_phrase = beat_idx % 8
+        
+        if position_in_phrase == 7 or position_in_phrase == 0:
+            # At phrase boundary - great place to cut
+            return 1.0
+        elif position_in_phrase == 3 or position_in_phrase == 4:
+            # At bar boundary - good place to cut
+            return 0.6
+        elif position_in_phrase in [1, 2, 5, 6]:
+            # Mid-bar - less ideal but okay
+            return 0.2
+        
+        return 0.0
+    
+    def _compute_step_coherence_bonus(self, beat_idx: int) -> float:
+        """Compute bonus for keeping beats adjacent to other kept beats.
+        
+        Encourages keeping coherent sections rather than scattered beats.
+        
+        Args:
+            beat_idx: Beat index being kept
+            
+        Returns:
+            Bonus value [0, 1] - higher if adjacent to other kept beats
+        """
+        kept_beats = self.edit_history.kept_beats
+        
+        if not kept_beats:
+            return 0.5  # First beat - neutral
+        
+        # Check if adjacent beats are kept
+        prev_kept = (beat_idx - 1) in kept_beats
+        next_kept = (beat_idx + 1) in kept_beats
+        
+        if prev_kept and next_kept:
+            # Filling a gap - great for coherence
+            return 1.0
+        elif prev_kept:
+            # Extending a section forward - good
+            return 0.8
+        elif next_kept:
+            # Will connect to next kept beat - good
+            return 0.7
+        else:
+            # Isolated beat (so far) - less ideal but might be fine
+            # Check if we're near other kept beats
+            nearby_kept = any(
+                abs(beat_idx - k) <= 3 
+                for k in kept_beats
+            )
+            if nearby_kept:
+                return 0.4
+            else:
+                return 0.1  # Very isolated
+    
+    def _compute_step_energy_penalty(self, beat_idx: int) -> float:
+        """Compute penalty for sudden energy discontinuity.
+        
+        If we keep a beat that has very different energy from the previous
+        kept beat, that could create a jarring transition.
+        
+        Args:
+            beat_idx: Beat index being kept
+            
+        Returns:
+            Penalty value [0, 1] - higher for larger energy jumps
+        """
+        if self.audio_state.beat_features is None:
+            return 0.0
+        
+        kept_beats = sorted(self.edit_history.kept_beats)
+        
+        if not kept_beats:
+            return 0.0  # No previous beats to compare
+        
+        # Find most recent kept beat
+        prev_kept_idx = kept_beats[-1]
+        
+        beat_features = self.audio_state.beat_features
+        n_beats = len(beat_features)
+        
+        if prev_kept_idx >= n_beats or beat_idx >= n_beats:
+            return 0.0
+        
+        # Use first few features (typically energy-related)
+        # Assuming features include RMS energy in first positions
+        try:
+            prev_energy = np.mean(np.abs(beat_features[prev_kept_idx][:8]))
+            curr_energy = np.mean(np.abs(beat_features[beat_idx][:8]))
+            
+            # Compute relative energy change
+            avg_energy = (prev_energy + curr_energy) / 2 + 1e-6
+            energy_diff = abs(prev_energy - curr_energy) / avg_energy
+            
+            # Penalty increases with energy difference
+            # 50% change = 0.5 penalty, 100% change = 1.0 penalty
+            penalty = min(1.0, energy_diff)
+            
+            return penalty
+            
+        except Exception:
+            return 0.0
         return reward * scale
     
     def _compute_supervised_step_reward(self, action: Action) -> float:
@@ -450,6 +595,36 @@ class AudioEditingEnv(gym.Env):
         
         return penalty
 
+    def _compute_loop_repetition_penalty(self, beat_idx: int) -> float:
+        """Compute penalty for looping beats near other looped beats.
+        
+        This discourages creating repetitive sections where multiple
+        consecutive or nearby beats are all looped.
+        
+        Args:
+            beat_idx: The beat index being looped
+            
+        Returns:
+            Penalty (negative) based on nearby looped beats
+        """
+        penalty_weight = self.config.reward.loop_repetition_penalty
+        window = self.config.reward.loop_proximity_window
+        
+        # Count how many nearby beats are already looped
+        nearby_loops = 0
+        for looped_beat in self.edit_history.looped_beats:
+            if looped_beat != beat_idx and abs(looped_beat - beat_idx) <= window:
+                nearby_loops += 1
+        
+        if nearby_loops == 0:
+            return 0.0
+        
+        # Progressive penalty: more nearby loops = stronger penalty
+        # 1 nearby: -0.3, 2 nearby: -0.6, 3+: -0.9 (capped)
+        penalty = -penalty_weight * min(nearby_loops, 3)
+        
+        return penalty
+
     def _get_observation(self) -> np.ndarray:
         """Get current observation.
 
@@ -596,10 +771,13 @@ class AudioEditingEnv(gym.Env):
     def compute_trajectory_reward(self) -> float:
         """Compute trajectory-based reward at end of episode.
         
-        This evaluates the quality of the entire edit by:
+        Enhanced with perceptual quality metrics (Option B):
         1. Building the edited audio from edit history
         2. Computing audio quality metrics (transitions, energy, tempo)
-        3. Checking keep ratio alignment with target
+        3. NEW: Spectral continuity at edit points
+        4. NEW: Section coherence (consecutive beat groupings)
+        5. NEW: Flow continuity (beat-to-beat transitions)
+        6. Ground truth alignment (reduced weight - learn quality, not just copy labels)
         
         Returns:
             Trajectory reward (scaled by trajectory_reward_scale)
@@ -626,6 +804,7 @@ class AudioEditingEnv(gym.Env):
         # 1. Keep ratio score (how close to target)
         n_kept = len(self.edit_history.kept_beats)
         n_total = len(self.audio_state.beat_times)
+        keep_ratio = 0.0
         if n_total > 0:
             keep_ratio = n_kept / n_total
             target_ratio = reward_config.target_keep_ratio
@@ -653,7 +832,6 @@ class AudioEditingEnv(gym.Env):
             total_weight += reward_config.tempo_consistency_weight
         except Exception as e:
             logger.debug(f"Tempo estimation failed: {e}")
-            # Use default tempo_score but don't add to quality_score
         
         # 4. Energy flow (smooth dynamics)
         energy_score = self._compute_energy_flow_score(edited_audio)
@@ -665,12 +843,34 @@ class AudioEditingEnv(gym.Env):
         quality_score += reward_config.phrase_completeness_weight * phrase_score
         total_weight += reward_config.phrase_completeness_weight
         
-        # 6. Ground truth alignment (how well does edit match human edit)
+        # === NEW ENHANCED METRICS (Option B) ===
+        
+        # 6. Spectral continuity at edit points
+        spectral_score = self._compute_spectral_continuity_score(edited_audio)
+        quality_score += reward_config.spectral_continuity_weight * spectral_score
+        total_weight += reward_config.spectral_continuity_weight
+        
+        # 7. Section coherence (reward for keeping consecutive beats together)
+        coherence_score = self._compute_section_coherence_score()
+        quality_score += reward_config.section_coherence_weight * coherence_score
+        total_weight += reward_config.section_coherence_weight
+        
+        # 8. Flow continuity (beat-to-beat transitions in kept sequence)
+        flow_score = self._compute_flow_continuity_score()
+        quality_score += reward_config.flow_continuity_weight * flow_score
+        total_weight += reward_config.flow_continuity_weight
+        
+        # 9. Beat alignment quality at edit points
+        beat_align_score = self._compute_beat_alignment_quality()
+        quality_score += reward_config.beat_alignment_quality_weight * beat_align_score
+        total_weight += reward_config.beat_alignment_quality_weight
+        
+        # 10. Ground truth alignment (REDUCED weight - learn quality, don't just copy)
         gt_alignment_score = 0.0
         if self.audio_state.target_labels is not None:
             gt_alignment_score = self._compute_ground_truth_alignment()
-            # Weight ground truth heavily - this is what we really want to learn
-            gt_weight = 3.0  # Higher weight than other metrics
+            # Use configurable weight (default 1.0, was hardcoded 3.0)
+            gt_weight = reward_config.ground_truth_weight
             quality_score += gt_weight * gt_alignment_score
             total_weight += gt_weight
         
@@ -684,7 +884,9 @@ class AudioEditingEnv(gym.Env):
         trajectory_reward = normalized_score * reward_config.trajectory_reward_scale
         
         logger.debug(f"Trajectory reward: {trajectory_reward:.2f} (keep_ratio: {keep_ratio:.2f}, "
-                    f"transition: {transition_score:.2f}, tempo: {tempo_score:.2f}, gt_align: {gt_alignment_score:.2f})")
+                    f"transition: {transition_score:.2f}, tempo: {tempo_score:.2f}, "
+                    f"spectral: {spectral_score:.2f}, coherence: {coherence_score:.2f}, "
+                    f"flow: {flow_score:.2f}, gt_align: {gt_alignment_score:.2f})")
         
         return trajectory_reward
     
@@ -724,6 +926,195 @@ class AudioEditingEnv(gym.Env):
         
         return f1_score
     
+    def _compute_spectral_continuity_score(self, edited_audio: np.ndarray) -> float:
+        """Compute spectral continuity at edit points.
+        
+        Measures how smoothly the frequency content transitions at edit boundaries.
+        High score = smooth spectral transitions, low score = jarring frequency jumps.
+        
+        Args:
+            edited_audio: Edited audio array
+            
+        Returns:
+            Spectral continuity score [0, 1]
+        """
+        sr = self.audio_state.sample_rate
+        
+        try:
+            # Compute mel spectrogram
+            import librosa
+            n_fft = 2048
+            hop_length = 512
+            mel_spec = librosa.feature.melspectrogram(
+                y=edited_audio, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=64
+            )
+            mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+            
+            if mel_db.shape[1] < 3:
+                return 0.5  # Too short
+            
+            # Compute frame-to-frame spectral flux
+            spectral_flux = np.sqrt(np.sum(np.diff(mel_db, axis=1) ** 2, axis=0))
+            
+            # Find large jumps (potential edit points)
+            mean_flux = np.mean(spectral_flux)
+            std_flux = np.std(spectral_flux)
+            threshold = mean_flux + 2 * std_flux
+            
+            n_large_jumps = np.sum(spectral_flux > threshold)
+            jump_density = n_large_jumps / len(spectral_flux)
+            
+            # Score: 1.0 if no large jumps, decreasing with more jumps
+            score = max(0.0, 1.0 - jump_density * 5)
+            return score
+            
+        except Exception as e:
+            logger.debug(f"Spectral continuity failed: {e}")
+            return 0.5
+    
+    def _compute_section_coherence_score(self) -> float:
+        """Compute section coherence score.
+        
+        Rewards keeping consecutive beats together (coherent sections)
+        rather than keeping isolated scattered beats.
+        
+        Returns:
+            Section coherence score [0, 1]
+        """
+        kept_sorted = sorted(self.edit_history.kept_beats)
+        
+        if len(kept_sorted) < 2:
+            return 0.5  # Not enough data
+        
+        # Count consecutive pairs
+        n_consecutive = 0
+        for i in range(len(kept_sorted) - 1):
+            if kept_sorted[i + 1] == kept_sorted[i] + 1:
+                n_consecutive += 1
+        
+        # Score based on ratio of consecutive to total kept
+        max_possible_consecutive = len(kept_sorted) - 1
+        if max_possible_consecutive == 0:
+            return 1.0
+        
+        coherence_ratio = n_consecutive / max_possible_consecutive
+        
+        # Reward higher coherence (keeping sections together)
+        # But don't penalize too much - some gaps are okay
+        return 0.3 + 0.7 * coherence_ratio
+    
+    def _compute_flow_continuity_score(self) -> float:
+        """Compute flow continuity based on beat-level features.
+        
+        Measures how smoothly the audio flows between kept beats,
+        using the audio features to detect jarring transitions.
+        
+        Returns:
+            Flow continuity score [0, 1]
+        """
+        if self.audio_state.beat_features is None:
+            return 0.5
+        
+        kept_sorted = sorted(self.edit_history.kept_beats)
+        
+        if len(kept_sorted) < 2:
+            return 0.5
+        
+        beat_features = self.audio_state.beat_features
+        n_beats = len(beat_features)
+        
+        # Compute feature distances between consecutive kept beats
+        distances = []
+        for i in range(len(kept_sorted) - 1):
+            curr_idx = kept_sorted[i]
+            next_idx = kept_sorted[i + 1]
+            
+            if curr_idx < n_beats and next_idx < n_beats:
+                # Euclidean distance between feature vectors
+                dist = np.linalg.norm(beat_features[curr_idx] - beat_features[next_idx])
+                distances.append(dist)
+        
+        if not distances:
+            return 0.5
+        
+        # Compare to distances between originally adjacent beats
+        original_distances = []
+        for i in range(min(n_beats - 1, 100)):  # Sample first 100 beats
+            dist = np.linalg.norm(beat_features[i] - beat_features[i + 1])
+            original_distances.append(dist)
+        
+        if not original_distances:
+            return 0.5
+        
+        mean_edit_dist = np.mean(distances)
+        mean_orig_dist = np.mean(original_distances)
+        
+        # Score: 1.0 if edit distances are similar to original, lower if larger
+        if mean_orig_dist > 0:
+            ratio = mean_edit_dist / (mean_orig_dist + 1e-6)
+            score = max(0.0, 1.0 - (ratio - 1.0) * 0.5)  # Allow some slack
+        else:
+            score = 0.5
+        
+        return min(1.0, score)
+    
+    def _compute_beat_alignment_quality(self) -> float:
+        """Compute beat alignment quality at edit boundaries.
+        
+        Checks if cuts happen at beat boundaries (rather than mid-beat)
+        and if the timing alignment is clean.
+        
+        Returns:
+            Beat alignment quality score [0, 1]
+        """
+        # Since we're always cutting at beat boundaries by design,
+        # this metric focuses on the quality of those boundaries
+        
+        kept_sorted = sorted(self.edit_history.kept_beats)
+        
+        if len(kept_sorted) < 2:
+            return 1.0  # Single section is always aligned
+        
+        # Find edit boundaries (where we jump between non-consecutive beats)
+        n_edit_points = 0
+        good_edit_points = 0
+        
+        beat_times = self.audio_state.beat_times
+        n_beats = len(beat_times)
+        
+        for i in range(len(kept_sorted) - 1):
+            curr_idx = kept_sorted[i]
+            next_idx = kept_sorted[i + 1]
+            
+            # If not consecutive, this is an edit point
+            if next_idx != curr_idx + 1:
+                n_edit_points += 1
+                
+                # Check if both beats are on downbeats (every 4th beat)
+                # This makes for cleaner musical transitions
+                curr_is_downbeat = curr_idx % 4 == 0
+                next_is_downbeat = next_idx % 4 == 0
+                
+                # Also check phrase boundaries (every 8th beat)
+                curr_is_phrase = curr_idx % 8 == 0
+                next_is_phrase = next_idx % 8 == 0
+                
+                # Score this edit point
+                if curr_is_phrase and next_is_phrase:
+                    good_edit_points += 1.0
+                elif curr_is_downbeat or next_is_downbeat:
+                    good_edit_points += 0.7
+                elif (curr_idx + 1) % 4 == 0 or next_idx % 4 == 0:
+                    # Cutting just before a downbeat is okay too
+                    good_edit_points += 0.5
+                else:
+                    good_edit_points += 0.2
+        
+        if n_edit_points == 0:
+            return 1.0  # No edit points needed
+        
+        return good_edit_points / n_edit_points
+
     def _build_edited_audio(self, crossfade_ms: float = 50.0) -> Optional[np.ndarray]:
         """Build edited audio from edit history.
         
