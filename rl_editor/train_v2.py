@@ -43,6 +43,7 @@ from .state import AudioState, EditHistory
 from .reward import compute_trajectory_return
 from .logging_utils import TrainingLogger, create_logger
 from .learned_reward_integration import LearnedRewardIntegration
+from .auxiliary_tasks import AuxiliaryConfig, AuxiliaryTargetComputer, compute_auxiliary_targets
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ def get_lr_scheduler(optimizer: optim.Optimizer, config: Config, total_epochs: i
 
 @dataclass
 class RolloutBufferV2:
-    """Buffer for storing rollout data with V2 action masks."""
+    """Buffer for storing rollout data with V2 action masks and auxiliary targets."""
     states: List[np.ndarray]
     actions: List[int]
     rewards: List[float]
@@ -107,6 +108,9 @@ class RolloutBufferV2:
     episode_rewards: List[float]
     episode_lengths: List[int]
     section_decisions: List[int]  # How many section-level actions taken
+    # Auxiliary task targets
+    beat_indices: List[int]  # Current beat index for each step
+    auxiliary_targets: Dict[str, List[np.ndarray]]  # task_name -> list of targets
     
     def __init__(self):
         self.clear()
@@ -122,8 +126,16 @@ class RolloutBufferV2:
         self.episode_rewards = []
         self.episode_lengths = []
         self.section_decisions = []
+        self.beat_indices = []
+        self.auxiliary_targets = {
+            "tempo": [],
+            "energy": [],
+            "phrase": [],
+            "reconstruction": [],
+            "reconstruction_mask": [],
+        }
     
-    def add(self, state, action, reward, value, log_prob, done, mask):
+    def add(self, state, action, reward, value, log_prob, done, mask, beat_index=0, aux_targets=None):
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
@@ -131,6 +143,21 @@ class RolloutBufferV2:
         self.log_probs.append(log_prob)
         self.dones.append(done)
         self.masks.append(mask)
+        self.beat_indices.append(beat_index)
+        
+        # Store auxiliary targets
+        if aux_targets is not None:
+            for key in self.auxiliary_targets:
+                if key in aux_targets:
+                    self.auxiliary_targets[key].append(aux_targets[key])
+    
+    def get_auxiliary_targets_batch(self) -> Dict[str, np.ndarray]:
+        """Get batched auxiliary targets for training."""
+        result = {}
+        for key, values in self.auxiliary_targets.items():
+            if values:
+                result[key] = np.array(values)
+        return result
     
     def __len__(self):
         return len(self.states)
@@ -171,39 +198,44 @@ class VectorizedEnvV2Wrapper:
         return obs_list, info_list
     
     def step_all(self, actions: List[int]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
-        """Step all environments with given actions.
+        """Step all environments with given actions using thread pool for parallelism.
         
         V2 uses episode-level rewards primarily - step rewards are minimal.
         """
-        next_obs_list = []
-        reward_list = []
-        terminated_list = []
-        truncated_list = []
-        info_list = []
-        
-        for env, action in zip(self.envs, actions):
+        def step_env(args):
+            env, action = args
             if env is not None:
-                next_obs, reward, terminated, truncated, info = env.step(action)
-                
-                # V2: Episode reward is computed in environment at episode end
-                # No additional trajectory reward computation needed here
-                
-                next_obs_list.append(next_obs)
-                reward_list.append(reward)
-                terminated_list.append(terminated)
-                truncated_list.append(truncated)
-                info_list.append(info)
+                return env.step(action)
+            return None, 0.0, False, False, {}
+        
+        # Parallel step using threads (GIL-friendly for I/O-bound env stepping)
+        with ThreadPoolExecutor(max_workers=len(self.envs)) as executor:
+            results = list(executor.map(step_env, zip(self.envs, actions)))
+        
+        next_obs_list = [r[0] for r in results]
+        reward_list = [r[1] for r in results]
+        terminated_list = [r[2] for r in results]
+        truncated_list = [r[3] for r in results]
+        info_list = [r[4] for r in results]
         
         return next_obs_list, reward_list, terminated_list, truncated_list, info_list
     
     def get_action_masks(self) -> List[np.ndarray]:
-        """Get action masks for all V2 environments."""
-        masks = []
-        for env in self.envs:
+        """Get action masks for all V2 environments using thread pool."""
+        def get_mask(env):
             if env is not None:
-                mask = env.get_action_mask()
-                masks.append(mask)
+                return env.get_action_mask()
+            return np.ones(ActionSpaceV2.N_ACTIONS, dtype=bool)
+        
+        with ThreadPoolExecutor(max_workers=len(self.envs)) as executor:
+            masks = list(executor.map(get_mask, self.envs))
         return masks
+    
+    def reset_env(self, i: int) -> Tuple[np.ndarray, dict]:
+        """Reset a single environment."""
+        if self.envs[i] is not None:
+            return self.envs[i].reset()
+        return None, {}
 
 
 class ParallelPPOTrainerV2:
@@ -216,6 +248,7 @@ class ParallelPPOTrainerV2:
         prefetch_factor: int = 2,
         total_epochs: int = 1000,
         learned_reward_model: Optional[Any] = None,
+        use_subprocess: bool = False,
     ):
         self.config = config
         self.n_envs = n_envs
@@ -223,6 +256,7 @@ class ParallelPPOTrainerV2:
         self.total_epochs = total_epochs
         self.current_epoch = 0
         self.learned_reward_model = learned_reward_model
+        self.use_subprocess = use_subprocess
         self.device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
         
         # Entropy coefficient (decay over training to reduce exploration as policy improves)
@@ -230,8 +264,14 @@ class ParallelPPOTrainerV2:
         self.entropy_coeff_min = getattr(config.ppo, 'entropy_coeff_min', 0.01)
         self.entropy_coeff_decay = getattr(config.ppo, 'entropy_coeff_decay', True)
         
-        # Vectorized V2 environments
-        self.vec_env = VectorizedEnvV2Wrapper(config, n_envs, learned_reward_model=learned_reward_model)
+        # Vectorized V2 environments (thread-based or subprocess-based)
+        if use_subprocess:
+            from .subprocess_vec_env import make_subprocess_vec_env
+            self.vec_env = make_subprocess_vec_env(config, n_envs, learned_reward_model=learned_reward_model)
+            logger.info(f"Using subprocess-based parallel environments ({n_envs} processes)")
+        else:
+            self.vec_env = VectorizedEnvV2Wrapper(config, n_envs, learned_reward_model=learned_reward_model)
+            logger.info(f"Using thread-based parallel environments ({n_envs} threads)")
         
         # Agent (initialized later when we know input dimensions)
         self.agent: Optional[Agent] = None
@@ -252,13 +292,23 @@ class ParallelPPOTrainerV2:
         self.episode_rewards = []
         self.episode_lengths = []
         
-        # Reward normalization (running statistics)
-        self.reward_mean = 0.0
-        self.reward_var = 1.0
-        self.reward_count = 0
+        # Running statistics for return normalization (stable across different n_envs)
+        self.return_mean = 0.0
+        self.return_var = 1.0
+        self.return_count = 0
+        
+        # Value learning rate scaling based on n_envs
+        # More envs = more variance in returns = need lower LR for stability
+        # Scale: 1/sqrt(n_envs/8) where 8 is the baseline
+        self.value_lr_scale = 1.0 / math.sqrt(n_envs / 8.0)
+        logger.info(f"Value LR scale for {n_envs} envs: {self.value_lr_scale:.3f}x")
         
         # Target KL for early stopping
         self.target_kl = getattr(config.ppo, 'target_kl', 0.01)
+        
+        # Auxiliary task target computer
+        self.aux_config = AuxiliaryConfig()
+        self.aux_target_computer = AuxiliaryTargetComputer(self.aux_config)
         
         # Logging
         self.training_logger: Optional[TrainingLogger] = None
@@ -274,17 +324,40 @@ class ParallelPPOTrainerV2:
         if config.ppo.lr_decay:
             logger.info(f"LR decay enabled: {config.ppo.lr_decay_type}, warmup={config.ppo.lr_warmup_epochs}")
     
-    def _init_agent(self, input_dim: int, n_actions: int):
-        """Initialize agent and optimizers."""
-        self.agent = Agent(self.config, input_dim, n_actions)
+    def _init_agent(self, input_dim: int, n_actions: int, beat_feature_dim: int = 121):
+        """Initialize agent and optimizers with auxiliary tasks."""
+        self.agent = Agent(
+            self.config, 
+            input_dim, 
+            n_actions,
+            beat_feature_dim=beat_feature_dim,
+            use_auxiliary_tasks=True,
+        )
+        
+        # Policy optimizer (includes encoder which is shared with auxiliary)
+        policy_lr = self.config.ppo.learning_rate
         self.policy_optimizer = optim.Adam(
             self.agent.policy_net.parameters(),
-            lr=self.config.ppo.learning_rate
+            lr=policy_lr
         )
+        
+        # Value optimizer with scaled learning rate for stability with many envs
+        # More envs = higher return variance = need lower LR to avoid oscillation
+        value_lr = policy_lr * self.value_lr_scale
         self.value_optimizer = optim.Adam(
             self.agent.value_net.parameters(),
-            lr=self.config.ppo.learning_rate
+            lr=value_lr
         )
+        logger.info(f"Policy LR: {policy_lr:.2e}, Value LR: {value_lr:.2e} ({self.value_lr_scale:.3f}x)")
+        
+        # Auxiliary task optimizer (separate to allow different learning rates)
+        self.auxiliary_optimizer = None
+        if self.agent.auxiliary_module is not None:
+            self.auxiliary_optimizer = optim.Adam(
+                self.agent.auxiliary_module.parameters(),
+                lr=self.config.ppo.learning_rate * 2.0,  # Slightly higher LR for auxiliary tasks
+            )
+            logger.info("Auxiliary task optimizer initialized")
         
         # Initialize LR schedulers
         self.policy_scheduler = get_lr_scheduler(
@@ -374,11 +447,14 @@ class ParallelPPOTrainerV2:
             self.value_scheduler.step()
         self.current_epoch += 1
         
-        # Log current learning rate and entropy coefficient
-        if self.policy_optimizer:
-            current_lr = self.policy_optimizer.param_groups[0]['lr']
+        # Log current learning rates and entropy coefficient
+        if self.policy_optimizer and self.value_optimizer:
+            policy_lr = self.policy_optimizer.param_groups[0]['lr']
+            value_lr = self.value_optimizer.param_groups[0]['lr']
             if self.training_logger:
-                self.training_logger.log_scalar("learning_rate", current_lr, self.current_epoch)
+                self.training_logger.log_scalar("learning_rate/policy", policy_lr, self.current_epoch)
+                self.training_logger.log_scalar("learning_rate/value", value_lr, self.current_epoch)
+                self.training_logger.log_scalar("learning_rate", policy_lr, self.current_epoch)  # backward compat
                 self.training_logger.log_scalar("entropy_coeff", self.get_current_entropy_coeff(), self.current_epoch)
     
     def get_current_entropy_coeff(self) -> float:
@@ -422,6 +498,9 @@ class ParallelPPOTrainerV2:
         n_steps: int,
     ) -> Dict[str, np.ndarray]:
         """Collect rollouts from multiple V2 environments in parallel."""
+        # Clear auxiliary target cache for new audio states
+        self.aux_target_computer._cache.clear()
+        
         # Setup environments
         self.vec_env.set_audio_states(audio_states)
         obs_list, _ = self.vec_env.reset_all()
@@ -442,55 +521,94 @@ class ParallelPPOTrainerV2:
         exploration_rate = max(0.15, 0.5 - self.global_step / 2000000)
         
         for step in range(n_steps):
-            # Batch observations
+            # Batch observations - keep on CPU until needed
             obs_batch = np.stack(obs_list)
-            obs_tensor = torch.from_numpy(obs_batch).float().to(self.device)
             
-            # Get V2 action masks
+            # Get V2 action masks (parallel via ThreadPool)
             masks = self.vec_env.get_action_masks()
             mask_batch = np.stack(masks)
-            mask_tensor = torch.from_numpy(mask_batch).bool().to(self.device)
+            
+            # Single GPU transfer for batch inference
+            obs_tensor = torch.from_numpy(obs_batch).float().to(self.device, non_blocking=True)
+            mask_tensor = torch.from_numpy(mask_batch).bool().to(self.device, non_blocking=True)
             
             # Batch inference
             with torch.no_grad():
                 actions, log_probs = self.agent.select_action_batch(obs_tensor, mask_tensor)
                 values = self.agent.compute_value_batch(obs_tensor)
+                # Move to CPU immediately to free GPU memory
+                actions_np = actions.cpu().numpy()
+                log_probs_np = log_probs.cpu().numpy()
+                values_np = values.cpu().numpy()
             
-            # Epsilon-greedy exploration
-            actions_np = actions.cpu().numpy()
-            log_probs_np = log_probs.cpu().numpy()
-            for i in range(len(obs_list)):
-                if np.random.random() < exploration_rate:
-                    valid_actions = np.where(masks[i])[0]
-                    if len(valid_actions) > 0:
-                        random_action = np.random.choice(valid_actions)
-                        actions_np[i] = random_action
-                        log_probs_np[i] = -np.log(len(valid_actions))
+            # Epsilon-greedy exploration (vectorized where possible)
+            explore_mask = np.random.random(len(obs_list)) < exploration_rate
+            for i in np.where(explore_mask)[0]:
+                valid_actions = np.where(masks[i])[0]
+                if len(valid_actions) > 0:
+                    actions_np[i] = np.random.choice(valid_actions)
+                    log_probs_np[i] = -np.log(len(valid_actions))
             
-            # Convert to lists
-            actions_list = actions_np.tolist()
-            log_probs_list = log_probs_np.tolist()
-            values_list = values.cpu().numpy().tolist()
+            # Step all environments (parallel via ThreadPool)
+            next_obs_list, rewards, terminateds, truncateds, infos = self.vec_env.step_all(actions_np.tolist())
             
-            # Step all environments
-            next_obs_list, rewards, terminateds, truncateds, infos = self.vec_env.step_all(actions_list)
+            # Batch auxiliary target computation
+            # For threading mode: access env data directly
+            # For subprocess mode: aux targets computed in subprocess and returned in info
+            beat_indices = []
+            aux_targets_list = []  # Store aux_targets per env
+            
+            if self.use_subprocess:
+                # Subprocess mode - aux targets computed in subprocess workers
+                for i in range(len(obs_list)):
+                    info = infos[i]
+                    beat_idx = info.get("beat", 0)
+                    beat_indices.append(beat_idx)
+                    # Get pre-computed aux targets from subprocess
+                    aux_targets = info.get("aux_targets")
+                    if aux_targets is not None:
+                        # Reconstruction is a list, convert back to array
+                        if "reconstruction" in aux_targets and isinstance(aux_targets["reconstruction"], list):
+                            aux_targets["reconstruction"] = np.array(aux_targets["reconstruction"])
+                    aux_targets_list.append(aux_targets)
+            else:
+                # Threading mode - access env data directly and compute here
+                for i in range(len(obs_list)):
+                    env = self.vec_env.envs[i]
+                    if env is not None and env.audio_state is not None:
+                        beat_indices.append(env.current_beat)
+                        # Compute auxiliary targets using cached computer
+                        audio_id = f"env_{i}_epoch"  # Cache per env per epoch
+                        aux_targets = self.aux_target_computer.get_targets(
+                            audio_id=audio_id,
+                            beat_times=env.audio_state.beat_times,
+                            beat_features=env.audio_state.beat_features,
+                            beat_indices=np.array([env.current_beat]),
+                        )
+                        aux_targets = {k: v[0] if len(v) > 0 else 0 for k, v in aux_targets.items()}
+                        aux_targets_list.append(aux_targets)
+                    else:
+                        beat_indices.append(0)
+                        aux_targets_list.append(None)
             
             # Store in buffer
             for i in range(len(obs_list)):
                 self.buffer.add(
                     state=obs_list[i],
-                    action=actions_list[i],
+                    action=actions_np[i],
                     reward=rewards[i],
-                    value=values_list[i],
-                    log_prob=log_probs_list[i],
+                    value=values_np[i],
+                    log_prob=log_probs_np[i],
                     done=terminateds[i] or truncateds[i],
                     mask=masks[i],
+                    beat_index=beat_indices[i],
+                    aux_targets=aux_targets_list[i],
                 )
                 episode_rewards[i] += rewards[i]
                 episode_lengths[i] += 1
                 
                 # Track section-level decisions
-                action = actions_list[i]
+                action = actions_np[i]
                 if action in [ActionTypeV2.KEEP_BAR.value, ActionTypeV2.CUT_BAR.value,
                              ActionTypeV2.KEEP_PHRASE.value, ActionTypeV2.CUT_PHRASE.value,
                              ActionTypeV2.LOOP_BAR_2X.value]:
@@ -514,8 +632,8 @@ class ParallelPPOTrainerV2:
                     episode_lengths[i] = 0
                     section_decisions[i] = 0
                     
-                    # Reset this environment
-                    obs, _ = self.vec_env.envs[i].reset()
+                    # Reset this environment (works with both thread and subprocess envs)
+                    obs, _ = self.vec_env.reset_env(i)
                     next_obs_list[i] = obs
             
             obs_list = next_obs_list
@@ -568,12 +686,49 @@ class ParallelPPOTrainerV2:
         }
     
     def update(self, rollout_data: Dict[str, np.ndarray]) -> Dict[str, float]:
-        """Update policy and value networks using PPO with batched operations."""
+        """Update policy and value networks using PPO with auxiliary tasks."""
         states = torch.from_numpy(rollout_data["states"]).float().to(self.device)
         actions = torch.from_numpy(rollout_data["actions"]).long().to(self.device)
-        returns = torch.from_numpy(rollout_data["returns"]).float().to(self.device)
+        raw_returns = torch.from_numpy(rollout_data["returns"]).float().to(self.device)
         advantages = torch.from_numpy(rollout_data["advantages"]).float().to(self.device)
         old_log_probs = torch.from_numpy(rollout_data["log_probs"]).float().to(self.device)
+        
+        # Update running statistics for return normalization (Welford's online algorithm)
+        # This makes normalization stable regardless of n_envs
+        batch_mean = raw_returns.mean().item()
+        batch_var = raw_returns.var().item()
+        batch_count = len(raw_returns)
+        
+        delta = batch_mean - self.return_mean
+        total_count = self.return_count + batch_count
+        
+        # Update mean
+        new_mean = self.return_mean + delta * batch_count / max(total_count, 1)
+        
+        # Update variance (parallel algorithm)
+        m_a = self.return_var * self.return_count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.return_count * batch_count / max(total_count, 1)
+        new_var = M2 / max(total_count, 1)
+        
+        self.return_mean = new_mean
+        self.return_var = max(new_var, 1e-8)  # Prevent zero variance
+        self.return_count = total_count
+        
+        # Normalize returns using RUNNING statistics (not batch statistics)
+        # This provides stability across different n_envs configurations
+        returns_std = np.sqrt(self.return_var) + 1e-8
+        returns = (raw_returns - self.return_mean) / returns_std
+        
+        # Get auxiliary targets from buffer
+        aux_targets_np = self.buffer.get_auxiliary_targets_batch()
+        aux_targets = {}
+        for key, arr in aux_targets_np.items():
+            if len(arr) > 0:
+                if key in ["tempo", "energy"]:
+                    aux_targets[key] = torch.from_numpy(arr).long().to(self.device)
+                else:
+                    aux_targets[key] = torch.from_numpy(arr).float().to(self.device)
         
         ppo_config = self.config.ppo
         batch_size = ppo_config.batch_size
@@ -582,9 +737,13 @@ class ParallelPPOTrainerV2:
         policy_losses = []
         value_losses = []
         entropy_losses = []
+        auxiliary_losses = []
         approx_kl_divs = []
         nan_batches_skipped = 0
         early_stop_epoch = False
+        
+        # Track auxiliary loss breakdown
+        aux_loss_breakdown = {}
         
         for epoch in range(ppo_config.n_epochs):
             if early_stop_epoch:
@@ -603,73 +762,114 @@ class ParallelPPOTrainerV2:
                 batch_advantages = advantages[batch_indices]
                 batch_old_log_probs = old_log_probs[batch_indices]
                 
+                # Get batch auxiliary targets
+                batch_aux_targets = {}
+                for key, tensor in aux_targets.items():
+                    if len(tensor) > len(batch_indices):
+                        batch_aux_targets[key] = tensor[batch_indices]
+                    elif len(tensor) == len(states):
+                        batch_aux_targets[key] = tensor[batch_indices]
+                
                 # Handle NaN in inputs
                 batch_states = torch.nan_to_num(batch_states, nan=0.0)
                 batch_returns = torch.nan_to_num(batch_returns, nan=0.0)
                 batch_advantages = torch.nan_to_num(batch_advantages, nan=0.0)
                 batch_old_log_probs = torch.nan_to_num(batch_old_log_probs, nan=-5.0)
                 
-                # Forward pass
-                new_log_probs, entropy = self.agent.evaluate_actions(batch_states, batch_actions)
-                
-                # Handle NaN in outputs
-                if torch.isnan(new_log_probs).any():
-                    new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0)
-                if torch.isnan(entropy).any():
-                    entropy = torch.nan_to_num(entropy, nan=0.0)
-                
-                # Compute ratio with clamping
-                log_ratio = new_log_probs - batch_old_log_probs
-                log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
-                ratio = torch.exp(log_ratio)
-                
-                # Approximate KL divergence for early stopping
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1) - log_ratio).mean().item()
-                    epoch_kl_divs.append(approx_kl)
-                
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - ppo_config.clip_ratio, 1 + ppo_config.clip_ratio) * batch_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # Value loss
-                values = self.agent.compute_value_batch(batch_states)
-                if torch.isnan(values).any():
-                    values = torch.nan_to_num(values, nan=0.0)
-                value_loss = nn.functional.mse_loss(values, batch_returns)
-                
-                # Entropy bonus
-                entropy_loss = -entropy.mean()
-                current_entropy_coeff = self.get_current_entropy_coeff()
-                
-                # Combined loss
-                loss = (
-                    policy_loss 
-                    + ppo_config.value_loss_coeff * value_loss 
-                    + current_entropy_coeff * entropy_loss
-                )
+                # Mixed precision forward pass
+                with torch.amp.autocast('cuda', enabled=self.scaler.is_enabled()):
+                    # Forward pass
+                    new_log_probs, entropy = self.agent.evaluate_actions(batch_states, batch_actions)
+                    
+                    # Handle NaN in outputs
+                    if torch.isnan(new_log_probs).any():
+                        new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0)
+                    if torch.isnan(entropy).any():
+                        entropy = torch.nan_to_num(entropy, nan=0.0)
+                    
+                    # Compute ratio with clamping
+                    log_ratio = new_log_probs - batch_old_log_probs
+                    log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
+                    ratio = torch.exp(log_ratio)
+                    
+                    # Approximate KL divergence for early stopping
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                        epoch_kl_divs.append(approx_kl)
+                    
+                    surr1 = ratio * batch_advantages
+                    surr2 = torch.clamp(ratio, 1 - ppo_config.clip_ratio, 1 + ppo_config.clip_ratio) * batch_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Value loss
+                    values = self.agent.compute_value_batch(batch_states)
+                    if torch.isnan(values).any():
+                        values = torch.nan_to_num(values, nan=0.0)
+                    value_loss = nn.functional.mse_loss(values, batch_returns)
+                    
+                    # Entropy bonus
+                    entropy_loss = -entropy.mean()
+                    current_entropy_coeff = self.get_current_entropy_coeff()
+                    
+                    # === AUXILIARY TASK LOSSES ===
+                    aux_loss = torch.tensor(0.0, device=self.device)
+                    if self.agent.auxiliary_module is not None and batch_aux_targets:
+                        aux_loss, aux_breakdown = self.agent.compute_auxiliary_loss(
+                            batch_states, 
+                            batch_aux_targets,
+                            epoch=self.current_epoch,
+                        )
+                        # Track breakdown for logging
+                        for k, v in aux_breakdown.items():
+                            if k not in aux_loss_breakdown:
+                                aux_loss_breakdown[k] = []
+                            aux_loss_breakdown[k].append(v)
+                    
+                    # Combined loss: policy + value + entropy + auxiliary
+                    loss = (
+                        policy_loss 
+                        + ppo_config.value_loss_coeff * value_loss 
+                        + current_entropy_coeff * entropy_loss
+                        + aux_loss  # Auxiliary tasks add to total loss
+                    )
                 
                 # Final NaN check
                 if torch.isnan(loss) or torch.isinf(loss):
                     nan_batches_skipped += 1
                     continue
                 
-                # Backward pass
+                # Backward pass with mixed precision
                 self.policy_optimizer.zero_grad()
                 self.value_optimizer.zero_grad()
+                if self.auxiliary_optimizer is not None:
+                    self.auxiliary_optimizer.zero_grad()
                 
-                loss.backward()
+                # Scaled backward for mixed precision
+                self.scaler.scale(loss).backward()
+                
+                # Unscale before clipping
+                self.scaler.unscale_(self.policy_optimizer)
+                self.scaler.unscale_(self.value_optimizer)
+                if self.auxiliary_optimizer is not None:
+                    self.scaler.unscale_(self.auxiliary_optimizer)
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.agent.policy_net.parameters(), ppo_config.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(self.agent.value_net.parameters(), ppo_config.max_grad_norm)
+                if self.agent.auxiliary_module is not None:
+                    torch.nn.utils.clip_grad_norm_(self.agent.auxiliary_module.parameters(), ppo_config.max_grad_norm)
                 
-                self.policy_optimizer.step()
-                self.value_optimizer.step()
+                # Step optimizers with scaler
+                self.scaler.step(self.policy_optimizer)
+                self.scaler.step(self.value_optimizer)
+                if self.auxiliary_optimizer is not None:
+                    self.scaler.step(self.auxiliary_optimizer)
+                self.scaler.update()
                 
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
+                auxiliary_losses.append(aux_loss.item())
             
             # Check KL divergence for early stopping
             if epoch_kl_divs:
@@ -677,6 +877,7 @@ class ParallelPPOTrainerV2:
                 approx_kl_divs.append(mean_kl)
                 if mean_kl > 1.5 * self.target_kl:
                     logger.debug(f"Early stopping at PPO epoch {epoch+1} due to KL: {mean_kl:.4f}")
+                    early_stop_epoch = True
                     early_stop_epoch = True
         
         if nan_batches_skipped > 0:
@@ -688,21 +889,31 @@ class ParallelPPOTrainerV2:
                 "policy_loss": 999.0,
                 "value_loss": 999.0, 
                 "entropy_loss": 0.0,
+                "auxiliary_loss": 0.0,
                 "episode_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0.0,
                 "total_loss": 999.0,
                 "approx_kl": 0.0,
             }
         
+        # Compute mean auxiliary losses
+        mean_aux_loss = np.mean(auxiliary_losses) if auxiliary_losses else 0.0
+        
         metrics = {
             "policy_loss": np.mean(policy_losses),
             "value_loss": np.mean(value_losses),
             "entropy_loss": np.mean(entropy_losses),
+            "auxiliary_loss": mean_aux_loss,
             "episode_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0.0,
-            "total_loss": np.mean(policy_losses) + ppo_config.value_loss_coeff * np.mean(value_losses),
+            "total_loss": np.mean(policy_losses) + ppo_config.value_loss_coeff * np.mean(value_losses) + mean_aux_loss,
             "approx_kl": np.mean(approx_kl_divs) if approx_kl_divs else 0.0,
             "n_episodes": len(self.episode_rewards),
             "section_decisions_per_ep": np.mean(self.buffer.section_decisions) if self.buffer.section_decisions else 0.0,
         }
+        
+        # Add auxiliary loss breakdown
+        for k, v_list in aux_loss_breakdown.items():
+            if v_list:
+                metrics[f"aux_{k}"] = np.mean(v_list)
         
         # Log metrics
         if self.training_logger:
@@ -716,6 +927,12 @@ class ParallelPPOTrainerV2:
             )
             self.training_logger.log_scalar("approx_kl", metrics["approx_kl"], self.global_step)
             self.training_logger.log_scalar("section_decisions_per_ep", metrics["section_decisions_per_ep"], self.global_step)
+            self.training_logger.log_scalar("auxiliary_loss", mean_aux_loss, self.global_step)
+            
+            # Log individual auxiliary losses
+            for k, v_list in aux_loss_breakdown.items():
+                if v_list and k != "warmup_factor":
+                    self.training_logger.log_scalar(f"aux/{k}", np.mean(v_list), self.global_step)
         
         return metrics
     
@@ -735,6 +952,10 @@ class ParallelPPOTrainerV2:
             "scaler": self.scaler.state_dict(),
             "config": self.config,
             "n_actions": ActionSpaceV2.N_ACTIONS,
+            # Running statistics for stable return normalization
+            "return_mean": self.return_mean,
+            "return_var": self.return_var,
+            "return_count": self.return_count,
         }
         torch.save(checkpoint, path)
         logger.info(f"Saved V2 checkpoint to {path}")
@@ -762,7 +983,20 @@ class ParallelPPOTrainerV2:
             self.policy_scheduler.load_state_dict(checkpoint["policy_scheduler"])
         if self.value_scheduler and checkpoint.get("value_scheduler"):
             self.value_scheduler.load_state_dict(checkpoint["value_scheduler"])
-        self.scaler.load_state_dict(checkpoint["scaler"])
+        
+        # Load scaler state if available and non-empty
+        if checkpoint.get("scaler") and len(checkpoint["scaler"]) > 0:
+            try:
+                self.scaler.load_state_dict(checkpoint["scaler"])
+            except RuntimeError as e:
+                logger.warning(f"Could not load scaler state: {e} - using fresh scaler")
+        
+        # Load running statistics for return normalization
+        if "return_mean" in checkpoint:
+            self.return_mean = checkpoint["return_mean"]
+            self.return_var = checkpoint["return_var"]
+            self.return_count = checkpoint["return_count"]
+            logger.info(f"Loaded return normalization stats: mean={self.return_mean:.2f}, std={np.sqrt(self.return_var):.2f}, count={self.return_count}")
         
         logger.info(f"Loaded checkpoint from {path} (epoch {self.current_epoch}, best_reward={self.best_reward:.2f})")
 
@@ -776,6 +1010,7 @@ def train_v2(
     checkpoint_path: Optional[str] = None,
     v1_checkpoint_path: Optional[str] = None,
     target_loss: float = 0.01,
+    use_subprocess: bool = False,
 ):
     """Main V2 training function with parallel environments.
     
@@ -788,6 +1023,7 @@ def train_v2(
         checkpoint_path: Optional V2 checkpoint to resume from
         v1_checkpoint_path: Optional V1 checkpoint for transfer learning
         target_loss: Stop training when loss reaches this value
+        use_subprocess: Use subprocess-based parallelism (true multiprocessing)
     """
     logger.info("=" * 60)
     logger.info("Starting V2 Training (Section Actions + Episode Rewards)")
@@ -795,6 +1031,11 @@ def train_v2(
     logger.info(f"Parallel environments: {n_envs}")
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Target loss: {target_loss}")
+    if use_subprocess:
+        logger.info(f"Parallelism: subprocess (true multiprocessing, ~4x faster rollouts)")
+        logger.info(f"Auxiliary tasks: computed in subprocess workers (no IPC overhead)")
+    else:
+        logger.info(f"Parallelism: threading (GIL-bound, auxiliary tasks computed in main process)")
     
     # V2 reward scaling: minimize step rewards, maximize episode rewards
     config.reward.step_reward_scale = 0.001  # Very small step rewards
@@ -830,7 +1071,8 @@ def train_v2(
         config, 
         n_envs=n_envs, 
         total_epochs=n_epochs, 
-        learned_reward_model=learned_reward_model
+        learned_reward_model=learned_reward_model,
+        use_subprocess=use_subprocess,
     )
     
     # Handle checkpoint loading
@@ -888,7 +1130,9 @@ def train_v2(
             audio_states.append(audio_state)
         
         # Collect rollouts in parallel
+        rollout_start = time.time()
         rollout_data = trainer.collect_rollouts_parallel(audio_states, steps_per_epoch // n_envs)
+        rollout_time = time.time() - rollout_start
         
         # Load V1 weights after first rollout (agent now initialized)
         if epoch == start_epoch and v1_checkpoint_path and trainer.agent is not None:
@@ -896,7 +1140,9 @@ def train_v2(
                 logger.info("✓ V1 weights loaded for transfer learning - encoder pretrained, policy head fresh")
         
         # Update networks
+        update_start = time.time()
         metrics = trainer.update(rollout_data)
+        update_time = time.time() - update_start
         
         # Step learning rate schedulers
         trainer.step_schedulers()
@@ -907,20 +1153,20 @@ def train_v2(
         # Log progress
         n_eps = metrics.get('n_episodes', 0)
         section_dec = metrics.get('section_decisions_per_ep', 0)
+        aux_loss = metrics.get('auxiliary_loss', 0.0)
         logger.info(
             f"Epoch {epoch + 1}/{n_epochs} | "
-            f"Loss: {metrics['total_loss']:.4f} (P: {metrics['policy_loss']:.4f}, V: {metrics['value_loss']:.4f}) | "
+            f"Loss: {metrics['total_loss']:.4f} (P: {metrics['policy_loss']:.4f}, V: {metrics['value_loss']:.4f}, Aux: {aux_loss:.4f}) | "
             f"Reward: {metrics['episode_reward']:.2f} (eps: {n_eps}) | "
             f"SectionDec: {section_dec:.1f} | "
             f"LR: {current_lr:.2e} | "
             f"Steps: {trainer.global_step:,} | "
-            f"Time: {epoch_time:.1f}s"
+            f"Time: {epoch_time:.1f}s (R:{rollout_time:.1f}s U:{update_time:.1f}s)"
         )
         
-        # Check for target loss
-        if metrics['total_loss'] < target_loss:
-            logger.info(f"🎉 Reached target loss {target_loss}! Stopping training.")
-            break
+        # NOTE: No early stopping on loss - we want full training for RL
+        # The policy loss converging doesn't mean the agent is good at editing!
+        # What matters is the episode reward (audio quality metrics)
         
         # Save checkpoint periodically
         if (epoch + 1) % 10 == 0:
@@ -958,6 +1204,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
     parser.add_argument("--no_lr_decay", action="store_true", help="Disable learning rate decay")
     parser.add_argument("--save_dir", type=str, default="models_v2", help="Directory to save checkpoints")
+    parser.add_argument("--subprocess", action="store_true", help="Use subprocess-based parallelism (true multiprocessing)")
     
     args = parser.parse_args()
     
@@ -987,6 +1234,10 @@ if __name__ == "__main__":
         config.reward.use_learned_rewards = True
         logger.info("Learned rewards ENABLED (RLHF mode)")
     
+    # Log subprocess mode
+    if args.subprocess:
+        logger.info("Subprocess parallelism ENABLED (true multiprocessing)")
+    
     train_v2(
         config=config,
         data_dir=args.data_dir,
@@ -996,4 +1247,5 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint,
         v1_checkpoint_path=args.v1_checkpoint,
         target_loss=args.target_loss,
+        use_subprocess=args.subprocess,
     )

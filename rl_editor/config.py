@@ -116,10 +116,10 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 3e-5  # Lower LR for stability (was 1e-4)
+    learning_rate: float = 2e-5  # Reduced for stability (was 3e-5)
     lr_decay: bool = True  # Enable learning rate decay
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
-    lr_min_ratio: float = 0.1  # Minimum LR as ratio of initial
+    lr_min_ratio: float = 0.5  # Decay from 2e-5 to 1e-5
     lr_warmup_epochs: int = 10  # Warmup epochs before decay starts
     lr_decay_epochs: int = 500  # Total epochs for decay (for step/exponential)
     lr_step_factor: float = 0.5  # Factor for step decay
@@ -128,18 +128,18 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.1  # Tighter clipping for stability (was 0.2)
     target_kl: float = 0.02  # Target KL divergence for early stopping (increased from 0.01)
-    entropy_coeff: float = 0.15  # Higher entropy to prevent premature convergence
+    entropy_coeff: float = 0.25  # Increased for more exploration (was 0.15)
     entropy_coeff_decay: bool = True  # Decay entropy over training
     entropy_coeff_min: float = 0.05  # Minimum entropy coefficient (increased)
-    value_loss_coeff: float = 0.5
+    value_loss_coeff: float = 0.125  # Reduced 75% to balance with policy/aux loss
     max_grad_norm: float = 0.5  # Standard grad clipping
     n_epochs: int = 3  # PPO epochs per update
-    batch_size: int = 128  # Batch size
+    batch_size: int = 512  # Larger batch for better GPU utilization (was 128)
     n_steps: int = 2048
-    n_workers: int = 4
+    n_workers: int = 8  # More workers for parallel data loading (was 4)
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 4
-    use_mixed_precision: bool = False  # Disabled - causes NaN issues
+    gradient_accumulation_steps: int = 2  # Reduced since batch is larger
+    use_mixed_precision: bool = False  # Disabled - value losses ~2000+ cause FP16 overflow
 
 
 @dataclass

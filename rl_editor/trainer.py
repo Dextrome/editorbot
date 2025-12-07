@@ -232,9 +232,14 @@ class PPOTrainer:
 
         states = torch.from_numpy(rollout_data["states"]).float().to(self.device)
         actions = torch.from_numpy(rollout_data["actions"]).long().to(self.device)
-        returns = torch.from_numpy(rollout_data["returns"]).float().to(self.device)
+        raw_returns = torch.from_numpy(rollout_data["returns"]).float().to(self.device)
         advantages = torch.from_numpy(rollout_data["advantages"]).float().to(self.device)
         old_log_probs = torch.from_numpy(rollout_data["log_probs"]).float().to(self.device)
+        
+        # Normalize returns for value function training (reduces value loss magnitude)
+        returns_mean = raw_returns.mean()
+        returns_std = raw_returns.std() + 1e-8
+        returns = (raw_returns - returns_mean) / returns_std
 
         ppo_config = self.config.ppo
         batch_size = ppo_config.batch_size

@@ -5,7 +5,7 @@ This provides efficient local context (O(n*k) instead of O(n²)) while
 maintaining global awareness through pooled summary features.
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -469,21 +469,48 @@ class ValueNetwork(nn.Module):
 
 
 class Agent:
-    """RL agent combining policy and value networks."""
+    """RL agent combining policy and value networks with auxiliary tasks."""
 
-    def __init__(self, config: Config, input_dim: int, n_actions: int) -> None:
+    def __init__(
+        self, 
+        config: Config, 
+        input_dim: int, 
+        n_actions: int,
+        beat_feature_dim: int = 121,
+        use_auxiliary_tasks: bool = True,
+    ) -> None:
         """Initialize agent.
 
         Args:
             config: Configuration object
             input_dim: Input state dimension
             n_actions: Number of actions
+            beat_feature_dim: Dimension of beat features (for reconstruction task)
+            use_auxiliary_tasks: Whether to use auxiliary task heads
         """
         self.config = config
         self.device = torch.device(config.training.device)
+        self.use_auxiliary_tasks = use_auxiliary_tasks
 
         self.policy_net = PolicyNetwork(config, input_dim, n_actions).to(self.device)
         self.value_net = ValueNetwork(config, input_dim).to(self.device)
+        
+        # Auxiliary task module (shares encoder with policy)
+        self.auxiliary_module = None
+        if use_auxiliary_tasks:
+            try:
+                from .auxiliary_tasks import AuxiliaryTaskModule, AuxiliaryConfig
+                aux_config = AuxiliaryConfig()
+                hidden_dim = config.model.policy_hidden_dim
+                self.auxiliary_module = AuxiliaryTaskModule(
+                    hidden_dim=hidden_dim,
+                    beat_feature_dim=beat_feature_dim,
+                    config=aux_config,
+                ).to(self.device)
+                logger.info(f"Initialized auxiliary task module with hidden_dim={hidden_dim}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize auxiliary tasks: {e}")
+                self.auxiliary_module = None
 
         logger.info(
             f"Initialized agent with {input_dim} input dims, {n_actions} actions on device {self.device}"
@@ -606,6 +633,66 @@ class Agent:
         entropy = torch.clamp(entropy, min=min_entropy)
         
         return log_probs, entropy
+    
+    def get_encoder_output(self, states: torch.Tensor) -> torch.Tensor:
+        """Get encoded representation from policy encoder.
+        
+        Args:
+            states: Batch of states (B, state_dim)
+            
+        Returns:
+            Encoded features (B, hidden_dim)
+        """
+        return self.policy_net.encoder(states)
+    
+    def get_auxiliary_predictions(
+        self, 
+        states: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Get predictions from auxiliary task heads.
+        
+        Args:
+            states: Batch of states (B, state_dim)
+            
+        Returns:
+            Dict of task name -> predictions
+        """
+        if self.auxiliary_module is None:
+            return {}
+        
+        # Get encoded representation from shared encoder
+        encoded = self.get_encoder_output(states)
+        
+        # Get auxiliary predictions
+        return self.auxiliary_module(encoded)
+    
+    def compute_auxiliary_loss(
+        self,
+        states: torch.Tensor,
+        targets: Dict[str, torch.Tensor],
+        epoch: int = 0,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute auxiliary task losses.
+        
+        Args:
+            states: Batch of states (B, state_dim)
+            targets: Dict of task name -> target tensors
+            epoch: Current epoch for curriculum learning
+            
+        Returns:
+            Tuple of (total_auxiliary_loss, loss_breakdown)
+        """
+        if self.auxiliary_module is None:
+            return torch.tensor(0.0, device=self.device), {}
+        
+        predictions = self.get_auxiliary_predictions(states)
+        return self.auxiliary_module.compute_losses(predictions, targets, epoch)
+    
+    def get_auxiliary_parameters(self):
+        """Get auxiliary module parameters for optimization."""
+        if self.auxiliary_module is None:
+            return []
+        return self.auxiliary_module.parameters()
 
     def get_policy_parameters(self):
         """Get policy network parameters for optimization."""
@@ -629,6 +716,8 @@ class Agent:
             "policy_net": self.policy_net.state_dict(),
             "value_net": self.value_net.state_dict(),
         }
+        if self.auxiliary_module is not None:
+            checkpoint["auxiliary_module"] = self.auxiliary_module.state_dict()
         torch.save(checkpoint, path)
         logger.info(f"Saved agent checkpoint to {path}")
 
@@ -641,14 +730,20 @@ class Agent:
         checkpoint = torch.load(path, map_location=self.device)
         self.policy_net.load_state_dict(checkpoint["policy_net"])
         self.value_net.load_state_dict(checkpoint["value_net"])
+        if self.auxiliary_module is not None and "auxiliary_module" in checkpoint:
+            self.auxiliary_module.load_state_dict(checkpoint["auxiliary_module"])
         logger.info(f"Loaded agent checkpoint from {path}")
 
     def train(self) -> None:
         """Set networks to train mode."""
         self.policy_net.train()
         self.value_net.train()
+        if self.auxiliary_module is not None:
+            self.auxiliary_module.train()
 
     def eval(self) -> None:
         """Set networks to eval mode."""
         self.policy_net.eval()
         self.value_net.eval()
+        if self.auxiliary_module is not None:
+            self.auxiliary_module.eval()

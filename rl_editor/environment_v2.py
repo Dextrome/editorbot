@@ -132,6 +132,14 @@ class AudioEditingEnvV2(gym.Env):
         
         return obs, info
     
+    def set_audio_state(self, audio_state: AudioState) -> None:
+        """Set audio state for the environment.
+        
+        This allows reusing the environment instance with different audio.
+        Call reset() after setting the audio state.
+        """
+        self.audio_state = audio_state
+    
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """Execute one step.
         
@@ -191,6 +199,8 @@ class AudioEditingEnvV2(gym.Env):
             "n_beat_decisions": self.n_beat_decisions,
             "episode_reward": episode_reward if (terminated or truncated) else 0.0,
             "action_mask": self.action_space_v2.get_action_mask(self.current_beat, self.edit_history).tolist(),
+            # Note: beat_times/beat_features not included by default (too large for IPC)
+            # Access directly via env.audio_state for threading mode
         }
         
         if terminated or truncated:
