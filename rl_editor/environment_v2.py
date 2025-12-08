@@ -365,32 +365,85 @@ class AudioEditingEnvV2(gym.Env):
         else:
             penalties["excess_loops"] = 0.0
         
-        # Penalty 4: OUTPUT DURATION - Target 35% of input (for 10-30min → 3-9min edits)
+        # Penalty 5: EXCESSIVE JUMPS - Jump actions should be rare, not main strategy
+        # Count only jump-back actions specifically
+        jump_actions = {ActionTypeV2.JUMP_BACK_4, ActionTypeV2.JUMP_BACK_8}
+        n_jumps = sum(1 for a in self.episode_actions if a.action_type in jump_actions)
+        n_actions = len(self.episode_actions)
+        jump_ratio = n_jumps / n_actions if n_actions > 0 else 0.0
+        
+        # Jumps should be < 10% of actions, heavily penalize if > 20%
+        if jump_ratio > 0.20:
+            # Spam territory - heavy penalty
+            excess_jump_ratio = jump_ratio - 0.20  # 0 to 0.80
+            penalties["excess_jumps"] = -(excess_jump_ratio / 0.30) ** 2 * 35.0  # up to -35
+        elif jump_ratio > 0.10:
+            # Moderate overuse
+            excess_jump_ratio = jump_ratio - 0.10  # 0 to 0.10
+            penalties["excess_jumps"] = -(excess_jump_ratio / 0.10) * 10.0  # up to -10
+        else:
+            penalties["excess_jumps"] = 0.0
+        
+        # Penalty 6: LOW ACTION DIVERSITY - Must use more than 3 action types
+        from collections import Counter
+        action_types_used = Counter(a.action_type for a in self.episode_actions if hasattr(a, 'action_type'))
+        n_unique_actions = len(action_types_used)
+        
+        # Must use at least 4 different action types, strongly prefer 6+
+        if n_unique_actions <= 2:
+            penalties["low_diversity"] = -25.0  # Only 1-2 action types = bad
+        elif n_unique_actions == 3:
+            penalties["low_diversity"] = -15.0  # 3 types = still exploitative
+        elif n_unique_actions == 4:
+            penalties["low_diversity"] = -5.0   # 4 types = barely acceptable
+        else:
+            penalties["low_diversity"] = 0.0    # 5+ types = good
+        
+        # Penalty 7: NO KEEP ACTIONS - Must actively decide to keep content, not just cut/jump
+        keep_actions = {ActionTypeV2.KEEP_BEAT, ActionTypeV2.KEEP_BAR, ActionTypeV2.KEEP_PHRASE}
+        n_keep_actions = sum(1 for a in self.episode_actions if a.action_type in keep_actions)
+        keep_action_ratio = n_keep_actions / n_actions if n_actions > 0 else 0.0
+        
+        # Should have at least 20% keep actions (explicit decisions to keep good content)
+        if keep_action_ratio < 0.05:
+            penalties["no_keep_actions"] = -20.0  # Almost no keeps = bad
+        elif keep_action_ratio < 0.15:
+            penalties["no_keep_actions"] = -10.0  # Too few keeps
+        elif keep_action_ratio < 0.25:
+            penalties["no_keep_actions"] = -5.0   # Barely enough keeps
+        else:
+            penalties["no_keep_actions"] = 0.0    # Good balance
+        
+        # Penalty 4: OUTPUT DURATION - Curriculum approach
+        # Start with gentle 60% target, model can learn to cut more over time
         total_looped_beats = sum(self.edit_history.looped_beats.values()) if self.edit_history.looped_beats else 0
         estimated_output_beats = n_kept + total_looped_beats
         duration_ratio = estimated_output_beats / n_beats if n_beats > 0 else 1.0
         self.episode_reward_breakdown["duration_ratio"] = duration_ratio
         
-        # Target: 35% duration, penalty starts at 50%
-        # Strong penalty for anything over 50% - we want SHORT edits
-        target_duration = 0.35
-        if duration_ratio > 0.50:
-            # Quadratic penalty: -60 points at 100%, -0 at 50%
-            excess_duration = duration_ratio - 0.50  # 0 to 0.50
-            penalties["excess_duration"] = -(excess_duration / 0.50) ** 2 * 60.0
+        # Target: 60% duration (gentler than 35%, avoids reward shock)
+        # Penalty scales smoothly - no harsh cliffs
+        target_duration = 0.60
+        
+        if duration_ratio > 0.90:
+            # Heavy penalty for keeping 90%+ (almost no editing)
+            excess = duration_ratio - 0.90  # 0 to 0.10
+            penalties["excess_duration"] = -(excess / 0.10) ** 2 * 40.0  # up to -40
         elif duration_ratio > target_duration:
-            # Light penalty between 35-50%
-            excess_duration = duration_ratio - target_duration  # 0 to 0.15
-            penalties["excess_duration"] = -(excess_duration / 0.15) * 10.0
+            # Moderate penalty: 60-90% (should cut more)
+            excess = duration_ratio - target_duration  # 0 to 0.30
+            penalties["excess_duration"] = -(excess / 0.30) ** 1.5 * 20.0  # up to -20
+        elif duration_ratio > 0.40:
+            # Sweet spot: 40-60% - small bonus
+            closeness = 1.0 - abs(duration_ratio - 0.50) / 0.10
+            penalties["excess_duration"] = max(0, closeness * 10.0)  # up to +10
+        elif duration_ratio > 0.25:
+            # Acceptable: 25-40% - neutral to small penalty
+            penalties["excess_duration"] = 0.0
         else:
-            # Bonus for hitting target (up to +15 at exactly 35%, less if too short)
-            if duration_ratio >= 0.20:
-                # Sweet spot: 20-35% gets bonus
-                closeness = 1.0 - abs(duration_ratio - target_duration) / 0.15
-                penalties["excess_duration"] = closeness * 15.0
-            else:
-                # Too short (<20%) - small penalty
-                penalties["excess_duration"] = -((0.20 - duration_ratio) / 0.20) * 20.0
+            # Too aggressive: <25% - penalty for cutting too much
+            shortage = 0.25 - duration_ratio  # 0 to 0.25
+            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 25.0  # up to -25
         
         # Target: 25-45% keep ratio (centered on 35%)
         target_ratio = self.config.reward.target_keep_ratio  # 0.35
