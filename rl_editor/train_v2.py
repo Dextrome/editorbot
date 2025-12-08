@@ -292,17 +292,6 @@ class ParallelPPOTrainerV2:
         self.episode_rewards = []
         self.episode_lengths = []
         
-        # Running statistics for return normalization (stable across different n_envs)
-        self.return_mean = 0.0
-        self.return_var = 1.0
-        self.return_count = 0
-        
-        # Value learning rate scaling based on n_envs
-        # More envs = more variance in returns = need lower LR for stability
-        # Scale: 1/sqrt(n_envs/8) where 8 is the baseline
-        self.value_lr_scale = 1.0 / math.sqrt(n_envs / 8.0)
-        logger.info(f"Value LR scale for {n_envs} envs: {self.value_lr_scale:.3f}x")
-        
         # Target KL for early stopping
         self.target_kl = getattr(config.ppo, 'target_kl', 0.01)
         
@@ -341,14 +330,12 @@ class ParallelPPOTrainerV2:
             lr=policy_lr
         )
         
-        # Value optimizer with scaled learning rate for stability with many envs
-        # More envs = higher return variance = need lower LR to avoid oscillation
-        value_lr = policy_lr * self.value_lr_scale
+        # Value optimizer (same LR as policy)
         self.value_optimizer = optim.Adam(
             self.agent.value_net.parameters(),
-            lr=value_lr
+            lr=policy_lr
         )
-        logger.info(f"Policy LR: {policy_lr:.2e}, Value LR: {value_lr:.2e} ({self.value_lr_scale:.3f}x)")
+        logger.info(f"Policy/Value LR: {policy_lr:.2e}")
         
         # Auxiliary task optimizer (separate to allow different learning rates)
         self.auxiliary_optimizer = None
@@ -689,36 +676,13 @@ class ParallelPPOTrainerV2:
         """Update policy and value networks using PPO with auxiliary tasks."""
         states = torch.from_numpy(rollout_data["states"]).float().to(self.device)
         actions = torch.from_numpy(rollout_data["actions"]).long().to(self.device)
-        raw_returns = torch.from_numpy(rollout_data["returns"]).float().to(self.device)
+        returns = torch.from_numpy(rollout_data["returns"]).float().to(self.device)
         advantages = torch.from_numpy(rollout_data["advantages"]).float().to(self.device)
         old_log_probs = torch.from_numpy(rollout_data["log_probs"]).float().to(self.device)
         
-        # Update running statistics for return normalization (Welford's online algorithm)
-        # This makes normalization stable regardless of n_envs
-        batch_mean = raw_returns.mean().item()
-        batch_var = raw_returns.var().item()
-        batch_count = len(raw_returns)
-        
-        delta = batch_mean - self.return_mean
-        total_count = self.return_count + batch_count
-        
-        # Update mean
-        new_mean = self.return_mean + delta * batch_count / max(total_count, 1)
-        
-        # Update variance (parallel algorithm)
-        m_a = self.return_var * self.return_count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + delta**2 * self.return_count * batch_count / max(total_count, 1)
-        new_var = M2 / max(total_count, 1)
-        
-        self.return_mean = new_mean
-        self.return_var = max(new_var, 1e-8)  # Prevent zero variance
-        self.return_count = total_count
-        
-        # Normalize returns using RUNNING statistics (not batch statistics)
-        # This provides stability across different n_envs configurations
-        returns_std = np.sqrt(self.return_var) + 1e-8
-        returns = (raw_returns - self.return_mean) / returns_std
+        # Value targets: use raw returns directly
+        # The value network learns to predict the actual expected return scale
+        # No normalization needed - just let it learn the natural scale (~50-70)
         
         # Get auxiliary targets from buffer
         aux_targets_np = self.buffer.get_auxiliary_targets_batch()
@@ -952,10 +916,6 @@ class ParallelPPOTrainerV2:
             "scaler": self.scaler.state_dict(),
             "config": self.config,
             "n_actions": ActionSpaceV2.N_ACTIONS,
-            # Running statistics for stable return normalization
-            "return_mean": self.return_mean,
-            "return_var": self.return_var,
-            "return_count": self.return_count,
         }
         torch.save(checkpoint, path)
         logger.info(f"Saved V2 checkpoint to {path}")
@@ -979,6 +939,7 @@ class ParallelPPOTrainerV2:
         if self.policy_optimizer and checkpoint["policy_optimizer"]:
             self.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
             self.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
+            
         if self.policy_scheduler and checkpoint.get("policy_scheduler"):
             self.policy_scheduler.load_state_dict(checkpoint["policy_scheduler"])
         if self.value_scheduler and checkpoint.get("value_scheduler"):
@@ -990,13 +951,6 @@ class ParallelPPOTrainerV2:
                 self.scaler.load_state_dict(checkpoint["scaler"])
             except RuntimeError as e:
                 logger.warning(f"Could not load scaler state: {e} - using fresh scaler")
-        
-        # Load running statistics for return normalization
-        if "return_mean" in checkpoint:
-            self.return_mean = checkpoint["return_mean"]
-            self.return_var = checkpoint["return_var"]
-            self.return_count = checkpoint["return_count"]
-            logger.info(f"Loaded return normalization stats: mean={self.return_mean:.2f}, std={np.sqrt(self.return_var):.2f}, count={self.return_count}")
         
         logger.info(f"Loaded checkpoint from {path} (epoch {self.current_epoch}, best_reward={self.best_reward:.2f})")
 
@@ -1185,7 +1139,8 @@ def train_v2(
     
     total_time = time.time() - start_time
     logger.info(f"V2 Training complete in {total_time/60:.1f} minutes")
-    logger.info(f"Final loss: {metrics['total_loss']:.4f}")
+    if 'metrics' in dir():
+        logger.info(f"Final loss: {metrics['total_loss']:.4f}")
     logger.info(f"Best reward: {trainer.best_reward:.2f}")
 
 

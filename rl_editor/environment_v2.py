@@ -266,12 +266,17 @@ class AudioEditingEnvV2(gym.Env):
             return 1
         
         elif action_type == ActionTypeV2.MARK_SOFT_TRANSITION:
+            # Transition markers now IMPLICITLY keep the beat and advance
+            # This prevents spam: can't just mark transitions without processing beats
+            self.edit_history.add_keep(beat_idx)  # Keep the beat
             self.edit_history.set_transition_marker(beat_idx, 'soft')
-            return 0  # No beat advance
+            return 1  # ADVANCE by 1 beat (no stalling!)
         
         elif action_type == ActionTypeV2.MARK_HARD_CUT:
+            # Hard cut marker also keeps beat and advances
+            self.edit_history.add_keep(beat_idx)
             self.edit_history.set_transition_marker(beat_idx, 'hard')
-            return 0
+            return 1  # ADVANCE by 1 beat
         
         return 1  # Default advance
     
@@ -288,17 +293,17 @@ class AudioEditingEnvV2(gym.Env):
     def _compute_episode_reward(self) -> float:
         """Compute episode reward based ONLY on audio quality.
         
-        PURE AUDIO QUALITY - NO GROUND TRUTH LABELS.
+        BALANCED REWARD DESIGN - Anti-Exploitation V2C (Soft Penalties)
         
-        The model must learn what SOUNDS good, not what MATCHES human edits.
-        Components:
-        1. Audio quality (clicks, smoothness)
-        2. Energy consistency (no jarring jumps)
-        3. Duration target (right length)
-        4. Section coherence (kept beats are related)
-        5. Phrase alignment (cuts at musical boundaries)
+        Key insight: Previous rewards allowed exploitation because:
+        1. Model learned to loop instead of cut (looping = safe, cutting = risky)
+        2. Keep ratio constraint wasn't strict enough (80% still allowed)
+        3. No penalty for making output LONGER than input
         
-        NO: Ground truth F1, label matching
+        New design: SOFT PENALTIES with HARD FLOORS
+        - Soft penalties give gradient signal toward valid region
+        - Hard floors only for truly degenerate policies (< 5% cut)
+        - Penalties scale with how far from target
         """
         self.episode_reward_breakdown = {}
         
@@ -307,82 +312,146 @@ class AudioEditingEnvV2(gym.Env):
         n_cut = len(self.edit_history.cut_beats)
         n_edited = n_kept + n_cut
         
-        # Catastrophic failure checks
+        # Count loop actions
+        loop_action_types = {
+            ActionTypeV2.LOOP_2X, ActionTypeV2.LOOP_4X, ActionTypeV2.LOOP_BAR_2X,
+            ActionTypeV2.JUMP_BACK_4, ActionTypeV2.JUMP_BACK_8
+        }
+        n_loops = sum(1 for a in self.episode_actions if a.action_type in loop_action_types)
+        
+        # === HARD FLOOR (only for truly broken policies) ===
         if n_edited == 0:
             self.episode_reward_breakdown["failure"] = "no_edits"
             return -100.0
         
         keep_ratio = n_kept / n_edited if n_edited > 0 else 0.0
-        
-        if keep_ratio < 0.05:  # Kept almost nothing
-            self.episode_reward_breakdown["failure"] = "too_little_kept"
-            return -50.0
-        
-        if keep_ratio > 0.95:  # Kept almost everything
-            self.episode_reward_breakdown["failure"] = "too_much_kept"
-            return -50.0
-        
-        # === AUDIO QUALITY METRICS ===
-        total_score = 0.0
-        total_weight = 0.0
-        
-        # 1. Build and analyze actual edited audio (MOST IMPORTANT)
-        audio_quality = self._compute_audio_quality_score()
-        weight_audio = 3.0  # Highest weight - actual audio quality
-        total_score += weight_audio * audio_quality
-        total_weight += weight_audio
-        self.episode_reward_breakdown["audio_quality"] = audio_quality
-        
-        # 2. Duration target (hit ~35% keep ratio)
-        target = self.config.reward.target_keep_ratio
-        deviation = abs(keep_ratio - target)
-        duration_score = max(0.0, 1.0 - deviation * 2.0)  # Linear penalty
-        weight_duration = 1.5
-        total_score += weight_duration * duration_score
-        total_weight += weight_duration
-        self.episode_reward_breakdown["duration_score"] = duration_score
+        cut_ratio = n_cut / n_edited if n_edited > 0 else 0.0
         self.episode_reward_breakdown["keep_ratio"] = keep_ratio
+        self.episode_reward_breakdown["cut_ratio"] = cut_ratio
+        self.episode_reward_breakdown["n_loops"] = n_loops
         
-        # 3. Energy consistency in edited audio
+        # Hard floor: Must have SOME cuts and keeps (prevents degenerate all-one-action)
+        if n_kept < 3 or n_cut < 3:
+            self.episode_reward_breakdown["failure"] = "degenerate_policy"
+            return -50.0
+        
+        # === SOFT PENALTIES (scale with violation severity) ===
+        penalties = {}
+        
+        # Penalty 1: CUT DEFICIT - Must cut at least 30% target
+        # Scales from 0 (at 30%+ cuts) to -40 (at 0% cuts)
+        target_cut_ratio = 0.30
+        if cut_ratio < target_cut_ratio:
+            cut_deficit = target_cut_ratio - cut_ratio  # 0 to 0.30
+            # Quadratic penalty: small violations = small penalty, large = big
+            penalties["cut_deficit"] = -(cut_deficit / target_cut_ratio) ** 2 * 40.0
+        else:
+            penalties["cut_deficit"] = 0.0
+        
+        # Penalty 2: EXCESSIVE CUTS - Don't cut more than 80%
+        if cut_ratio > 0.80:
+            excess_cuts = cut_ratio - 0.80  # 0 to 0.20
+            penalties["excess_cuts"] = -(excess_cuts / 0.20) ** 2 * 30.0
+        else:
+            penalties["excess_cuts"] = 0.0
+        
+        # Penalty 3: LOOP BUDGET - 1 loop allowed per 4 cuts
+        # Excess loops get penalized, not zeroed
+        max_loops = n_cut // 4
+        if n_loops > max_loops:
+            excess_loops = n_loops - max_loops
+            # -5 points per excess loop, capped at -30
+            penalties["excess_loops"] = -min(excess_loops * 5.0, 30.0)
+        else:
+            penalties["excess_loops"] = 0.0
+        
+        # Penalty 4: OUTPUT DURATION - Target 35% of input (for 10-30min → 3-9min edits)
+        total_looped_beats = sum(self.edit_history.looped_beats.values()) if self.edit_history.looped_beats else 0
+        estimated_output_beats = n_kept + total_looped_beats
+        duration_ratio = estimated_output_beats / n_beats if n_beats > 0 else 1.0
+        self.episode_reward_breakdown["duration_ratio"] = duration_ratio
+        
+        # Target: 35% duration, penalty starts at 50%
+        # Strong penalty for anything over 50% - we want SHORT edits
+        target_duration = 0.35
+        if duration_ratio > 0.50:
+            # Quadratic penalty: -60 points at 100%, -0 at 50%
+            excess_duration = duration_ratio - 0.50  # 0 to 0.50
+            penalties["excess_duration"] = -(excess_duration / 0.50) ** 2 * 60.0
+        elif duration_ratio > target_duration:
+            # Light penalty between 35-50%
+            excess_duration = duration_ratio - target_duration  # 0 to 0.15
+            penalties["excess_duration"] = -(excess_duration / 0.15) * 10.0
+        else:
+            # Bonus for hitting target (up to +15 at exactly 35%, less if too short)
+            if duration_ratio >= 0.20:
+                # Sweet spot: 20-35% gets bonus
+                closeness = 1.0 - abs(duration_ratio - target_duration) / 0.15
+                penalties["excess_duration"] = closeness * 15.0
+            else:
+                # Too short (<20%) - small penalty
+                penalties["excess_duration"] = -((0.20 - duration_ratio) / 0.20) * 20.0
+        
+        # Target: 25-45% keep ratio (centered on 35%)
+        target_ratio = self.config.reward.target_keep_ratio  # 0.35
+        
+        # === INDEPENDENT REWARD COMPONENTS ===
+        # Each component is scored 0-1 and contributes additively
+        # Total possible: 100 points, but practically ~60-80 is good
+        
+        components = {}
+        
+        # Component 1: Keep Ratio Score (25 points max)
+        # Gaussian centered on target, with reasonable width
+        ratio_deviation = abs(keep_ratio - target_ratio)
+        # Score: 1.0 at target, 0.5 at ±0.15, ~0 at ±0.30
+        ratio_score = np.exp(-(ratio_deviation ** 2) / (2 * 0.10 ** 2))
+        components["keep_ratio"] = ratio_score * 25.0
+        
+        # Component 2: Audio Quality (20 points max)
+        audio_quality = self._compute_audio_quality_score()
+        # Diminishing returns: sqrt to prevent exploitation
+        components["audio_quality"] = np.sqrt(audio_quality) * 20.0
+        
+        # Component 3: Energy Consistency (15 points max)
         energy_score = self._compute_edited_energy_consistency()
-        weight_energy = 2.0
-        total_score += weight_energy * energy_score
-        total_weight += weight_energy
-        self.episode_reward_breakdown["energy_consistency"] = energy_score
+        components["energy_consistency"] = np.sqrt(energy_score) * 15.0
         
-        # 4. Section coherence (reward keeping related beats together)
-        coherence_score = self._compute_section_coherence()
-        weight_coherence = 1.5
-        total_score += weight_coherence * coherence_score
-        total_weight += weight_coherence
-        self.episode_reward_breakdown["section_coherence"] = coherence_score
+        # Component 4: Cut Quality (15 points max)
+        # Reward for cutting LOW quality beats, keeping HIGH quality
+        cut_quality = self._compute_cut_quality()
+        components["cut_quality"] = np.sqrt(cut_quality) * 15.0
         
-        # 5. Phrase alignment (cuts at musical boundaries)
+        # Component 5: Edit Structure (10 points max)
+        # Reward for having multiple kept sections (not one big chunk or scattered)
+        structure_score = self._compute_edit_structure_score()
+        components["edit_structure"] = structure_score * 10.0
+        
+        # Component 6: Phrase Alignment (10 points max)
         phrase_score = self._compute_phrase_alignment()
-        weight_phrase = 1.0
-        total_score += weight_phrase * phrase_score
-        total_weight += weight_phrase
-        self.episode_reward_breakdown["phrase_alignment"] = phrase_score
+        components["phrase_alignment"] = phrase_score * 10.0
         
-        # 6. Flow continuity (smooth feature transitions)
-        flow_score = self._compute_flow_score()
-        weight_flow = 1.0
-        total_score += weight_flow * flow_score
-        total_weight += weight_flow
-        self.episode_reward_breakdown["flow_continuity"] = flow_score
+        # Component 7: Action Diversity Bonus (5 points max)
+        # Penalize using only one type of action (prevents section-only exploit)
+        diversity_score = self._compute_action_diversity()
+        components["action_diversity"] = diversity_score * 5.0
         
-        # Normalize and scale
-        normalized = total_score / total_weight if total_weight > 0 else 0.0
+        # === COMPUTE FINAL REWARD ===
+        base_reward = sum(components.values())
+        total_penalty = sum(penalties.values())
+        total_reward = base_reward + total_penalty
         
-        # Scale to meaningful range (0-100)
-        episode_reward = normalized * 100.0
+        # Store breakdown for logging
+        self.episode_reward_breakdown.update(components)
+        self.episode_reward_breakdown.update(penalties)
+        self.episode_reward_breakdown["base_reward"] = base_reward
+        self.episode_reward_breakdown["total_penalty"] = total_penalty
+        self.episode_reward_breakdown["total"] = total_reward
         
-        self.episode_reward_breakdown["total_normalized"] = normalized
-        self.episode_reward_breakdown["total_scaled"] = episode_reward
+        # Debug logging
+        logger.debug(f"Episode reward: {total_reward:.2f} | cut_ratio: {cut_ratio:.2%} | penalties: {penalties}")
         
-        logger.debug(f"Episode reward: {episode_reward:.2f} | breakdown: {self.episode_reward_breakdown}")
-        
-        return episode_reward
+        return total_reward
     
     def _compute_edited_energy_consistency(self) -> float:
         """Compute energy consistency of the edited audio output."""
@@ -428,18 +497,164 @@ class AudioEditingEnvV2(gym.Env):
         return 0.0
     
     def _compute_section_coherence(self) -> float:
-        """Reward for keeping consecutive beats together."""
+        """Reward for keeping COHERENT sections (similar features within kept regions).
+        
+        Instead of rewarding consecutive beats, we reward:
+        1. Low variance within kept sections (coherent)
+        2. High variance between kept sections (distinct sections)
+        3. Cutting at feature boundaries (not mid-section)
+        """
         kept = sorted(self.edit_history.kept_beats)
         if len(kept) < 2:
             return 0.5
         
-        n_consecutive = sum(1 for i in range(len(kept) - 1) if kept[i+1] == kept[i] + 1)
-        max_consecutive = len(kept) - 1
+        features = self.audio_state.beat_features
+        if features is None:
+            return 0.5
         
-        if max_consecutive == 0:
-            return 1.0
+        n_beats = len(features)
         
-        return 0.3 + 0.7 * (n_consecutive / max_consecutive)
+        # Find kept sections (groups of consecutive kept beats)
+        sections = []
+        current_section = [kept[0]]
+        
+        for i in range(1, len(kept)):
+            if kept[i] == kept[i-1] + 1:
+                current_section.append(kept[i])
+            else:
+                if len(current_section) >= 1:
+                    sections.append(current_section)
+                current_section = [kept[i]]
+        if current_section:
+            sections.append(current_section)
+        
+        if not sections:
+            return 0.5
+        
+        # 1. Within-section coherence: low feature variance within each section
+        within_variances = []
+        for section in sections:
+            if len(section) >= 2:
+                section_features = [features[b] for b in section if b < n_beats]
+                if len(section_features) >= 2:
+                    variance = np.var(section_features, axis=0).mean()
+                    within_variances.append(variance)
+        
+        # 2. Between-section distinctness: sections should be different from each other
+        section_means = []
+        for section in sections:
+            section_features = [features[b] for b in section if b < n_beats]
+            if section_features:
+                section_means.append(np.mean(section_features, axis=0))
+        
+        between_variance = 0.0
+        if len(section_means) >= 2:
+            between_variance = np.var(section_means, axis=0).mean()
+        
+        # Score: reward low within-section variance, high between-section variance
+        avg_within = np.mean(within_variances) if within_variances else 0.0
+        
+        # Normalize scores (these are relative metrics)
+        if avg_within > 0 and between_variance > 0:
+            # Ratio of between/within variance - higher is better
+            coherence_ratio = between_variance / (avg_within + 1e-6)
+            coherence_score = min(1.0, coherence_ratio / 2.0)  # Cap at 1.0
+        elif avg_within == 0:
+            coherence_score = 0.8  # Perfect within-section coherence
+        else:
+            coherence_score = 0.4  # No between-section variance
+        
+        # 3. Bonus for having multiple distinct sections (not just one big chunk)
+        n_sections = len(sections)
+        section_bonus = min(0.2, n_sections * 0.05)  # Up to 0.2 bonus for 4+ sections
+        
+        return min(1.0, coherence_score + section_bonus)
+    
+    def _compute_cut_quality(self) -> float:
+        """Reward for making GOOD cuts - cutting low-quality or repetitive sections.
+        
+        This explicitly rewards the act of cutting, not just penalizes not cutting.
+        Good cuts are:
+        1. Cuts at low-energy sections (silence, noise)
+        2. Cuts at repetitive sections (similar to other parts)
+        3. Cuts that improve overall variance (remove boring parts)
+        """
+        cut_beats = sorted(self.edit_history.cut_beats)
+        kept_beats = sorted(self.edit_history.kept_beats)
+        
+        if len(cut_beats) == 0:
+            return 0.0  # No cuts = no cut quality
+        
+        if len(kept_beats) == 0:
+            return 0.0  # Cut everything = bad
+        
+        features = self.audio_state.beat_features
+        if features is None:
+            return 0.5
+        
+        n_beats = len(features)
+        
+        # 1. Energy-based cut quality: did we cut low-energy beats?
+        # Use first few features as energy proxy (usually related to amplitude)
+        energy_scores = []
+        for beat in cut_beats:
+            if beat < n_beats:
+                # Lower energy = better to cut
+                energy = np.linalg.norm(features[beat][:10]) if len(features[beat]) >= 10 else np.linalg.norm(features[beat])
+                energy_scores.append(energy)
+        
+        kept_energies = []
+        for beat in kept_beats:
+            if beat < n_beats:
+                energy = np.linalg.norm(features[beat][:10]) if len(features[beat]) >= 10 else np.linalg.norm(features[beat])
+                kept_energies.append(energy)
+        
+        # Good cuts: cut beats have lower energy than kept beats on average
+        if energy_scores and kept_energies:
+            avg_cut_energy = np.mean(energy_scores)
+            avg_kept_energy = np.mean(kept_energies)
+            if avg_kept_energy > 0:
+                # If cut energy < kept energy, we're cutting the right stuff
+                energy_ratio = avg_cut_energy / (avg_kept_energy + 1e-6)
+                energy_cut_score = max(0.0, min(1.0, 1.5 - energy_ratio))  # Higher score if cutting low energy
+            else:
+                energy_cut_score = 0.5
+        else:
+            energy_cut_score = 0.5
+        
+        # 2. Repetition-based: did we cut repetitive sections?
+        # Check if cut beats are similar to other beats (repetitive = good to cut)
+        similarity_scores = []
+        for cut_beat in cut_beats[:20]:  # Sample for efficiency
+            if cut_beat < n_beats:
+                # Find similarity to other beats
+                cut_feat = features[cut_beat]
+                similarities = []
+                for other in range(0, n_beats, 4):  # Sample every 4th beat
+                    if other != cut_beat:
+                        sim = 1.0 / (1.0 + np.linalg.norm(cut_feat - features[other]))
+                        similarities.append(sim)
+                if similarities:
+                    similarity_scores.append(np.mean(similarities))
+        
+        # Higher similarity = more repetitive = better to cut
+        if similarity_scores:
+            avg_similarity = np.mean(similarity_scores)
+            repetition_cut_score = min(1.0, avg_similarity * 3.0)  # Scale up
+        else:
+            repetition_cut_score = 0.5
+        
+        # 3. Cut ratio bonus: reward for achieving target cut amount
+        total_beats = len(cut_beats) + len(kept_beats)
+        cut_ratio = len(cut_beats) / total_beats if total_beats > 0 else 0
+        target_cut = 1.0 - self.config.reward.target_keep_ratio  # ~0.65
+        
+        # Reward being close to target cut ratio
+        cut_deviation = abs(cut_ratio - target_cut)
+        cut_ratio_score = max(0.0, 1.0 - cut_deviation * 2.0)
+        
+        # Combine scores
+        return 0.4 * energy_cut_score + 0.3 * repetition_cut_score + 0.3 * cut_ratio_score
     
     def _compute_phrase_alignment(self) -> float:
         """Reward for cutting at phrase boundaries (every 4 or 8 beats)."""
@@ -467,7 +682,7 @@ class AudioEditingEnvV2(gym.Env):
             return 1.0
         
         return good_cuts / n_edit_points
-    
+
     def _compute_decision_quality(self) -> float:
         """Reward for using appropriate decision granularity.
         
@@ -530,6 +745,107 @@ class AudioEditingEnvV2(gym.Env):
             return max(0.0, min(1.0, 2.0 - ratio))  # Score 1.0 if ratio <= 1, decreasing above
         
         return 0.5
+    
+    def _compute_edit_structure_score(self) -> float:
+        """Reward for having good edit structure - multiple coherent sections.
+        
+        Bad: One big kept chunk + one big cut chunk (trivial)
+        Bad: Scattered single beats kept (noisy)
+        Good: 3-10 kept sections of 4+ beats each
+        """
+        kept = sorted(self.edit_history.kept_beats)
+        if len(kept) < 4:
+            return 0.1
+        
+        # Find contiguous kept sections
+        sections = []
+        current_section = [kept[0]]
+        
+        for i in range(1, len(kept)):
+            if kept[i] == kept[i-1] + 1:
+                current_section.append(kept[i])
+            else:
+                sections.append(current_section)
+                current_section = [kept[i]]
+        sections.append(current_section)
+        
+        n_sections = len(sections)
+        section_lengths = [len(s) for s in sections]
+        avg_length = np.mean(section_lengths)
+        
+        # Score based on number of sections (3-8 is ideal)
+        if n_sections == 1:
+            section_count_score = 0.2  # One big chunk = trivial
+        elif n_sections == 2:
+            section_count_score = 0.5
+        elif 3 <= n_sections <= 8:
+            section_count_score = 1.0  # Ideal range
+        elif n_sections <= 12:
+            section_count_score = 0.7
+        else:
+            section_count_score = 0.3  # Too fragmented
+        
+        # Score based on average section length (4-16 beats is ideal)
+        if avg_length < 2:
+            length_score = 0.2  # Too short = choppy
+        elif avg_length < 4:
+            length_score = 0.5
+        elif 4 <= avg_length <= 16:
+            length_score = 1.0  # Ideal phrase length
+        elif avg_length <= 32:
+            length_score = 0.7
+        else:
+            length_score = 0.4  # Too long sections
+        
+        return 0.5 * section_count_score + 0.5 * length_score
+    
+    def _compute_action_diversity(self) -> float:
+        """Reward for using diverse action types - prevent single-action exploits.
+        
+        If model only uses one type of action (e.g., always KEEP_SECTION),
+        it's likely exploiting rather than learning.
+        """
+        if not self.episode_actions:
+            return 0.5
+        
+        from collections import Counter
+        # Convert actions to integers for hashing
+        # ActionV2 is a dataclass with action_type attribute (an IntEnum)
+        action_ints = []
+        for a in self.episode_actions:
+            if hasattr(a, 'action_type'):
+                action_ints.append(int(a.action_type))
+            elif hasattr(a, 'value'):
+                action_ints.append(a.value)
+            elif isinstance(a, (int, float)):
+                action_ints.append(int(a))
+            else:
+                # Fallback - try to get any numeric attribute
+                action_ints.append(0)  # Default
+        
+        action_counts = Counter(action_ints)
+        
+        n_unique = len(action_counts)
+        n_total = len(action_ints)
+        
+        if n_total < 3:
+            return 0.5
+        
+        # Method 1: Count unique action types used
+        # At least 3 different actions should be used
+        uniqueness_score = min(1.0, (n_unique - 1) / 4.0)  # Score 1.0 at 5+ unique actions
+        
+        # Method 2: Entropy of action distribution
+        probs = np.array(list(action_counts.values())) / n_total
+        entropy = -np.sum(probs * np.log(probs + 1e-8))
+        max_entropy = np.log(13)  # 13 possible actions
+        entropy_score = entropy / max_entropy
+        
+        # Method 3: No single action dominates (>70%)
+        max_action_ratio = max(action_counts.values()) / n_total
+        dominance_score = 1.0 if max_action_ratio < 0.5 else (1.0 - max_action_ratio)
+        
+        return 0.3 * uniqueness_score + 0.4 * entropy_score + 0.3 * dominance_score
     
     def _compute_audio_quality_score(self) -> float:
         """Compute audio quality by building edited audio and analyzing."""
