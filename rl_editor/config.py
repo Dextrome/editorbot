@@ -68,7 +68,7 @@ class RewardConfig:
     target_max_duration_s: float = 600.0  # 10 minutes max output duration
     duration_penalty_weight: float = 0.1  # Penalty multiplier for exceeding target (reduced from 0.5)
     max_loop_ratio: float = 0.12  # Max fraction of beats that should be looped (12%, reduced from 15%)
-    loop_penalty_weight: float = 0.6  # Penalty for exceeding max loop ratio (increased from 0.5)
+    loop_penalty_weight: float = 0.5  # Penalty for exceeding max loop ratio
     loop_repetition_penalty: float = 0.2  # Penalty for looping beats near other looped beats
     loop_proximity_window: int = 8  # Beats within this window count as "nearby" loops
     tempo_consistency_weight: float = 1.0

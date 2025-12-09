@@ -8,18 +8,18 @@ Key changes from V1:
 Action Space Structure:
 - KEEP_BEAT: Keep single beat (fine control)
 - CUT_BEAT: Cut single beat (fine control)  
-- KEEP_PHRASE: Keep entire 4-beat or 8-beat phrase
-- CUT_PHRASE: Cut entire phrase
-- LOOP_SECTION(n_beats, n_times): Loop a section
-- JUMP_BACK(n_phrases): Jump back to repeat earlier content
-- EXTEND_SECTION: Mark current section for extension (dynamic looping)
-- TRANSITION_SOFT: Use soft crossfade at current edit point
-- TRANSITION_HARD: Use hard cut (beat-aligned)
+- KEEP_BAR/CUT_BAR: Keep/cut entire 4-beat bar
+- KEEP_PHRASE/CUT_PHRASE: Keep/cut entire 8-beat phrase
+- LOOP_BEAT/LOOP_BAR/LOOP_PHRASE: Loop beat, 4-beat bar, or 8-beat phrase 2x
+- JUMP_BACK_4/JUMP_BACK_8: Jump back to repeat earlier content
+- REORDER_BEAT/REORDER_BAR/REORDER_PHRASE: Move content to end of output (deferred placement)
+- MARK_SOFT_TRANSITION/MARK_HARD_CUT: Transition control markers
 
 This makes the policy problem harder because:
 1. Decisions affect multiple beats (longer horizon thinking needed)
 2. More action types to choose from
 3. Phrase-level structure must be learned
+4. Reorder actions enable creative non-linear arrangements
 """
 
 from dataclasses import dataclass
@@ -43,18 +43,23 @@ class ActionTypeV2(IntEnum):
     KEEP_PHRASE = 4   # Keep next 8 beats
     CUT_PHRASE = 5    # Cut next 8 beats
     
-    # Looping actions
-    LOOP_2X = 6       # Loop current beat 2x
-    LOOP_4X = 7       # Loop current beat 4x
-    LOOP_BAR_2X = 8   # Loop current 4-beat bar 2x
+    # Looping actions (all loop 2x by default)
+    LOOP_BEAT = 6     # Loop current beat 2x
+    LOOP_BAR = 7      # Loop current 4-beat bar 2x
+    LOOP_PHRASE = 8   # Loop current 8-beat phrase 2x
     
     # Section control
     JUMP_BACK_4 = 9   # Jump back 4 beats (repeat section)
     JUMP_BACK_8 = 10  # Jump back 8 beats
     
+    # Reorder actions (move content to end of output - deferred placement)
+    REORDER_BEAT = 11   # Move current beat to end of output
+    REORDER_BAR = 12    # Move current 4-beat bar to end of output
+    REORDER_PHRASE = 13 # Move current 8-beat phrase to end of output
+    
     # Transition control (affects how edits are rendered)
-    MARK_SOFT_TRANSITION = 11  # Mark for soft crossfade at next edit
-    MARK_HARD_CUT = 12         # Mark for beat-aligned hard cut
+    MARK_SOFT_TRANSITION = 14  # Mark for soft crossfade at next edit
+    MARK_HARD_CUT = 15         # Mark for beat-aligned hard cut
 
 
 @dataclass
@@ -88,15 +93,18 @@ class ActionSpaceV2:
     ACTION_CUT_BAR = 3
     ACTION_KEEP_PHRASE = 4
     ACTION_CUT_PHRASE = 5
-    ACTION_LOOP_2X = 6
-    ACTION_LOOP_4X = 7
-    ACTION_LOOP_BAR_2X = 8
+    ACTION_LOOP_BEAT = 6
+    ACTION_LOOP_BAR = 7
+    ACTION_LOOP_PHRASE = 8
     ACTION_JUMP_BACK_4 = 9
     ACTION_JUMP_BACK_8 = 10
-    ACTION_MARK_SOFT = 11
-    ACTION_MARK_HARD = 12
+    ACTION_REORDER_BEAT = 11
+    ACTION_REORDER_BAR = 12
+    ACTION_REORDER_PHRASE = 13
+    ACTION_MARK_SOFT = 14
+    ACTION_MARK_HARD = 15
     
-    N_ACTIONS = 13
+    N_ACTIONS = 16
     
     def __init__(
         self,
@@ -162,21 +170,33 @@ class ActionSpaceV2:
             n_beats = min(self.phrase_size, remaining_beats)
             return ActionV2(ActionTypeV2.CUT_PHRASE, current_beat, n_beats_affected=n_beats)
         
-        elif action_idx == self.ACTION_LOOP_2X:
-            return ActionV2(ActionTypeV2.LOOP_2X, current_beat, n_beats_affected=1)
+        elif action_idx == self.ACTION_LOOP_BEAT:
+            return ActionV2(ActionTypeV2.LOOP_BEAT, current_beat, n_beats_affected=1)
         
-        elif action_idx == self.ACTION_LOOP_4X:
-            return ActionV2(ActionTypeV2.LOOP_4X, current_beat, n_beats_affected=1)
-        
-        elif action_idx == self.ACTION_LOOP_BAR_2X:
+        elif action_idx == self.ACTION_LOOP_BAR:
             n_beats = min(self.bar_size, remaining_beats)
-            return ActionV2(ActionTypeV2.LOOP_BAR_2X, current_beat, n_beats_affected=n_beats)
+            return ActionV2(ActionTypeV2.LOOP_BAR, current_beat, n_beats_affected=n_beats)
+        
+        elif action_idx == self.ACTION_LOOP_PHRASE:
+            n_beats = min(self.phrase_size, remaining_beats)
+            return ActionV2(ActionTypeV2.LOOP_PHRASE, current_beat, n_beats_affected=n_beats)
         
         elif action_idx == self.ACTION_JUMP_BACK_4:
             return ActionV2(ActionTypeV2.JUMP_BACK_4, current_beat, n_beats_affected=0)
         
         elif action_idx == self.ACTION_JUMP_BACK_8:
             return ActionV2(ActionTypeV2.JUMP_BACK_8, current_beat, n_beats_affected=0)
+        
+        elif action_idx == self.ACTION_REORDER_BEAT:
+            return ActionV2(ActionTypeV2.REORDER_BEAT, current_beat, n_beats_affected=1)
+        
+        elif action_idx == self.ACTION_REORDER_BAR:
+            n_beats = min(self.bar_size, remaining_beats)
+            return ActionV2(ActionTypeV2.REORDER_BAR, current_beat, n_beats_affected=n_beats)
+        
+        elif action_idx == self.ACTION_REORDER_PHRASE:
+            n_beats = min(self.phrase_size, remaining_beats)
+            return ActionV2(ActionTypeV2.REORDER_PHRASE, current_beat, n_beats_affected=n_beats)
         
         elif action_idx == self.ACTION_MARK_SOFT:
             self.pending_soft_transition = True
@@ -216,7 +236,7 @@ class ActionSpaceV2:
         if remaining_beats < self.bar_size:
             mask[self.ACTION_KEEP_BAR] = False
             mask[self.ACTION_CUT_BAR] = False
-            mask[self.ACTION_LOOP_BAR_2X] = False
+            mask[self.ACTION_LOOP_BAR] = False
         
         # Disable jump-back if not enough history
         if current_beat < 4:
@@ -228,9 +248,26 @@ class ActionSpaceV2:
         n_loops = len(edit_history.looped_beats)
         n_processed = len(edit_history.get_edited_beats())
         if n_processed > 0 and n_loops / n_processed > 0.15:
-            mask[self.ACTION_LOOP_2X] = False
-            mask[self.ACTION_LOOP_4X] = False
-            mask[self.ACTION_LOOP_BAR_2X] = False
+            mask[self.ACTION_LOOP_BEAT] = False
+            mask[self.ACTION_LOOP_BAR] = False
+            mask[self.ACTION_LOOP_PHRASE] = False
+        
+        # Disable phrase-level loop if not enough beats
+        if remaining_beats < self.phrase_size:
+            mask[self.ACTION_LOOP_PHRASE] = False
+        
+        # Disable phrase-level reorder if not enough beats
+        if remaining_beats < self.phrase_size:
+            mask[self.ACTION_REORDER_PHRASE] = False
+        if remaining_beats < self.bar_size:
+            mask[self.ACTION_REORDER_BAR] = False
+        
+        # Disable excessive reordering (check reorder ratio)
+        n_reordered = len(edit_history.reordered_sections)
+        if n_processed > 0 and n_reordered / max(1, n_processed // 4) > 0.25:
+            mask[self.ACTION_REORDER_BEAT] = False
+            mask[self.ACTION_REORDER_BAR] = False
+            mask[self.ACTION_REORDER_PHRASE] = False
         
         return mask
     
@@ -250,6 +287,7 @@ class EditHistoryV2:
         self.jump_points: list = []  # [(from_beat, to_beat)]
         self.transition_markers: dict = {}  # beat_idx -> 'soft' or 'hard'
         self.section_edits: list = []  # Track section-level decisions
+        self.reordered_sections: list = []  # [(start_beat, n_beats)] - sections to append at end
     
     def add_keep(self, beat_idx: int) -> None:
         """Add single beat keep."""
@@ -288,13 +326,30 @@ class EditHistoryV2:
         """Add jump point for non-linear editing."""
         self.jump_points.append((from_beat, to_beat))
     
+    def add_reorder(self, start_beat: int, n_beats: int) -> None:
+        """Add section to be reordered (placed at end of output).
+        
+        These beats are NOT kept in their original position - they will
+        be appended to the end of the final output during rendering.
+        """
+        self.reordered_sections.append((start_beat, n_beats))
+        # Mark these beats as processed but not kept in-place
+        for i in range(n_beats):
+            # Remove from kept/cut since they'll be placed elsewhere
+            self.kept_beats.discard(start_beat + i)
+            self.cut_beats.discard(start_beat + i)
+    
     def set_transition_marker(self, beat_idx: int, marker_type: str) -> None:
         """Set transition marker at beat."""
         self.transition_markers[beat_idx] = marker_type
     
     def get_edited_beats(self) -> set:
-        """Get all beats that have been edited."""
-        return self.kept_beats | self.cut_beats
+        """Get all beats that have been edited (including reordered)."""
+        reordered_beats = set()
+        for start_beat, n_beats in self.reordered_sections:
+            for i in range(n_beats):
+                reordered_beats.add(start_beat + i)
+        return self.kept_beats | self.cut_beats | reordered_beats
     
     def get_keep_ratio(self) -> float:
         """Get ratio of kept beats to edited beats."""

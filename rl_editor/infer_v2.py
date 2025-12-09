@@ -85,20 +85,23 @@ def run_inference_v2(
 def decode_action_v2(action_idx: int, current_beat: int, n_beats: int) -> Dict:
     """Decode V2 action index to action info for audio processing.
     
-    V2 Actions:
+    V2 Actions (16 total):
     - 0: KEEP_BEAT
     - 1: CUT_BEAT
     - 2: KEEP_BAR (4 beats)
     - 3: CUT_BAR (4 beats)
     - 4: KEEP_PHRASE (8 beats)
     - 5: CUT_PHRASE (8 beats)
-    - 6: LOOP_2X
-    - 7: LOOP_4X
-    - 8: LOOP_BAR_2X (4 beats looped)
+    - 6: LOOP_BEAT (loop 2x)
+    - 7: LOOP_BAR (4 beats looped 2x)
+    - 8: LOOP_PHRASE (8 beats looped 2x)
     - 9: JUMP_BACK_4
     - 10: JUMP_BACK_8
-    - 11: MARK_SOFT_TRANSITION
-    - 12: MARK_HARD_CUT
+    - 11: REORDER_BEAT
+    - 12: REORDER_BAR (4 beats)
+    - 13: REORDER_PHRASE (8 beats)
+    - 14: MARK_SOFT_TRANSITION
+    - 15: MARK_HARD_CUT
     """
     if action_idx == ActionSpaceV2.ACTION_KEEP_BEAT:
         return {"type": "KEEP", "beats": [current_beat]}
@@ -116,17 +119,26 @@ def decode_action_v2(action_idx: int, current_beat: int, n_beats: int) -> Dict:
     elif action_idx == ActionSpaceV2.ACTION_CUT_PHRASE:
         end_beat = min(current_beat + 8, n_beats)
         return {"type": "CUT", "beats": list(range(current_beat, end_beat))}
-    elif action_idx == ActionSpaceV2.ACTION_LOOP_2X:
+    elif action_idx == ActionSpaceV2.ACTION_LOOP_BEAT:
         return {"type": "LOOP", "beats": [current_beat], "times": 2}
-    elif action_idx == ActionSpaceV2.ACTION_LOOP_4X:
-        return {"type": "LOOP", "beats": [current_beat], "times": 4}
-    elif action_idx == ActionSpaceV2.ACTION_LOOP_BAR_2X:
+    elif action_idx == ActionSpaceV2.ACTION_LOOP_BAR:
         end_beat = min(current_beat + 4, n_beats)
+        return {"type": "LOOP", "beats": list(range(current_beat, end_beat)), "times": 2}
+    elif action_idx == ActionSpaceV2.ACTION_LOOP_PHRASE:
+        end_beat = min(current_beat + 8, n_beats)
         return {"type": "LOOP", "beats": list(range(current_beat, end_beat)), "times": 2}
     elif action_idx == ActionSpaceV2.ACTION_JUMP_BACK_4:
         return {"type": "JUMP_BACK", "beats": 4}
     elif action_idx == ActionSpaceV2.ACTION_JUMP_BACK_8:
         return {"type": "JUMP_BACK", "beats": 8}
+    elif action_idx == ActionSpaceV2.ACTION_REORDER_BEAT:
+        return {"type": "REORDER", "beats": [current_beat]}
+    elif action_idx == ActionSpaceV2.ACTION_REORDER_BAR:
+        end_beat = min(current_beat + 4, n_beats)
+        return {"type": "REORDER", "beats": list(range(current_beat, end_beat))}
+    elif action_idx == ActionSpaceV2.ACTION_REORDER_PHRASE:
+        end_beat = min(current_beat + 8, n_beats)
+        return {"type": "REORDER", "beats": list(range(current_beat, end_beat))}
     elif action_idx == ActionSpaceV2.ACTION_MARK_SOFT:
         return {"type": "MARK_SOFT", "beats": [current_beat]}
     elif action_idx == ActionSpaceV2.ACTION_MARK_HARD:
@@ -165,6 +177,7 @@ def create_edited_audio_v2(
     # Default: all beats are initially undecided
     beat_status = {}  # beat_idx -> "KEEP" | "CUT" | ("LOOP", times)
     transition_markers = {}  # beat_idx -> "SOFT" | "HARD"
+    reordered_sections = []  # List of (start_beat, n_beats) to append at end
     
     current_beat = 0
     for action_idx in actions:
@@ -193,6 +206,16 @@ def create_edited_audio_v2(
                     beat_status[b] = ("LOOP", loop_times)
             current_beat = max(action_info["beats"]) + 1 if action_info["beats"] else current_beat + 1
             
+        elif action_type == "REORDER":
+            # Mark these beats as reordered (will be appended at end)
+            beats = action_info["beats"]
+            if beats:
+                reordered_sections.append((min(beats), len(beats)))
+                for b in beats:
+                    if b < n_beats:
+                        beat_status[b] = "REORDER"  # Don't keep in place
+            current_beat = max(beats) + 1 if beats else current_beat + 1
+            
         elif action_type == "JUMP_BACK":
             # Jump back means we'll potentially revisit earlier beats
             jump_beats = action_info["beats"]
@@ -220,7 +243,8 @@ def create_edited_audio_v2(
     for i in range(n_beats):
         status = beat_status.get(i, "KEEP")
         
-        if status == "CUT":
+        if status == "CUT" or status == "REORDER":
+            # Skip cut beats and reordered beats (reordered will be added at end)
             continue
             
         start_sample = beat_samples[i]
@@ -251,24 +275,97 @@ def create_edited_audio_v2(
         
         prev_beat_idx = i
     
+    # Append reordered sections at the end
+    for start_beat, n_reorder_beats in reordered_sections:
+        for i in range(n_reorder_beats):
+            beat_idx = start_beat + i
+            if beat_idx >= n_beats:
+                continue
+            start_sample = beat_samples[beat_idx]
+            end_sample = beat_samples[beat_idx + 1]
+            segment = audio[start_sample:end_sample].copy()
+            logger.debug(f"Beat {beat_idx}: REORDER (appended at end)")
+            
+            # Apply crossfade when appending reordered content
+            if segments and crossfade_samples > 0:
+                prev_audio = segments.pop()
+                combined = apply_crossfade(prev_audio, segment, crossfade_samples)
+                segments.append(combined)
+            else:
+                segments.append(segment)
+    
     if not segments:
         logger.warning("No segments kept! Returning original audio.")
         return audio
     
     # Concatenate all segments
     edited = np.concatenate(segments)
-    
-    # Log statistics
+
+    # --- Accurate output beat statistics and duration ratios ---
+    # Track how many times each beat index is included in the output, and sum their durations
+    output_beat_counts = np.zeros(n_beats, dtype=int)
+    output_beat_samples = np.zeros(n_beats, dtype=int)
+
+    # For main pass (kept/looped beats)
+    for i in range(n_beats):
+        status = beat_status.get(i, "KEEP")
+        if status == "CUT" or status == "REORDER":
+            continue
+        start_sample = beat_samples[i]
+        end_sample = beat_samples[i + 1]
+        seg_len = end_sample - start_sample
+        if isinstance(status, tuple) and status[0] == "LOOP":
+            loop_times = status[1]
+            output_beat_counts[i] += loop_times
+            output_beat_samples[i] += seg_len * loop_times
+        else:
+            output_beat_counts[i] += 1
+            output_beat_samples[i] += seg_len
+    # For reordered sections appended at end
+    for start_beat, n_reorder_beats in reordered_sections:
+        for j in range(n_reorder_beats):
+            beat_idx = start_beat + j
+            if beat_idx < n_beats:
+                start_sample = beat_samples[beat_idx]
+                end_sample = beat_samples[beat_idx + 1]
+                seg_len = end_sample - start_sample
+                output_beat_counts[beat_idx] += 1
+                output_beat_samples[beat_idx] += seg_len
+
+    kept_samples = np.sum(output_beat_samples)
+    cut_samples = len(audio) - kept_samples
     original_duration = len(audio) / sr
-    edited_duration = len(edited) / sr
-    
-    keep_count = sum(1 for s in beat_status.values() if s == "KEEP")
-    cut_count = sum(1 for s in beat_status.values() if s == "CUT")
-    loop_count = sum(1 for s in beat_status.values() if isinstance(s, tuple))
-    
+    edited_duration = kept_samples / sr
+    cut_duration = cut_samples / sr
+
+    # Calculate total duration of cut beats
+    cut_beat_samples = 0
+    for i in range(n_beats):
+        if output_beat_counts[i] == 0:
+            start_sample = beat_samples[i]
+            end_sample = beat_samples[i + 1]
+            cut_beat_samples += (end_sample - start_sample)
+    cut_beat_duration = cut_beat_samples / sr
+
     logger.info(f"Audio: {original_duration:.2f}s -> {edited_duration:.2f}s ({100*edited_duration/original_duration:.1f}%)")
-    logger.info(f"Beats: {keep_count} kept, {cut_count} cut, {loop_count} looped (of {n_beats} total)")
-    
+    logger.info(f"Kept duration: {edited_duration:.2f}s ({100*edited_duration/original_duration:.1f}%), Cut duration: {cut_duration:.2f}s ({100*cut_duration/original_duration:.1f}%)")
+    logger.info(f"Output beats: {np.sum(output_beat_counts)} total (kept: {np.sum(output_beat_counts == 1)}, looped/reordered: {np.sum(output_beat_counts > 1)}, cut: {np.sum(output_beat_counts == 0)}, of {n_beats} unique beats)")
+    logger.info(f"Total duration of cut beats: {cut_beat_duration:.2f}s ({100*cut_beat_duration/original_duration:.1f}%)")
+
+    # --- Debug: Print and plot beat durations ---
+    import matplotlib.pyplot as plt
+    beat_durations_sec = np.diff(beat_times)
+    print("Beat durations (seconds):", beat_durations_sec)
+    print(f"Min: {beat_durations_sec.min():.4f}s, Max: {beat_durations_sec.max():.4f}s, Mean: {beat_durations_sec.mean():.4f}s, Std: {beat_durations_sec.std():.4f}s")
+    plt.figure(figsize=(10, 4))
+    plt.plot(beat_durations_sec, marker='o')
+    plt.title('Beat Durations (seconds)')
+    plt.xlabel('Beat Index')
+    plt.ylabel('Duration (s)')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
     return edited
 
 
@@ -280,7 +377,7 @@ def main():
                        help="V2 model checkpoint path")
     parser.add_argument("--deterministic", action="store_true", default=True,
                        help="Use deterministic policy (default: True)")
-    parser.add_argument("--max-beats", type=int, default=500, help="Maximum beats to process")
+    parser.add_argument("--max-beats", type=int, default=0, help="Maximum beats to process")
     parser.add_argument("--crossfade-ms", type=float, default=50.0, 
                        help="Crossfade duration in ms at edit boundaries")
     
@@ -338,7 +435,7 @@ def main():
     # Analyze actions
     action_counter = Counter(action_names)
     logger.info(f"Action distribution: {dict(action_counter)}")
-    
+
     # Create edited audio
     edited_audio = create_edited_audio_v2(
         audio, sr, 
@@ -361,3 +458,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

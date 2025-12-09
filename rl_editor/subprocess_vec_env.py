@@ -1,4 +1,4 @@
-"""
+﻿"""
 Subprocess-based vectorized environment for true multiprocessing.
 Each environment runs in its own process, bypassing the GIL.
 
@@ -41,7 +41,55 @@ def _worker(
         while True:
             cmd, data = remote.recv()
             
-            if cmd == "step":
+            if cmd == "batched_rollout":
+                # Run N steps with pre-computed actions (batched to reduce IPC)
+                actions, n_steps = data
+                results = []
+                for step_idx in range(n_steps):
+                    action = actions[step_idx] if step_idx < len(actions) else 0
+                    obs, reward, terminated, truncated, info = env.step(action)
+                    
+                    # Compute auxiliary targets locally
+                    aux_dict = {}
+                    if env.audio_state is not None and env.audio_state.beat_features is not None:
+                        beat_times = env.audio_state.beat_times
+                        beat_features = env.audio_state.beat_features
+                        beat_idx = env.current_beat
+                        aux_targets = aux_computer.get_targets(
+                            audio_id=current_audio_id or f"worker_{worker_id}",
+                            beat_times=beat_times,
+                            beat_features=beat_features,
+                            beat_indices=np.array([beat_idx]),
+                        )
+                        for k, v in aux_targets.items():
+                            if k == "reconstruction_mask":
+                                continue
+                            if k == "reconstruction":
+                                if len(v) > 0:
+                                    aux_dict[k] = v[0].tolist() if hasattr(v[0], 'tolist') else list(v[0])
+                                else:
+                                    aux_dict[k] = []
+                            else:
+                                if len(v) > 0:
+                                    val = v[0]
+                                    aux_dict[k] = float(val) if np.isscalar(val) else float(val.item())
+                                else:
+                                    aux_dict[k] = 0.0
+                    info["aux_targets"] = aux_dict
+                    
+                    # Get action mask for next step
+                    mask = env.get_action_mask()
+                    
+                    results.append((obs.tolist(), reward, terminated, truncated, info, mask.tolist()))
+                    
+                    if terminated or truncated:
+                        # Reset and continue
+                        obs, reset_info = env.reset()
+                        aux_computer.clear_cache()
+                
+                remote.send(results)
+                
+            elif cmd == "step":
                 obs, reward, terminated, truncated, info = env.step(data)
                 
                 # Compute auxiliary targets locally (fast, no IPC for big arrays)
@@ -223,6 +271,35 @@ class SubprocessVecEnvV2:
         for remote in self.remotes:
             remote.recv()
     
+
+    def batched_rollout(self, actions_per_env, n_steps):
+        """Run batched rollouts in all environments in parallel.
+        
+        Each subprocess runs n_steps with pre-computed actions, reducing IPC from
+        O(n_envs * n_steps) to O(n_envs).
+        """
+        # Send batched rollout commands to all workers (parallel)
+        for remote, actions in zip(self.remotes, actions_per_env):
+            remote.send(("batched_rollout", (actions, n_steps)))
+        
+        # Collect results (blocking, but all workers run in parallel)
+        all_results = []
+        for remote in self.remotes:
+            env_results = remote.recv()
+            processed = []
+            for obs, reward, term, trunc, info, mask in env_results:
+                processed.append((
+                    np.array(obs),
+                    reward,
+                    term,
+                    trunc,
+                    info,
+                    np.array(mask),
+                ))
+            all_results.append(processed)
+        
+        return all_results
+
     def close(self):
         """Close all environments and processes."""
         if self.closed:
@@ -271,3 +348,4 @@ def make_subprocess_vec_env(
     env_fns = [make_env for _ in range(n_envs)]
     
     return SubprocessVecEnvV2(env_fns, start_method="spawn")
+

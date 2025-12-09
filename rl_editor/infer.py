@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 def load_and_process_audio(
     audio_path: str, 
     config: Config,
-    max_beats: int = 500,
+    max_beats: int = 0,
     cache_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, int, AudioState]:
     """Load audio and compute features matching the training pipeline.
@@ -169,7 +169,7 @@ def load_and_process_audio(
     logger.info(f"Beat features shape: {beat_features.shape}")
     
     # Truncate to max_beats
-    if len(beat_times) > max_beats:
+    if max_beats > 0 and len(beat_times) > max_beats:
         logger.warning(f"Truncating from {len(beat_times)} to {max_beats} beats")
         beat_times = beat_times[:max_beats]
         beat_features = beat_features[:max_beats]

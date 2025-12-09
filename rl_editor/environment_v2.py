@@ -242,15 +242,15 @@ class AudioEditingEnvV2(gym.Env):
             self.edit_history.add_cut_section(beat_idx, n_beats)
             return n_beats
         
-        elif action_type == ActionTypeV2.LOOP_2X:
+        elif action_type == ActionTypeV2.LOOP_BEAT:
             self.edit_history.add_loop(beat_idx, 2)
             return 1
         
-        elif action_type == ActionTypeV2.LOOP_4X:
-            self.edit_history.add_loop(beat_idx, 4)
-            return 1
+        elif action_type == ActionTypeV2.LOOP_BAR:
+            self.edit_history.add_section_loop(beat_idx, n_beats, 2)
+            return n_beats
         
-        elif action_type == ActionTypeV2.LOOP_BAR_2X:
+        elif action_type == ActionTypeV2.LOOP_PHRASE:
             self.edit_history.add_section_loop(beat_idx, n_beats, 2)
             return n_beats
         
@@ -278,16 +278,64 @@ class AudioEditingEnvV2(gym.Env):
             self.edit_history.set_transition_marker(beat_idx, 'hard')
             return 1  # ADVANCE by 1 beat
         
+        elif action_type == ActionTypeV2.REORDER_BEAT:
+            # Move this beat to the end of the output (deferred placement)
+            self.edit_history.add_reorder(beat_idx, 1)
+            return 1
+        
+        elif action_type == ActionTypeV2.REORDER_BAR:
+            # Move this 4-beat bar to the end of the output
+            self.edit_history.add_reorder(beat_idx, n_beats)
+            return n_beats
+        
+        elif action_type == ActionTypeV2.REORDER_PHRASE:
+            # Move this 8-beat phrase to the end of the output
+            self.edit_history.add_reorder(beat_idx, n_beats)
+            return n_beats
+        
         return 1  # Default advance
     
     def _compute_minimal_step_reward(self, action: ActionV2) -> float:
-        """Compute step reward.
+        """Compute step reward with duration warning signal.
         
-        MONTE CARLO MODE: Zero step rewards.
-        All learning signal comes from episode end.
-        This forces true multi-step credit assignment.
+        Mostly Monte Carlo (episode-end rewards), BUT with one exception:
+        Give immediate negative signal when approaching duration limit.
+        This helps the model learn the constraint faster.
         """
-        # Pure Monte Carlo = NO step rewards
+        n_beats = len(self.audio_state.beat_times)
+        if n_beats == 0:
+            return 0.0
+        
+        # Calculate current duration ratio - must match episode calculation!
+        # Output = kept + reordered + loop_extra + jumped
+        n_kept = len(self.edit_history.kept_beats)
+        
+        # Reordered beats
+        total_reordered = sum(n for _, n in self.edit_history.reordered_sections) if self.edit_history.reordered_sections else 0
+        
+        # Jumped beats (JUMP_BACK does not replay content on its own)
+        total_jumped = sum(max(0, from_b - to_b) for from_b, to_b in self.edit_history.jump_points) if self.edit_history.jump_points else 0
+        
+        # Loop extra from both looped_beats AND looped_sections
+        loop_extra_beats = sum(max(0, times - 1) for times in self.edit_history.looped_beats.values()) if self.edit_history.looped_beats else 0
+        loop_extra_sections = sum((end - start) * max(0, times - 1) for start, end, times in self.edit_history.looped_sections) if self.edit_history.looped_sections else 0
+        loop_extra = loop_extra_beats + loop_extra_sections
+        
+        estimated_output = n_kept + total_reordered + loop_extra # + total_jumped
+        duration_ratio = estimated_output / n_beats
+        
+        # STEP-LEVEL DURATION WARNING
+        # Give immediate negative signal when approaching/exceeding 90%
+        if duration_ratio > 0.90:
+            # Already over limit - strong negative signal every step
+            return -5.0
+        elif duration_ratio > 0.80:
+            # Warning zone - mild negative signal
+            return -1.0
+        elif duration_ratio > 0.70:
+            # Approaching warning - very mild signal
+            return -0.2
+        
         return 0.0
     
     def _compute_episode_reward(self) -> float:
@@ -312,9 +360,15 @@ class AudioEditingEnvV2(gym.Env):
         n_cut = len(self.edit_history.cut_beats)
         n_edited = n_kept + n_cut
         
+        # EXPLOIT FIX: Count looped beats as implicit keeps
+        # Looping a beat without keeping it is still keeping content
+        looped_beat_indices = set(self.edit_history.looped_beats.keys()) if self.edit_history.looped_beats else set()
+        n_looped_unique = len(looped_beat_indices - self.edit_history.kept_beats)  # Looped but not explicitly kept
+        n_effective_kept = n_kept + n_looped_unique  # For ratio calculations
+        
         # Count loop actions
         loop_action_types = {
-            ActionTypeV2.LOOP_2X, ActionTypeV2.LOOP_4X, ActionTypeV2.LOOP_BAR_2X,
+            ActionTypeV2.LOOP_BEAT, ActionTypeV2.LOOP_BAR, ActionTypeV2.LOOP_PHRASE,
             ActionTypeV2.JUMP_BACK_4, ActionTypeV2.JUMP_BACK_8
         }
         n_loops = sum(1 for a in self.episode_actions if a.action_type in loop_action_types)
@@ -355,13 +409,13 @@ class AudioEditingEnvV2(gym.Env):
         else:
             penalties["excess_cuts"] = 0.0
         
-        # Penalty 3: LOOP BUDGET - 1 loop allowed per 4 cuts
-        # Excess loops get penalized, not zeroed
-        max_loops = n_cut // 4
+        # Penalty 3: LOOP BUDGET - More lenient: 1 loop per 3 cuts (was 4)
+        # We WANT loops to be used, just not spammed
+        max_loops = max(2, n_cut // 3)  # At least 2 loops allowed, then 1 per 3 cuts
         if n_loops > max_loops:
             excess_loops = n_loops - max_loops
-            # -5 points per excess loop, capped at -30
-            penalties["excess_loops"] = -min(excess_loops * 5.0, 30.0)
+            # -3 points per excess loop (was -5), capped at -20 (was -30)
+            penalties["excess_loops"] = -min(excess_loops * 3.0, 20.0)
         else:
             penalties["excess_loops"] = 0.0
         
@@ -372,15 +426,16 @@ class AudioEditingEnvV2(gym.Env):
         n_actions = len(self.episode_actions)
         jump_ratio = n_jumps / n_actions if n_actions > 0 else 0.0
         
-        # Jumps should be < 10% of actions, heavily penalize if > 20%
-        if jump_ratio > 0.20:
-            # Spam territory - heavy penalty
-            excess_jump_ratio = jump_ratio - 0.20  # 0 to 0.80
-            penalties["excess_jumps"] = -(excess_jump_ratio / 0.30) ** 2 * 35.0  # up to -35
-        elif jump_ratio > 0.10:
-            # Moderate overuse
-            excess_jump_ratio = jump_ratio - 0.10  # 0 to 0.10
-            penalties["excess_jumps"] = -(excess_jump_ratio / 0.10) * 10.0  # up to -10
+        # Jumps should be < 25% of actions (more lenient - we WANT some jumps)
+        # Only penalize if truly spamming (> 30%)
+        if jump_ratio > 0.30:
+            # Spam territory - moderate penalty
+            excess_jump_ratio = jump_ratio - 0.30  # 0 to 0.70
+            penalties["excess_jumps"] = -(excess_jump_ratio / 0.30) ** 2 * 20.0  # up to -20 (was -35)
+        elif jump_ratio > 0.25:
+            # Slightly over budget
+            excess_jump_ratio = jump_ratio - 0.25  # 0 to 0.05
+            penalties["excess_jumps"] = -(excess_jump_ratio / 0.05) * 5.0  # up to -5 (was -10)
         else:
             penalties["excess_jumps"] = 0.0
         
@@ -389,15 +444,150 @@ class AudioEditingEnvV2(gym.Env):
         action_types_used = Counter(a.action_type for a in self.episode_actions if hasattr(a, 'action_type'))
         n_unique_actions = len(action_types_used)
         
-        # Must use at least 4 different action types, strongly prefer 6+
+        # More lenient diversity requirements - we want SOME diversity, but
+        # it is OK to have a dominant cutting strategy as long as other tools are used
         if n_unique_actions <= 2:
-            penalties["low_diversity"] = -25.0  # Only 1-2 action types = bad
+            penalties["low_diversity"] = -15.0  # Only 1-2 action types = bad (was -25)
         elif n_unique_actions == 3:
-            penalties["low_diversity"] = -15.0  # 3 types = still exploitative
+            penalties["low_diversity"] = -8.0   # 3 types = could be better (was -15)
         elif n_unique_actions == 4:
-            penalties["low_diversity"] = -5.0   # 4 types = barely acceptable
+            penalties["low_diversity"] = -2.0   # 4 types = acceptable (was -5)
         else:
             penalties["low_diversity"] = 0.0    # 5+ types = good
+        
+        # Penalty 8: TRANSITION MARKER SPAM - Markers should be rare (< 5% of actions)
+        marker_actions = {ActionTypeV2.MARK_SOFT_TRANSITION, ActionTypeV2.MARK_HARD_CUT}
+        n_markers = sum(1 for a in self.episode_actions if a.action_type in marker_actions)
+        marker_ratio = n_markers / n_actions if n_actions > 0 else 0.0
+        if marker_ratio > 0.15:
+            penalties["marker_spam"] = -20.0 - (marker_ratio - 0.15) * 50.0  # Heavy penalty
+        elif marker_ratio > 0.05:
+            penalties["marker_spam"] = -(marker_ratio - 0.05) * 100.0  # up to -10
+        else:
+            penalties["marker_spam"] = 0.0
+        
+        # Penalty 9: UNEVEN CUT DISTRIBUTION - Cuts should be spread throughout, not bunched
+        # Prevents "cut everything at the end" exploit
+        if n_cut > 5:
+            cut_positions = sorted(self.edit_history.cut_beats)
+            if len(cut_positions) > 1:
+                # Check if cuts are spread evenly (std dev of gaps)
+                gaps = [cut_positions[i+1] - cut_positions[i] for i in range(len(cut_positions)-1)]
+                avg_gap = sum(gaps) / len(gaps) if gaps else 0
+                # Coefficient of variation - high = uneven distribution
+                if avg_gap > 0:
+                    gap_std = (sum((g - avg_gap)**2 for g in gaps) / len(gaps)) ** 0.5
+                    cv = gap_std / avg_gap
+                    # CV > 1.5 means very uneven (bunched cuts)
+                    if cv > 2.0:
+                        penalties["bunched_cuts"] = -15.0
+                    elif cv > 1.5:
+                        penalties["bunched_cuts"] = -8.0
+                    elif cv > 1.0:
+                        penalties["bunched_cuts"] = -3.0
+                    else:
+                        penalties["bunched_cuts"] = 0.0
+                else:
+                    penalties["bunched_cuts"] = 0.0
+            else:
+                penalties["bunched_cuts"] = 0.0
+        else:
+            penalties["bunched_cuts"] = 0.0
+        
+        # Penalty 10: LOW COVERAGE - Must process most of the song, not just a small portion
+        # Prevents "do minimum then stop" exploit
+        max_beat_processed = max(self.edit_history.kept_beats | self.edit_history.cut_beats) if (self.edit_history.kept_beats or self.edit_history.cut_beats) else 0
+        coverage_ratio = max_beat_processed / n_beats if n_beats > 0 else 0.0
+        if coverage_ratio < 0.50:
+            penalties["low_coverage"] = -30.0 * (1.0 - coverage_ratio / 0.50)  # up to -30
+        elif coverage_ratio < 0.80:
+            penalties["low_coverage"] = -10.0 * (1.0 - coverage_ratio / 0.80)  # up to -10
+        else:
+            penalties["low_coverage"] = 0.0
+        
+        # Penalty 11: DOMINANT ACTION - No single action should be > 50% of all actions
+        if action_types_used:
+            most_common_action, most_common_count = action_types_used.most_common(1)[0]
+            dominant_ratio = most_common_count / n_actions if n_actions > 0 else 0.0
+            if dominant_ratio > 0.60:
+                penalties["dominant_action"] = -25.0 * ((dominant_ratio - 0.60) / 0.40)  # up to -25
+            elif dominant_ratio > 0.50:
+                penalties["dominant_action"] = -10.0 * ((dominant_ratio - 0.50) / 0.10)  # up to -10
+            else:
+                penalties["dominant_action"] = 0.0
+        else:
+            penalties["dominant_action"] = 0.0
+        
+        # Penalty 12: SECTION ACTION IMBALANCE - Section actions vs beat actions should be balanced
+        # Prevents gaming by using KEEP_PHRASE for large chunks while CUT_BEAT for small adjustments
+        section_keep_actions = {ActionTypeV2.KEEP_BAR, ActionTypeV2.KEEP_PHRASE}
+        section_cut_actions = {ActionTypeV2.CUT_BAR, ActionTypeV2.CUT_PHRASE}
+        beat_keep_actions = {ActionTypeV2.KEEP_BEAT}
+        beat_cut_actions = {ActionTypeV2.CUT_BEAT}
+        
+        n_section_keeps = sum(1 for a in self.episode_actions if a.action_type in section_keep_actions)
+        n_section_cuts = sum(1 for a in self.episode_actions if a.action_type in section_cut_actions)
+        n_beat_keeps = sum(1 for a in self.episode_actions if a.action_type in beat_keep_actions)
+        n_beat_cuts = sum(1 for a in self.episode_actions if a.action_type in beat_cut_actions)
+        
+        # Ratio of section_keeps to section_cuts should be similar to beat_keeps to beat_cuts
+        # Prevents: KEEP_PHRASE everything, CUT_BEAT selectively
+        total_keeps = n_section_keeps + n_beat_keeps
+        total_cuts = n_section_cuts + n_beat_cuts
+        
+        if total_keeps > 0 and total_cuts > 0:
+            section_keep_ratio = n_section_keeps / total_keeps if total_keeps > 0 else 0.0
+            section_cut_ratio = n_section_cuts / total_cuts if total_cuts > 0 else 0.0
+            ratio_diff = abs(section_keep_ratio - section_cut_ratio)
+            # If difference > 0.5, model is gaming (e.g., section keeps but beat cuts)
+            if ratio_diff > 0.6:
+                penalties["section_imbalance"] = -20.0
+            elif ratio_diff > 0.4:
+                penalties["section_imbalance"] = -10.0
+            else:
+                penalties["section_imbalance"] = 0.0
+        else:
+            penalties["section_imbalance"] = 0.0
+        
+        # Penalty 13: CUT POSITION GAMING - Cuts shouldn't cluster only at "easy" positions
+        # Prevents: Only cutting at beat%8==0 to game phrase alignment score
+        if n_cut > 10:
+            cut_positions = sorted(self.edit_history.cut_beats)
+            # Check what percentage of cuts are at beat%4==0 or beat%8==0
+            easy_cuts = sum(1 for b in cut_positions if b % 4 == 0)
+            easy_ratio = easy_cuts / len(cut_positions) if cut_positions else 0.0
+            # In natural music, ~25% of beats are at %4==0
+            # If > 60% of cuts are at easy positions, model is gaming
+            if easy_ratio > 0.70:
+                penalties["easy_cut_gaming"] = -15.0
+            elif easy_ratio > 0.50:
+                penalties["easy_cut_gaming"] = -5.0
+            else:
+                penalties["easy_cut_gaming"] = 0.0
+        else:
+            penalties["easy_cut_gaming"] = 0.0
+        
+        # Penalty 14: EFFECTIVE KEEP RATIO - Use effective keeps (including loops) for ratio calc
+        # Prevents: Using loops to keep content without it counting as "keep"
+        effective_keep_ratio = n_effective_kept / (n_effective_kept + n_cut) if (n_effective_kept + n_cut) > 0 else 0.0
+        if effective_keep_ratio > 0.80:
+            # Too much kept (including via loops)
+            excess = effective_keep_ratio - 0.80
+            penalties["effective_keep_excess"] = -(excess / 0.20) ** 2 * 30.0  # up to -30
+        else:
+            penalties["effective_keep_excess"] = 0.0
+        
+        # Penalty 15: MINIMUM CUT BEATS - Must cut at least 20% of total beats (not just actions)
+        # Prevents: Processing whole song with mostly keeps
+        actual_cut_ratio = n_cut / n_beats if n_beats > 0 else 0.0
+        if actual_cut_ratio < 0.15:
+            deficit = 0.15 - actual_cut_ratio
+            penalties["min_cut_beats"] = -(deficit / 0.15) ** 2 * 40.0  # up to -40
+        elif actual_cut_ratio < 0.20:
+            deficit = 0.20 - actual_cut_ratio
+            penalties["min_cut_beats"] = -(deficit / 0.05) * 10.0  # up to -10
+        else:
+            penalties["min_cut_beats"] = 0.0
         
         # Penalty 7: NO KEEP ACTIONS - Must actively decide to keep content, not just cut/jump
         keep_actions = {ActionTypeV2.KEEP_BEAT, ActionTypeV2.KEEP_BAR, ActionTypeV2.KEEP_PHRASE}
@@ -414,36 +604,59 @@ class AudioEditingEnvV2(gym.Env):
         else:
             penalties["no_keep_actions"] = 0.0    # Good balance
         
-        # Penalty 4: OUTPUT DURATION - Curriculum approach
-        # Start with gentle 60% target, model can learn to cut more over time
-        total_looped_beats = sum(self.edit_history.looped_beats.values()) if self.edit_history.looped_beats else 0
-        estimated_output_beats = n_kept + total_looped_beats
+        # Penalty 4: OUTPUT DURATION - HARD CONSTRAINT ON >90%
+        # The model MUST learn that >90% duration is completely unacceptable
+        # CRITICAL FIX: Duration = kept + reordered + looped_extra + jumped_beats
+        
+        # Count reordered beats (they go to end of output, so they count!)
+        total_reordered_beats = sum(n for _, n in self.edit_history.reordered_sections) if self.edit_history.reordered_sections else 0
+        
+        # Count jumped beats (JUMP_BACK replays content = adds to duration!)
+        # Each jump from beat A to beat B replays (A - B) beats
+        total_jumped_beats = sum(max(0, from_b - to_b) for from_b, to_b in self.edit_history.jump_points) if self.edit_history.jump_points else 0
+        
+        # Count loop extra beats from BOTH looped_beats (LOOP_BEAT) AND looped_sections (LOOP_BAR/PHRASE)
+        # looped_beats: {beat_idx: n_times} - beat is kept, adds (n_times - 1) extra copies
+        loop_extra_beats = sum(max(0, times - 1) for times in self.edit_history.looped_beats.values()) if self.edit_history.looped_beats else 0
+        # looped_sections: [(start, end, n_times)] - section is kept, adds (n_times - 1) * section_length extra
+        loop_extra_sections = sum((end - start) * max(0, times - 1) for start, end, times in self.edit_history.looped_sections) if self.edit_history.looped_sections else 0
+        loop_extra = loop_extra_beats + loop_extra_sections
+        
+        # Output = kept beats + reordered beats + extra looped beats + jumped beats
+        estimated_output_beats = n_kept + total_reordered_beats + loop_extra + total_jumped_beats
         duration_ratio = estimated_output_beats / n_beats if n_beats > 0 else 1.0
         self.episode_reward_breakdown["duration_ratio"] = duration_ratio
+        self.episode_reward_breakdown["n_reordered"] = total_reordered_beats
+        self.episode_reward_breakdown["n_jumped"] = total_jumped_beats
         
-        # Target: 60% duration (gentler than 35%, avoids reward shock)
-        # Penalty scales smoothly - no harsh cliffs
-        target_duration = 0.60
-        
+        # HARD CONSTRAINT: >90% duration = episode failure
+        # This overrides ALL other rewards - model cannot ignore this
         if duration_ratio > 0.90:
-            # Heavy penalty for keeping 90%+ (almost no editing)
-            excess = duration_ratio - 0.90  # 0 to 0.10
-            penalties["excess_duration"] = -(excess / 0.10) ** 2 * 40.0  # up to -40
-        elif duration_ratio > target_duration:
-            # Moderate penalty: 60-90% (should cut more)
-            excess = duration_ratio - target_duration  # 0 to 0.30
-            penalties["excess_duration"] = -(excess / 0.30) ** 1.5 * 20.0  # up to -20
+            excess = duration_ratio - 0.90  # 0 to 0.10+
+            # MASSIVE penalty: -150 base, scaling up to -300 for 100% duration
+            # This ensures ANY positive rewards are wiped out
+            penalties["excess_duration"] = -150.0 - (excess / 0.10) * 150.0
+            self.episode_reward_breakdown["duration_violation"] = True
+            logger.debug(f"DURATION VIOLATION: {duration_ratio:.1%} > 90% | penalty: {penalties['excess_duration']:.1f}")
+        elif duration_ratio > 0.75:
+            # Strong warning zone: 75-90% - significant penalty
+            excess = duration_ratio - 0.75  # 0 to 0.15
+            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 80.0  # up to -80
+        elif duration_ratio > 0.60:
+            # Soft penalty zone: 60-75% - moderate penalty
+            excess = duration_ratio - 0.60  # 0 to 0.15
+            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 30.0  # up to -30
         elif duration_ratio > 0.40:
-            # Sweet spot: 40-60% - small bonus
+            # Sweet spot: 40-60% - bonus!
             closeness = 1.0 - abs(duration_ratio - 0.50) / 0.10
-            penalties["excess_duration"] = max(0, closeness * 10.0)  # up to +10
+            penalties["excess_duration"] = max(0, closeness * 15.0)  # up to +15
         elif duration_ratio > 0.25:
-            # Acceptable: 25-40% - neutral to small penalty
+            # Acceptable: 25-40% - neutral
             penalties["excess_duration"] = 0.0
         else:
             # Too aggressive: <25% - penalty for cutting too much
             shortage = 0.25 - duration_ratio  # 0 to 0.25
-            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 25.0  # up to -25
+            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 40.0  # up to -40
         
         # Target: 25-45% keep ratio (centered on 35%)
         target_ratio = self.config.reward.target_keep_ratio  # 0.35
@@ -470,24 +683,36 @@ class AudioEditingEnvV2(gym.Env):
         energy_score = self._compute_edited_energy_consistency()
         components["energy_consistency"] = np.sqrt(energy_score) * 15.0
         
-        # Component 4: Cut Quality (15 points max)
+        # Component 4: Cut Quality (20 points max)
         # Reward for cutting LOW quality beats, keeping HIGH quality
         cut_quality = self._compute_cut_quality()
-        components["cut_quality"] = np.sqrt(cut_quality) * 15.0
+        components["cut_quality"] = np.sqrt(cut_quality) * 20.0
         
-        # Component 5: Edit Structure (10 points max)
+        # Component 5: Edit Structure (15 points max)
         # Reward for having multiple kept sections (not one big chunk or scattered)
         structure_score = self._compute_edit_structure_score()
-        components["edit_structure"] = structure_score * 10.0
+        components["edit_structure"] = structure_score * 15.0
         
-        # Component 6: Phrase Alignment (10 points max)
+        # Component 6: Phrase Alignment (15 points max)
         phrase_score = self._compute_phrase_alignment()
-        components["phrase_alignment"] = phrase_score * 10.0
+        components["phrase_alignment"] = phrase_score * 15.0
         
         # Component 7: Action Diversity Bonus (5 points max)
         # Penalize using only one type of action (prevents section-only exploit)
         diversity_score = self._compute_action_diversity()
         components["action_diversity"] = diversity_score * 5.0
+        
+        # Component 8: Creative Reordering Bonus (20 points max)
+        # REWARD for using jumps/loops that IMPROVE the edit quality
+        reorder_score = self._compute_reordering_quality()
+        components["reordering_quality"] = reorder_score * 20.0
+        
+        # Component 9: Loop Usage Bonus (10 points max)
+        # POSITIVE BONUS for using loops - they're a valid creative tool!
+        # Currently model avoids loops because they trigger duration penalty
+        # But good loops (repeating high-energy sections) should be rewarded
+        loop_bonus = self._compute_loop_usage_bonus()
+        components["loop_bonus"] = loop_bonus * 10.0
         
         # === COMPUTE FINAL REWARD ===
         base_reward = sum(components.values())
@@ -891,7 +1116,7 @@ class AudioEditingEnvV2(gym.Env):
         # Method 2: Entropy of action distribution
         probs = np.array(list(action_counts.values())) / n_total
         entropy = -np.sum(probs * np.log(probs + 1e-8))
-        max_entropy = np.log(13)  # 13 possible actions
+        max_entropy = np.log(16)  # 16 possible actions
         entropy_score = entropy / max_entropy
         
         # Method 3: No single action dominates (>70%)
@@ -899,6 +1124,206 @@ class AudioEditingEnvV2(gym.Env):
         dominance_score = 1.0 if max_action_ratio < 0.5 else (1.0 - max_action_ratio)
         
         return 0.3 * uniqueness_score + 0.4 * entropy_score + 0.3 * dominance_score
+    
+    def _compute_reordering_quality(self) -> float:
+        """Compute quality of reordering actions (jumps, loops, reorders).
+        
+        REWARDS creative use of non-linear editing:
+        1. Jumps that create better energy flow (jump to similar energy level)
+        2. Loops that repeat high-quality sections
+        3. Reorders that move good content to better positions
+        4. Overall structural coherence of reordered output
+        """
+        if not self.episode_actions:
+            return 0.0
+        
+        features = self.audio_state.beat_features
+        if features is None or len(features) == 0:
+            return 0.3  # Neutral if no features
+        
+        n_beats = len(features)
+        
+        # Collect jump, loop, and reorder actions
+        jump_actions = []
+        loop_actions = []
+        reorder_actions = []
+        
+        for action in self.episode_actions:
+            if action.action_type == ActionTypeV2.JUMP_BACK_4:
+                jump_actions.append((action.beat_index, 4))
+            elif action.action_type == ActionTypeV2.JUMP_BACK_8:
+                jump_actions.append((action.beat_index, 8))
+            elif action.action_type == ActionTypeV2.LOOP_BEAT:
+                loop_actions.append((action.beat_index, 2))
+            elif action.action_type == ActionTypeV2.LOOP_BAR:
+                loop_actions.append((action.beat_index, 2))  # Bar = 4 beats looped 2x
+            elif action.action_type == ActionTypeV2.LOOP_PHRASE:
+                loop_actions.append((action.beat_index, 2))  # Phrase = 8 beats looped 2x
+            elif action.action_type == ActionTypeV2.REORDER_BEAT:
+                reorder_actions.append((action.beat_index, 1))
+            elif action.action_type == ActionTypeV2.REORDER_BAR:
+                reorder_actions.append((action.beat_index, action.n_beats_affected))
+            elif action.action_type == ActionTypeV2.REORDER_PHRASE:
+                reorder_actions.append((action.beat_index, action.n_beats_affected))
+        
+        scores = []
+        
+        # === JUMP QUALITY ===
+        for from_beat, jump_amount in jump_actions:
+            target_beat = max(0, from_beat - jump_amount)
+            if 0 <= from_beat < n_beats and 0 <= target_beat < n_beats:
+                source_feat = features[from_beat]
+                target_feat = features[target_beat]
+                source_energy = np.mean(np.abs(source_feat))
+                target_energy = np.mean(np.abs(target_feat))
+                energy_diff = abs(source_energy - target_energy)
+                energy_similarity = np.exp(-energy_diff * 2.0)
+                dot = np.dot(source_feat, target_feat)
+                norm = np.linalg.norm(source_feat) * np.linalg.norm(target_feat) + 1e-8
+                feature_similarity = (dot / norm + 1.0) / 2.0
+                target_quality = min(1.0, target_energy / (np.mean(np.abs(features)) + 1e-8))
+                jump_score = 0.4 * energy_similarity + 0.3 * feature_similarity + 0.3 * target_quality
+                scores.append(jump_score)
+        
+        # === LOOP QUALITY ===
+        for beat_idx, n_times in loop_actions:
+            if 0 <= beat_idx < n_beats:
+                beat_feat = features[beat_idx]
+                beat_energy = np.mean(np.abs(beat_feat))
+                avg_energy = np.mean(np.abs(features))
+                energy_ratio = beat_energy / (avg_energy + 1e-8)
+                loop_score = min(1.0, energy_ratio)
+                if beat_idx > 0 and beat_idx < n_beats - 1:
+                    neighbor_avg = (features[beat_idx - 1] + features[beat_idx + 1]) / 2
+                    distinctiveness = np.linalg.norm(beat_feat - neighbor_avg)
+                    distinctiveness_score = min(1.0, distinctiveness * 0.5)
+                    loop_score = 0.6 * loop_score + 0.4 * distinctiveness_score
+                scores.append(loop_score)
+        
+        # === REORDER QUALITY ===
+        # Reward reordering of high-energy, distinctive sections (good content moved to end)
+        for start_beat, n_beats_affected in reorder_actions:
+            if 0 <= start_beat < n_beats:
+                # Get average features for the reordered section
+                end_beat = min(start_beat + n_beats_affected, n_beats)
+                section_feats = features[start_beat:end_beat]
+                if len(section_feats) > 0:
+                    section_energy = np.mean(np.abs(section_feats))
+                    avg_energy = np.mean(np.abs(features))
+                    
+                    # Higher score for reordering high-energy content (moving good stuff)
+                    energy_quality = min(1.0, section_energy / (avg_energy + 1e-8))
+                    
+                    # Bonus if the section is coherent (low internal variance)
+                    if len(section_feats) > 1:
+                        internal_var = np.mean(np.var(section_feats, axis=0))
+                        coherence_score = np.exp(-internal_var * 0.5)
+                    else:
+                        coherence_score = 0.5
+                    
+                    # Bonus for reordering at phrase boundaries (musically sensible)
+                    boundary_bonus = 0.0
+                    if start_beat % 8 == 0:  # Phrase boundary
+                        boundary_bonus = 0.3
+                    elif start_beat % 4 == 0:  # Bar boundary
+                        boundary_bonus = 0.15
+                    
+                    reorder_score = 0.4 * energy_quality + 0.3 * coherence_score + 0.3 * (0.5 + boundary_bonus)
+                    scores.append(reorder_score)
+        
+        # === BASE SCORE FOR ATTEMPTING REORDERING ===
+        n_reorder_actions = len(jump_actions) + len(loop_actions) + len(reorder_actions)
+        n_total_actions = len(self.episode_actions)
+        
+        if n_total_actions == 0:
+            return 0.0
+        
+        reorder_ratio = n_reorder_actions / n_total_actions
+        
+        # Bonus for trying reordering at all (even if imperfect)
+        if reorder_ratio == 0:
+            attempt_bonus = 0.0
+        elif reorder_ratio < 0.05:
+            attempt_bonus = 0.3  # Small usage
+        elif reorder_ratio < 0.20:
+            attempt_bonus = 0.6  # Good usage range
+        elif reorder_ratio < 0.30:
+            attempt_bonus = 0.4  # Getting heavy
+        else:
+            attempt_bonus = 0.2  # Overusing
+        
+        if scores:
+            quality_avg = np.mean(scores)
+            return 0.5 * attempt_bonus + 0.5 * quality_avg
+        else:
+            return attempt_bonus * 0.5
+    
+    def _compute_loop_usage_bonus(self) -> float:
+        """POSITIVE bonus for using loop actions creatively.
+        
+        Loops are a valid creative tool for music editing:
+        1. Repeating a catchy hook or drop builds tension
+        2. Looping the best part of a section extends high-energy moments
+        3. Strategic loops can improve song structure
+        
+        Problem: Model currently avoids loops because they trigger duration penalty.
+        Solution: Add explicit positive bonus for good loop usage.
+        """
+        if not self.edit_history.looped_beats:
+            return 0.0  # No loops = no bonus (but also no penalty)
+        
+        features = self.audio_state.beat_features
+        if features is None or len(features) == 0:
+            return 0.2
+        
+        n_beats = len(features)
+        avg_energy = np.mean(np.abs(features))
+        
+        loop_scores = []
+        for beat_idx, loop_times in self.edit_history.looped_beats.items():
+            if 0 <= beat_idx < n_beats:
+                # Get the looped beat's energy
+                beat_energy = np.mean(np.abs(features[beat_idx]))
+                
+                # Bonus for looping HIGH-ENERGY content (the good parts!)
+                energy_ratio = beat_energy / (avg_energy + 1e-8)
+                energy_quality = min(1.0, max(0.0, (energy_ratio - 0.7) / 0.6))  # Scale 0.7-1.3 to 0-1
+                
+                # Bonus for looping at musically sensible positions
+                position_bonus = 0.0
+                if beat_idx % 8 == 0:  # Phrase start - great for loops
+                    position_bonus = 0.3
+                elif beat_idx % 4 == 0:  # Bar start - good
+                    position_bonus = 0.15
+                
+                # Don't over-loop the same spot
+                repetition_penalty = max(0.0, 1.0 - (loop_times - 2) * 0.3)
+                
+                loop_score = (0.5 * energy_quality + 0.3 * position_bonus + 0.2) * repetition_penalty
+                loop_scores.append(loop_score)
+        
+        if not loop_scores:
+            return 0.0
+        
+        # Base bonus for using loops at all
+        n_loops = len(loop_scores)
+        n_total = len(self.episode_actions) if self.episode_actions else 1
+        loop_ratio = n_loops / n_total
+        
+        # Sweet spot: 5-15% of actions being loops
+        if loop_ratio == 0:
+            usage_bonus = 0.0
+        elif loop_ratio < 0.05:
+            usage_bonus = 0.5  # Using loops, but could use more
+        elif loop_ratio <= 0.15:
+            usage_bonus = 1.0  # Sweet spot!
+        elif loop_ratio <= 0.25:
+            usage_bonus = 0.6  # Acceptable
+        else:
+            usage_bonus = 0.3  # Overusing
+        
+        quality_avg = np.mean(loop_scores)
+        return 0.4 * usage_bonus + 0.6 * quality_avg
     
     def _compute_audio_quality_score(self) -> float:
         """Compute audio quality by building edited audio and analyzing."""
@@ -923,7 +1348,10 @@ class AudioEditingEnvV2(gym.Env):
             return 0.5
     
     def _build_edited_audio(self, crossfade_ms: float = 50.0) -> Optional[np.ndarray]:
-        """Build edited audio from edit history."""
+        """Build edited audio from edit history.
+        
+        Order: kept beats in sequence, then reordered sections appended at end.
+        """
         audio = self.audio_state.raw_audio
         sr = self.audio_state.sample_rate
         beat_times = self.audio_state.beat_times
@@ -951,6 +1379,19 @@ class AudioEditingEnvV2(gym.Env):
                 segment = np.tile(segment, n_times)
             
             segments.append(segment)
+        
+        # Append reordered sections at the end
+        for start_beat, n_beats_affected in self.edit_history.reordered_sections:
+            for i in range(n_beats_affected):
+                beat_idx = start_beat + i
+                if beat_idx >= len(beat_times):
+                    continue
+                
+                start = beat_samples[beat_idx]
+                end = beat_samples[beat_idx + 1] if beat_idx + 1 < len(beat_samples) else len(audio)
+                
+                segment = audio[start:end].copy()
+                segments.append(segment)
         
         if not segments:
             return None

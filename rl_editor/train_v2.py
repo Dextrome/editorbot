@@ -1,7 +1,7 @@
-"""V2 Training Script - Section-level actions with episode rewards.
+﻿"""V2 Training Script - Section-level actions with episode rewards.
 
 Based on train_parallel.py with these key changes:
-1. Uses AudioEditingEnvV2 with section-level actions (13 actions vs 9)
+1. Uses AudioEditingEnvV2 with section-level actions (16 actions vs 9)
 2. Episode-level rewards (minimize step rewards, maximize end-of-episode quality)
 3. Can load V1 weights for transfer learning (encoder transfers, policy head reinitialized)
 4. Full action space enabled by default (not restricted to KEEP/CUT)
@@ -10,10 +10,21 @@ Key V2 Actions:
 - Beat-level: KEEP_BEAT, CUT_BEAT
 - Bar-level (4 beats): KEEP_BAR, CUT_BAR
 - Phrase-level (8 beats): KEEP_PHRASE, CUT_PHRASE
-- Looping: LOOP_2X, LOOP_4X, LOOP_BAR_2X
+- Looping: LOOP_BEAT, LOOP_BAR, LOOP_PHRASE
+- Reordering: REORDER_BEAT, REORDER_BAR, REORDER_PHRASE
 - Navigation: JUMP_BACK_4, JUMP_BACK_8
 - Transitions: MARK_SOFT_TRANSITION, MARK_HARD_CUT
 """
+
+# Set multiprocessing start method for Windows compatibility (must be at very top)
+import sys
+import multiprocessing as mp
+if sys.platform == 'win32':
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
 
 import logging
 import math
@@ -169,6 +180,7 @@ class VectorizedEnvV2Wrapper:
     def __init__(self, config: Config, n_envs: int = 4, learned_reward_model: Optional[Any] = None):
         self.config = config
         self.n_envs = n_envs
+        self._executor = ThreadPoolExecutor(max_workers=n_envs)  # Persistent thread pool
         self.envs: List[Optional[AudioEditingEnvV2]] = [None] * n_envs
         self.audio_states: List[Optional[AudioState]] = [None] * n_envs
         self.learned_reward_model = learned_reward_model
@@ -209,8 +221,7 @@ class VectorizedEnvV2Wrapper:
             return None, 0.0, False, False, {}
         
         # Parallel step using threads (GIL-friendly for I/O-bound env stepping)
-        with ThreadPoolExecutor(max_workers=len(self.envs)) as executor:
-            results = list(executor.map(step_env, zip(self.envs, actions)))
+        results = list(self._executor.map(step_env, zip(self.envs, actions)))
         
         next_obs_list = [r[0] for r in results]
         reward_list = [r[1] for r in results]
@@ -227,8 +238,7 @@ class VectorizedEnvV2Wrapper:
                 return env.get_action_mask()
             return np.ones(ActionSpaceV2.N_ACTIONS, dtype=bool)
         
-        with ThreadPoolExecutor(max_workers=len(self.envs)) as executor:
-            masks = list(executor.map(get_mask, self.envs))
+        masks = list(self._executor.map(get_mask, self.envs))
         return masks
     
     def reset_env(self, i: int) -> Tuple[np.ndarray, dict]:
@@ -419,7 +429,7 @@ class ParallelPPOTrainerV2:
                 except Exception as e:
                     logger.debug(f"Could not copy encoder to value net: {e}")
             
-            logger.info(f"✓ V1 weights loaded for transfer learning from {v1_checkpoint_path}")
+            logger.info(f"âœ“ V1 weights loaded for transfer learning from {v1_checkpoint_path}")
             return True
             
         except Exception as e:
@@ -598,7 +608,8 @@ class ParallelPPOTrainerV2:
                 action = actions_np[i]
                 if action in [ActionTypeV2.KEEP_BAR.value, ActionTypeV2.CUT_BAR.value,
                              ActionTypeV2.KEEP_PHRASE.value, ActionTypeV2.CUT_PHRASE.value,
-                             ActionTypeV2.LOOP_BAR_2X.value]:
+                             ActionTypeV2.LOOP_BAR.value, ActionTypeV2.LOOP_PHRASE.value,
+                             ActionTypeV2.REORDER_BAR.value, ActionTypeV2.REORDER_PHRASE.value]:
                     section_decisions[i] += 1
             
             # Handle episode ends
@@ -986,8 +997,7 @@ def train_v2(
     logger.info(f"Steps per epoch: {steps_per_epoch}")
     logger.info(f"Target loss: {target_loss}")
     if use_subprocess:
-        logger.info(f"Parallelism: subprocess (true multiprocessing, ~4x faster rollouts)")
-        logger.info(f"Auxiliary tasks: computed in subprocess workers (no IPC overhead)")
+        logger.info(f"Parallelism: subprocess")
     else:
         logger.info(f"Parallelism: threading (GIL-bound, auxiliary tasks computed in main process)")
     
@@ -1015,7 +1025,7 @@ def train_v2(
         reward_integration = LearnedRewardIntegration(config)
         if reward_integration.load_model():
             learned_reward_model = reward_integration.model
-            logger.info("✓ Learned reward model loaded for RLHF training")
+            logger.info("âœ“ Learned reward model loaded for RLHF training")
         else:
             logger.warning("Could not load learned reward model - using dense rewards only")
             config.reward.use_learned_rewards = False
@@ -1045,26 +1055,27 @@ def train_v2(
     
     # Training loop
     start_time = time.time()
-    MAX_BEATS = 500  # Limit beats for tractable action space
+    MAX_BEATS = 2500  # Limit beats for tractable action space
+    logger.info(f"Max Beats per sample set to {MAX_BEATS} for V2 training")
     
     for epoch in range(start_epoch, n_epochs):
         epoch_start = time.time()
-        
+
         # Sample audio states for parallel environments
         audio_states = []
         for _ in range(n_envs):
             idx = np.random.randint(len(dataset))
             item = dataset[idx]
-            
+
             raw_data = item["raw"]
             beat_times = raw_data["beat_times"].numpy()
             beat_features = raw_data["beat_features"].numpy()
-            
+
             # Get ground truth edit labels
             edit_labels = item.get("edit_labels")
             if edit_labels is not None:
                 edit_labels = edit_labels.numpy() if hasattr(edit_labels, 'numpy') else np.array(edit_labels)
-            
+
             # Limit to MAX_BEATS
             if len(beat_times) > MAX_BEATS:
                 start_idx = np.random.randint(0, len(beat_times) - MAX_BEATS)
@@ -1073,7 +1084,7 @@ def train_v2(
                 if edit_labels is not None and len(edit_labels) > MAX_BEATS:
                     edit_labels = edit_labels[start_idx:start_idx + MAX_BEATS]
                 beat_times = beat_times - beat_times[0]
-            
+
             audio_state = AudioState(
                 beat_index=0,
                 beat_times=beat_times,
@@ -1082,28 +1093,28 @@ def train_v2(
                 target_labels=edit_labels,
             )
             audio_states.append(audio_state)
-        
+
         # Collect rollouts in parallel
         rollout_start = time.time()
-        rollout_data = trainer.collect_rollouts_parallel(audio_states, steps_per_epoch // n_envs)
+        rollout_data = trainer.collect_rollouts_parallel(audio_states, steps_per_epoch)
         rollout_time = time.time() - rollout_start
-        
+
         # Load V1 weights after first rollout (agent now initialized)
         if epoch == start_epoch and v1_checkpoint_path and trainer.agent is not None:
             if trainer.load_v1_weights(v1_checkpoint_path):
                 logger.info("✓ V1 weights loaded for transfer learning - encoder pretrained, policy head fresh")
-        
+
         # Update networks
         update_start = time.time()
         metrics = trainer.update(rollout_data)
         update_time = time.time() - update_start
-        
+
         # Step learning rate schedulers
         trainer.step_schedulers()
-        
+
         epoch_time = time.time() - epoch_start
         current_lr = trainer.get_current_lr()
-        
+
         # Log progress
         n_eps = metrics.get('n_episodes', 0)
         section_dec = metrics.get('section_decisions_per_ep', 0)
@@ -1117,26 +1128,26 @@ def train_v2(
             f"Steps: {trainer.global_step:,} | "
             f"Time: {epoch_time:.1f}s (R:{rollout_time:.1f}s U:{update_time:.1f}s)"
         )
-        
+
         # NOTE: No early stopping on loss - we want full training for RL
         # The policy loss converging doesn't mean the agent is good at editing!
         # What matters is the episode reward (audio quality metrics)
-        
+
         # Save checkpoint periodically
         if (epoch + 1) % 10 == 0:
             checkpoint_file = Path(config.training.save_dir) / f"checkpoint_v2_epoch_{epoch + 1}.pt"
             trainer.save_checkpoint(str(checkpoint_file))
-        
+
         # Save best model
         if metrics['episode_reward'] > trainer.best_reward:
             trainer.best_reward = metrics['episode_reward']
             best_file = Path(config.training.save_dir) / "checkpoint_v2_best.pt"
             trainer.save_checkpoint(str(best_file))
-    
+
     # Save final checkpoint
     final_file = Path(config.training.save_dir) / "checkpoint_v2_final.pt"
     trainer.save_checkpoint(str(final_file))
-    
+
     total_time = time.time() - start_time
     logger.info(f"V2 Training complete in {total_time/60:.1f} minutes")
     if 'metrics' in dir():
@@ -1204,3 +1215,6 @@ if __name__ == "__main__":
         target_loss=args.target_loss,
         use_subprocess=args.subprocess,
     )
+
+
+
