@@ -323,20 +323,79 @@ class AudioEditingEnvV2(gym.Env):
         
         estimated_output = n_kept + total_reordered + loop_extra # + total_jumped
         duration_ratio = estimated_output / n_beats
+        reward = 0.0
         
-        # STEP-LEVEL DURATION WARNING
-        # Give immediate negative signal when approaching/exceeding 90%
+        # STEP-LEVEL PENALTIES
+        # 1. Give negative signal when approaching/exceeding 90%
         if duration_ratio > 0.90:
-            # Already over limit - strong negative signal every step
-            return -5.0
+            # Already over limit - strong negative penalty every step
+            reward -= 2.0
         elif duration_ratio > 0.80:
-            # Warning zone - mild negative signal
-            return -1.0
+            # Warning zone - mild negative penalty
+            reward -= 0.8
         elif duration_ratio > 0.70:
-            # Approaching warning - very mild signal
-            return -0.2
-        
-        return 0.0
+            # Approaching warning - very mild penalty
+            reward -= 0.2
+    
+        # 2. Penalty for repeating the same action type too many times in a row
+        # If the last 3 actions (including current) are the same type, subtract 0.2
+        if len(self.episode_actions) >= 2:
+            last_two = self.episode_actions[-2:]
+            if all(a.action_type == action.action_type for a in last_two):
+                reward -= 0.2
+
+
+        # === INTERMEDIATE POSITIVE REWARDS ===
+        # 1. Bonus for cutting at phrase boundaries (every 8th beat)
+        if action.action_type in [ActionTypeV2.CUT_PHRASE, ActionTypeV2.CUT_BAR, ActionTypeV2.CUT_BEAT]:
+            if action.beat_index % 8 == 0:
+                reward += 0.4  # Phrase boundary cut
+            elif action.beat_index % 4 == 0:
+                reward += 0.1  # Bar boundary cut
+        # 2. Bonus for using diverse actions (not repeating last action)
+        if len(self.episode_actions) > 1:
+            last_action = self.episode_actions[-1]
+            if action.action_type != last_action.action_type:
+                reward += 0.1
+        # 3. Bonus for explicit keep actions (encourage agent to keep good content)
+        if action.action_type in [ActionTypeV2.KEEP_BEAT, ActionTypeV2.KEEP_BAR, ActionTypeV2.KEEP_PHRASE]:
+            reward += 0.1
+        # 4. Bonus for hitting keep ratio target early in episode
+        keep_ratio = self.edit_history.get_keep_ratio()
+        target_keep = self.config.reward.target_keep_ratio if hasattr(self.config.reward, 'target_keep_ratio') else 0.35
+        if 0.25 < keep_ratio < target_keep:
+            reward += 0.1
+        # 5. Bonus for using transition markers sparingly
+        if action.action_type in [ActionTypeV2.MARK_SOFT_TRANSITION, ActionTypeV2.MARK_HARD_CUT]:
+            n_markers = sum(1 for a in self.episode_actions if a.action_type in [ActionTypeV2.MARK_SOFT_TRANSITION, ActionTypeV2.MARK_HARD_CUT])
+            if n_markers < 3:
+                reward += 0.1
+        # 6. Bonus for cutting when duration ratio is high but NOT if it's a good bar/phrase
+        if (
+            duration_ratio > 0.75
+            and action.action_type in [ActionTypeV2.CUT_BEAT, ActionTypeV2.CUT_BAR, ActionTypeV2.CUT_PHRASE]
+            and (action.beat_index % 8 != 0 and action.beat_index % 4 != 0)
+        ):
+            reward += 0.1
+        # 7. Reward for using a section action after several beat actions
+        # If the last 3 actions were beat-level and now a section action, add 0.2
+        if len(self.episode_actions) >= 3:
+            last_three = self.episode_actions[-3:]
+            beat_actions = [ActionTypeV2.KEEP_BEAT, ActionTypeV2.CUT_BEAT, ActionTypeV2.LOOP_BEAT, ActionTypeV2.REORDER_BEAT]
+            section_actions = [ActionTypeV2.KEEP_BAR, ActionTypeV2.KEEP_PHRASE, ActionTypeV2.CUT_BAR, ActionTypeV2.CUT_PHRASE, ActionTypeV2.LOOP_BAR, ActionTypeV2.LOOP_PHRASE, ActionTypeV2.REORDER_BAR, ActionTypeV2.REORDER_PHRASE]
+            if all(a.action_type in beat_actions for a in last_three) and action.action_type in section_actions:
+                reward += 0.1
+
+        # 8. Reward for KEEP_PHRASE at phrase boundary when duration ratio is low
+        # If action is KEEP_PHRASE at beat % 8 == 0 and duration_ratio < 0.5, add 0.2
+        if (
+            action.action_type == ActionTypeV2.KEEP_PHRASE
+            and action.beat_index % 8 == 0
+            and duration_ratio < 0.5
+        ):
+            reward += 0.1
+
+        return reward
     
     def _compute_episode_reward(self) -> float:
         """Compute episode reward based ONLY on audio quality.

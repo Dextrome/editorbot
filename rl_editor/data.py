@@ -120,6 +120,8 @@ class AudioDataset(Dataset):
             - path: File path
         """
         file_path = self.file_list[idx]
+        #import time
+        #t0 = time.perf_counter()
         
         # Check cache first
         if self.cache_dir:
@@ -134,7 +136,9 @@ class AudioDataset(Dataset):
             # Save to cache if enabled
             if self.cache_dir:
                 self._save_to_cache(file_path, data)
-                
+
+            #t1 = time.perf_counter()
+            #print(f"__getitem__({idx}) took {t1-t0:.4f}s")                
             return data
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}")
@@ -492,6 +496,9 @@ class PairedAudioDataset(Dataset):
             - pair_id: Identifier for the pair
             - is_reference: True if this is a reference track (not a true pair)
         """
+        #import time
+        #t0 = time.perf_counter()
+
         # Handle reference tracks (indexed after pairs)
         if idx >= len(self.pairs):
             ref_idx = idx - len(self.pairs)
@@ -544,7 +551,10 @@ class PairedAudioDataset(Dataset):
                 "edited_path": str(edited_path),
                 "is_reference": False,
             }
-                
+
+            #t1 = time.perf_counter()
+            #print(f"__getitem__({idx}) took {t1-t0:.4f}s")    
+
             return data
         except Exception as e:
             logger.error(f"Error processing pair {raw_path} / {edited_path}: {e}")

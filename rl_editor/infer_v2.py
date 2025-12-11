@@ -357,14 +357,14 @@ def create_edited_audio_v2(
     beat_durations_sec = np.diff(beat_times)
     print("Beat durations (seconds):", beat_durations_sec)
     print(f"Min: {beat_durations_sec.min():.4f}s, Max: {beat_durations_sec.max():.4f}s, Mean: {beat_durations_sec.mean():.4f}s, Std: {beat_durations_sec.std():.4f}s")
-    plt.figure(figsize=(10, 4))
-    plt.plot(beat_durations_sec, marker='o')
-    plt.title('Beat Durations (seconds)')
-    plt.xlabel('Beat Index')
-    plt.ylabel('Duration (s)')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    #plt.figure(figsize=(10, 4))
+    #plt.plot(beat_durations_sec, marker='o')
+    #plt.title('Beat Durations (seconds)')
+    #plt.xlabel('Beat Index')
+    #plt.ylabel('Duration (s)')
+    #plt.grid(True)
+    #plt.tight_layout()
+    #plt.show()
 
     return edited
 

@@ -63,8 +63,8 @@ class RewardConfig:
     use_learned_rewards: bool = False  # Disabled - needs real audio features to be useful
     use_trajectory_rewards: bool = True  # End-of-episode audio quality reward
     trajectory_reward_scale: float = 100.0  # Scale factor for trajectory rewards
-    step_reward_scale: float = 0.0  # ZERO step rewards in Monte Carlo mode
-    target_keep_ratio: float = 0.35  # Target ratio of beats to keep (~35%)
+    step_reward_scale: float = 0.05  # ZERO step rewards in Monte Carlo mode
+    target_keep_ratio: float = 0.45  # Target ratio of beats to keep (~35%)
     target_max_duration_s: float = 600.0  # 10 minutes max output duration
     duration_penalty_weight: float = 0.1  # Penalty multiplier for exceeding target (reduced from 0.5)
     max_loop_ratio: float = 0.12  # Max fraction of beats that should be looped (12%, reduced from 15%)
@@ -116,8 +116,8 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 2e-5  # Reduced for stability (was 3e-5)
-    lr_decay: bool = True  # Enable learning rate decay
+    learning_rate: float = 4e-5  # Reduced for stability (was 3e-5)
+    lr_decay: bool = False  # Enable learning rate decay
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
     lr_min_ratio: float = 0.5  # Decay from 2e-5 to 1e-5
     lr_warmup_epochs: int = 10  # Warmup epochs before decay starts
@@ -126,19 +126,19 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.1  # Tighter clipping for stability (was 0.2)
-    target_kl: float = 0.02  # Target KL divergence for early stopping (increased from 0.01)
-    entropy_coeff: float = 0.25  # Increased for more exploration (was 0.15)
+    clip_ratio: float = 0.2 # PPO clipping ratio
+    target_kl: float = 0.05  # Target KL divergence for early stopping (increased from 0.01)
+    entropy_coeff: float = 0.5  # Increased for more exploration (was 0.15)
     entropy_coeff_decay: bool = True  # Decay entropy over training
     entropy_coeff_min: float = 0.05  # Minimum entropy coefficient (increased)
-    value_loss_coeff: float = 0.125  # Reduced 75% to balance with policy/aux loss
+    value_loss_coeff: float = 0.2  # Reduced to balance with policy/aux loss
     max_grad_norm: float = 0.5  # Standard grad clipping
-    n_epochs: int = 3  # PPO epochs per update
-    batch_size: int = 512  # Larger batch for better GPU utilization (was 128)
-    n_steps: int = 2048
-    n_workers: int = 8  # More workers for parallel data loading (was 4)
+    n_epochs: int = 2  # PPO epochs per update
+    batch_size: int = 1024  # Larger batch for better GPU utilization (was 128)
+    n_steps: int = 512
+    n_workers: int = 16  # More workers for parallel data loading (was 4)
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 2  # Reduced since batch is larger
+    gradient_accumulation_steps: int = 3  # Reduced since batch is larger
     use_mixed_precision: bool = False  # Disabled - value losses ~2000+ cause FP16 overflow
 
 
@@ -205,7 +205,7 @@ class AugmentationCfg:
     """Data augmentation configuration."""
     
     # Master switch
-    enabled: bool = True
+    enabled: bool = False
     
     # Pitch shifting
     pitch_shift_enabled: bool = True
@@ -214,7 +214,7 @@ class AugmentationCfg:
     pitch_shift_prob: float = 0.5
     
     # Time stretching
-    time_stretch_enabled: bool = True
+    time_stretch_enabled: bool = False
     time_stretch_min: float = 0.9  # rate multiplier
     time_stretch_max: float = 1.1
     time_stretch_prob: float = 0.5
@@ -238,7 +238,7 @@ class AugmentationCfg:
     eq_prob: float = 0.3
     
     # Overall probability and limits
-    augment_prob: float = 0.8
+    augment_prob: float = 0.65
     max_augments: int = 3
 
 
