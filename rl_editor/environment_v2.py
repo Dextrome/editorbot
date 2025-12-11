@@ -418,7 +418,6 @@ class AudioEditingEnvV2(gym.Env):
         n_kept = len(self.edit_history.kept_beats)
         n_cut = len(self.edit_history.cut_beats)
         n_edited = n_kept + n_cut
-        
         # EXPLOIT FIX: Count looped beats as implicit keeps
         # Looping a beat without keeping it is still keeping content
         looped_beat_indices = set(self.edit_history.looped_beats.keys()) if self.edit_history.looped_beats else set()
@@ -457,14 +456,14 @@ class AudioEditingEnvV2(gym.Env):
         if cut_ratio < target_cut_ratio:
             cut_deficit = target_cut_ratio - cut_ratio  # 0 to 0.30
             # Quadratic penalty: small violations = small penalty, large = big
-            penalties["cut_deficit"] = -(cut_deficit / target_cut_ratio) ** 2 * 40.0
+            penalties["cut_deficit"] = -(cut_deficit / target_cut_ratio) ** 2 * 20.0
         else:
             penalties["cut_deficit"] = 0.0
         
         # Penalty 2: EXCESSIVE CUTS - Don't cut more than 80%
         if cut_ratio > 0.80:
             excess_cuts = cut_ratio - 0.80  # 0 to 0.20
-            penalties["excess_cuts"] = -(excess_cuts / 0.20) ** 2 * 30.0
+            penalties["excess_cuts"] = -(excess_cuts / 0.20) ** 2 * 15.0
         else:
             penalties["excess_cuts"] = 0.0
         
@@ -474,7 +473,7 @@ class AudioEditingEnvV2(gym.Env):
         if n_loops > max_loops:
             excess_loops = n_loops - max_loops
             # -3 points per excess loop (was -5), capped at -20 (was -30)
-            penalties["excess_loops"] = -min(excess_loops * 3.0, 20.0)
+            penalties["excess_loops"] = -min(excess_loops * 3.0, 10.0)
         else:
             penalties["excess_loops"] = 0.0
         
@@ -490,11 +489,11 @@ class AudioEditingEnvV2(gym.Env):
         if jump_ratio > 0.30:
             # Spam territory - moderate penalty
             excess_jump_ratio = jump_ratio - 0.30  # 0 to 0.70
-            penalties["excess_jumps"] = -(excess_jump_ratio / 0.30) ** 2 * 20.0  # up to -20 (was -35)
+            penalties["excess_jumps"] = -(excess_jump_ratio / 0.30) ** 2 * 15.0  # up to -20 (was -35)
         elif jump_ratio > 0.25:
             # Slightly over budget
             excess_jump_ratio = jump_ratio - 0.25  # 0 to 0.05
-            penalties["excess_jumps"] = -(excess_jump_ratio / 0.05) * 5.0  # up to -5 (was -10)
+            penalties["excess_jumps"] = -(excess_jump_ratio / 0.05) * 4.0  # up to -5 (was -10)
         else:
             penalties["excess_jumps"] = 0.0
         
@@ -508,9 +507,9 @@ class AudioEditingEnvV2(gym.Env):
         if n_unique_actions <= 2:
             penalties["low_diversity"] = -15.0  # Only 1-2 action types = bad (was -25)
         elif n_unique_actions == 3:
-            penalties["low_diversity"] = -8.0   # 3 types = could be better (was -15)
+            penalties["low_diversity"] = -6.0   # 3 types = could be better (was -15)
         elif n_unique_actions == 4:
-            penalties["low_diversity"] = -2.0   # 4 types = acceptable (was -5)
+            penalties["low_diversity"] = -1.0   # 4 types = acceptable (was -5)
         else:
             penalties["low_diversity"] = 0.0    # 5+ types = good
         
@@ -539,11 +538,11 @@ class AudioEditingEnvV2(gym.Env):
                     cv = gap_std / avg_gap
                     # CV > 1.5 means very uneven (bunched cuts)
                     if cv > 2.0:
-                        penalties["bunched_cuts"] = -15.0
+                        penalties["bunched_cuts"] = -14.0
                     elif cv > 1.5:
-                        penalties["bunched_cuts"] = -8.0
+                        penalties["bunched_cuts"] = -7.0
                     elif cv > 1.0:
-                        penalties["bunched_cuts"] = -3.0
+                        penalties["bunched_cuts"] = -2.0
                     else:
                         penalties["bunched_cuts"] = 0.0
                 else:
@@ -558,9 +557,9 @@ class AudioEditingEnvV2(gym.Env):
         max_beat_processed = max(self.edit_history.kept_beats | self.edit_history.cut_beats) if (self.edit_history.kept_beats or self.edit_history.cut_beats) else 0
         coverage_ratio = max_beat_processed / n_beats if n_beats > 0 else 0.0
         if coverage_ratio < 0.50:
-            penalties["low_coverage"] = -30.0 * (1.0 - coverage_ratio / 0.50)  # up to -30
+            penalties["low_coverage"] = -20.0 * (1.0 - coverage_ratio / 0.50)  # up to -30
         elif coverage_ratio < 0.80:
-            penalties["low_coverage"] = -10.0 * (1.0 - coverage_ratio / 0.80)  # up to -10
+            penalties["low_coverage"] = -5.0 * (1.0 - coverage_ratio / 0.80)  # up to -10
         else:
             penalties["low_coverage"] = 0.0
         
@@ -569,9 +568,9 @@ class AudioEditingEnvV2(gym.Env):
             most_common_action, most_common_count = action_types_used.most_common(1)[0]
             dominant_ratio = most_common_count / n_actions if n_actions > 0 else 0.0
             if dominant_ratio > 0.60:
-                penalties["dominant_action"] = -25.0 * ((dominant_ratio - 0.60) / 0.40)  # up to -25
+                penalties["dominant_action"] = -10.0 * ((dominant_ratio - 0.60) / 0.40)  # up to -25
             elif dominant_ratio > 0.50:
-                penalties["dominant_action"] = -10.0 * ((dominant_ratio - 0.50) / 0.10)  # up to -10
+                penalties["dominant_action"] = -5.0 * ((dominant_ratio - 0.50) / 0.10)  # up to -10
             else:
                 penalties["dominant_action"] = 0.0
         else:
@@ -600,9 +599,9 @@ class AudioEditingEnvV2(gym.Env):
             ratio_diff = abs(section_keep_ratio - section_cut_ratio)
             # If difference > 0.5, model is gaming (e.g., section keeps but beat cuts)
             if ratio_diff > 0.6:
-                penalties["section_imbalance"] = -20.0
+                penalties["section_imbalance"] = -8.0
             elif ratio_diff > 0.4:
-                penalties["section_imbalance"] = -10.0
+                penalties["section_imbalance"] = -4.0
             else:
                 penalties["section_imbalance"] = 0.0
         else:
@@ -692,30 +691,30 @@ class AudioEditingEnvV2(gym.Env):
         # This overrides ALL other rewards - model cannot ignore this
         if duration_ratio > 0.90:
             excess = duration_ratio - 0.90  # 0 to 0.10+
-            # MASSIVE penalty: -150 base, scaling up to -300 for 100% duration
+            # MASSIVE penalty: -50 base, scaling up to -200 for 100% duration
             # This ensures ANY positive rewards are wiped out
-            penalties["excess_duration"] = -150.0 - (excess / 0.10) * 150.0
+            penalties["excess_duration"] = -50.0 - (excess / 0.10) * 150.0
             self.episode_reward_breakdown["duration_violation"] = True
             logger.debug(f"DURATION VIOLATION: {duration_ratio:.1%} > 90% | penalty: {penalties['excess_duration']:.1f}")
         elif duration_ratio > 0.75:
             # Strong warning zone: 75-90% - significant penalty
             excess = duration_ratio - 0.75  # 0 to 0.15
-            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 80.0  # up to -80
+            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 40.0  # up to -50
         elif duration_ratio > 0.60:
             # Soft penalty zone: 60-75% - moderate penalty
             excess = duration_ratio - 0.60  # 0 to 0.15
-            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 30.0  # up to -30
+            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 10.0  # up to -10
         elif duration_ratio > 0.40:
             # Sweet spot: 40-60% - bonus!
             closeness = 1.0 - abs(duration_ratio - 0.50) / 0.10
-            penalties["excess_duration"] = max(0, closeness * 15.0)  # up to +15
+            penalties["excess_duration"] = max(0, closeness * 30.0)  # up to +30
         elif duration_ratio > 0.25:
             # Acceptable: 25-40% - neutral
             penalties["excess_duration"] = 0.0
         else:
             # Too aggressive: <25% - penalty for cutting too much
             shortage = 0.25 - duration_ratio  # 0 to 0.25
-            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 40.0  # up to -40
+            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 30.0  # up to -30
         
         # Target: 25-45% keep ratio (centered on 35%)
         target_ratio = self.config.reward.target_keep_ratio  # 0.35
@@ -772,6 +771,12 @@ class AudioEditingEnvV2(gym.Env):
         # But good loops (repeating high-energy sections) should be rewarded
         loop_bonus = self._compute_loop_usage_bonus()
         components["loop_bonus"] = loop_bonus * 10.0
+
+        # Component 10: Section Coherence Bonus (10 points max)
+        components["structural_symmetry"] = self._compute_structural_symmetry() * 10.0  # up to 10 points
+
+        # Component 11: Novelty Bonus (10 points max)
+        components["novelty"] = self._compute_novelty_score() * 10.0  # up to 10 points
         
         # === COMPUTE FINAL REWARD ===
         base_reward = sum(components.values())
@@ -789,6 +794,64 @@ class AudioEditingEnvV2(gym.Env):
         logger.debug(f"Episode reward: {total_reward:.2f} | cut_ratio: {cut_ratio:.2%} | penalties: {penalties}")
         
         return total_reward
+    
+    
+    def _compute_novelty_score(self) -> float:
+        # Compare kept output to original input using beat features
+        kept = sorted(self.edit_history.kept_beats)
+        features = self.audio_state.beat_features
+        if not kept or features is None:
+            return 0.0
+        # Get features for kept beats (output)
+        output_feats = np.array([features[b] for b in kept if b < len(features)])
+        # Get features for original sequence (input)
+        input_feats = np.array(features)
+        # Compute mean feature for output and input
+        output_mean = np.mean(output_feats, axis=0)
+        input_mean = np.mean(input_feats, axis=0)
+        # Novelty = normalized distance between output and input means
+        novelty = np.linalg.norm(output_mean - input_mean) / (np.linalg.norm(input_mean) + 1e-6)
+        # Bell curve: reward moderate novelty, penalize too much
+        # Centered at 0.3, width 0.2
+        reward = np.exp(-((novelty - 0.3) ** 2) / (2 * 0.2 ** 2))
+        return float(reward)
+    
+    def _compute_structural_symmetry(self) -> float:
+        # Example: treat every 8 beats as a section
+        kept = sorted(self.edit_history.kept_beats)
+        if not kept:
+            return 0.0
+        
+        # Find kept sections (groups of consecutive kept beats)
+        sections = []
+        current_section = []
+        for b in kept:
+            if not current_section or b == current_section[-1] + 1:
+                current_section.append(b)
+            else:
+                sections.append(current_section)
+                current_section = [b]
+        if current_section:
+            sections.append(current_section)
+        # Intro: first section, Outro: last section
+        intro_len = len(sections[0]) if sections else 0
+        outro_len = len(sections[-1]) if len(sections) > 1 else 0
+        # Reward if intro/outro similar
+        if intro_len > 0 and outro_len > 0:
+            symmetry = 1.0 - abs(intro_len - outro_len) / max(intro_len, outro_len)
+        else:
+            symmetry = 0.0
+        # Bonus for repeated section lengths
+        section_lengths = [len(s) for s in sections]
+        if len(section_lengths) > 2:
+            mean_len = np.mean(section_lengths)
+            std_len = np.std(section_lengths)
+            regularity = 1.0 - min(1.0, std_len / (mean_len + 1e-6))
+        else:
+            regularity = 0.0
+        # Combine
+        score = 0.6 * symmetry + 0.4 * regularity
+        return max(0.0, min(1.0, score))
     
     def _compute_edited_energy_consistency(self) -> float:
         """Compute energy consistency of the edited audio output."""
