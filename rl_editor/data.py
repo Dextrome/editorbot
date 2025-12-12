@@ -511,33 +511,53 @@ class PairedAudioDataset(Dataset):
             # Apply same augmentation to both raw and edited to preserve labels
             apply_augment = self.use_augmentation and self.augmentor is not None
             
+            # Check for cached edit labels first
+            cached_labels = None
+            if self.feature_cache:
+                cached_labels = self.feature_cache.load_labels(raw_path, edited_path)
+            
+            # Track if timing-changing augmentations are enabled
+            needs_fresh_extraction = False
+            
             if apply_augment:
-                # Load raw audio for pair augmentation
-                y_raw, sr = load_audio(str(raw_path), sr=self.config.audio.sample_rate)
-                y_edited, _ = load_audio(str(edited_path), sr=self.config.audio.sample_rate)
+                # Check which augmentations will be applied
+                # pitch_shift and time_stretch change timing -> need fresh extraction
+                # noise, gain, eq do NOT change timing -> can use cached features
+                if hasattr(self.augmentor, 'config'):
+                    if self.augmentor.config.pitch_shift_enabled:
+                        needs_fresh_extraction = True
+                    if self.augmentor.config.time_stretch_enabled:
+                        needs_fresh_extraction = True
                 
-                # Apply same augmentation to both
-                y_raw_aug, y_edited_aug, aug_info = self.augmentor.augment_pair(
-                    y_raw, y_edited, return_info=True
-                )
-                
-                # Now process the augmented audio
-                raw_data = self._process_audio_array(y_raw_aug, sr)
-                edited_data = self._process_audio_array(y_edited_aug, sr)
+                if needs_fresh_extraction:
+                    # Load raw audio for pair augmentation (slow path)
+                    y_raw, sr = load_audio(str(raw_path), sr=self.config.audio.sample_rate)
+                    y_edited, _ = load_audio(str(edited_path), sr=self.config.audio.sample_rate)
+                    
+                    # Apply same augmentation to both
+                    y_raw_aug, y_edited_aug, aug_info = self.augmentor.augment_pair(
+                        y_raw, y_edited, return_info=True
+                    )
+                    
+                    # Now process the augmented audio (expensive!)
+                    raw_data = self._process_audio_array(y_raw_aug, sr)
+                    edited_data = self._process_audio_array(y_edited_aug, sr)
+                else:
+                    # Fast path: use cached features (timing unchanged)
+                    # Augmentations like noise/gain/EQ don't affect beat timing
+                    raw_data = self._process_file(raw_path)
+                    edited_data = self._process_file(edited_path)
             else:
-                # Check for cached edit labels first
-                cached_labels = None
-                if self.feature_cache:
-                    cached_labels = self.feature_cache.load_labels(raw_path, edited_path)
-                
                 raw_data = self._process_file(raw_path)
                 edited_data = self._process_file(edited_path)
             
             # Infer edit labels (use cached if available)
-            if apply_augment or cached_labels is None:
+            # Only re-infer if timing changed (needs_fresh_extraction) or no cache
+            needs_label_reinfer = (apply_augment and needs_fresh_extraction) or cached_labels is None
+            if needs_label_reinfer:
                 edit_labels = self._infer_edit_labels(raw_data, edited_data)
-                # Cache the labels for next time
-                if not apply_augment and self.feature_cache:
+                # Cache the labels for next time (only if no timing augmentation)
+                if cached_labels is None and self.feature_cache:
                     self.feature_cache.save_labels(raw_path, edited_path, edit_labels)
             else:
                 edit_labels = cached_labels

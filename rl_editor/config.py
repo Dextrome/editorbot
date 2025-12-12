@@ -8,6 +8,13 @@ from dataclasses import dataclass, field
 from typing import Dict, Any
 
 
+# Stub for backwards compatibility with old checkpoints
+@dataclass
+class ActionSpaceConfig:
+    """Legacy action space config - kept for checkpoint compatibility."""
+    pass
+
+
 @dataclass
 class AudioConfig:
     """Audio processing configuration."""
@@ -106,18 +113,18 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.5 # PPO clipping ratio (default 0.2, increased for more exploration)
-    target_kl: float = 0.05  # Target KL divergence for early stopping (increased from 0.01)
-    entropy_coeff: float = 0.75  # Increased for more exploration (was 0.15)
-    entropy_coeff_decay: bool = False  # Decay entropy over training
-    entropy_coeff_min: float = 0.25  # Minimum entropy coefficient (increased)
+    clip_ratio: float = 0.3  # PPO clipping ratio (0.2-0.3 is standard, was 0.5)
+    target_kl: float = 0.03  # Target KL divergence for early stopping
+    entropy_coeff: float = 0.3  # Start moderate, decay over time (was 0.75 - too high!)
+    entropy_coeff_decay: bool = True  # ENABLED: decay entropy to allow convergence
+    entropy_coeff_min: float = 0.05  # Decay to low value for fine-tuning
     value_loss_coeff: float = 0.05  # Reduced to balance with policy/aux loss
     max_grad_norm: float = 0.5  # Standard grad clipping
     n_epochs: int = 4  # PPO epochs per update
-    batch_size: int = 1024  # Larger batch for better GPU utilization (was 128)
+    batch_size: int = 2048  # Larger batch for better GPU utilization (was 128)
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 4  # Reduced since batch is larger
-    use_mixed_precision: bool = False  # Disabled - value losses ~2000+ cause FP16 overflow
+    gradient_accumulation_steps: int = 2  # Reduced since batch is larger
+    use_mixed_precision: bool = True  # Enabled - returns are clipped to prevent FP16 overflow
 
 
 @dataclass
@@ -129,6 +136,7 @@ class TrainingConfig:
     log_dir: str = "./logs"
     use_tensorboard: bool = True
     use_wandb: bool = False
+    wandb_project: str = "rl-audio-editor"
 
 
 @dataclass
@@ -142,18 +150,24 @@ class FeatureExtractionConfig:
 
 @dataclass
 class AugmentationCfg:
-    """Data augmentation configuration."""
+    """Data augmentation configuration.
+    
+    NOTE: pitch_shift and time_stretch are DISABLED by default because they
+    change audio timing, which invalidates cached features and requires
+    expensive re-extraction (~5-15s per file). Keep them disabled for fast
+    training. Noise/gain/EQ are safe and fast.
+    """
     
     # Master switch
-    enabled: bool = False
+    enabled: bool = True  # Enable fast augmentations (noise, gain, EQ)
     
-    # Pitch shifting
-    pitch_shift_enabled: bool = True
+    # Pitch shifting - DISABLED (too slow, requires feature re-extraction)
+    pitch_shift_enabled: bool = False
     pitch_shift_min: float = -2.0  # semitones
     pitch_shift_max: float = 2.0
     pitch_shift_prob: float = 0.5
     
-    # Time stretching
+    # Time stretching - DISABLED (too slow, requires feature re-extraction)
     time_stretch_enabled: bool = False
     time_stretch_min: float = 0.9  # rate multiplier
     time_stretch_max: float = 1.1

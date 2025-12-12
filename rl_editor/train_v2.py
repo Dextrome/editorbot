@@ -1204,8 +1204,7 @@ def train_v2(
             f"Reward: {metrics['episode_reward']:.2f} (eps: {n_eps}) | "
             f"SectionDec: {section_dec:.1f} | "
             f"LR: {current_lr:.2e} | "
-            #f"Steps: {trainer.global_step:,} | "
-            f"Time: {epoch_time:.1f}s" # (R:{rollout_time:.1f}s U:{update_time:.1f}s)"
+            f"Time: {epoch_time:.1f}s (D:{data_sample_time:.1f}s R:{rollout_time:.1f}s U:{update_time:.1f}s)"
         )
 
         # logger.info(
