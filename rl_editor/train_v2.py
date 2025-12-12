@@ -519,6 +519,9 @@ class ParallelPPOTrainerV2:
         episode_rewards = [0.0] * len(obs_list)
         episode_lengths = [0] * len(obs_list)
         section_decisions = [0] * len(obs_list)
+
+        # --- For reward breakdown aggregation ---
+        self._episode_reward_breakdowns = []
         
         # V2: Higher exploration to prevent premature convergence
         # Slower decay - stays high longer
@@ -625,7 +628,12 @@ class ParallelPPOTrainerV2:
                     self.episode_rewards.append(episode_rewards[i])
                     self.episode_lengths.append(episode_lengths[i])
                     self.buffer.section_decisions.append(section_decisions[i])
-                    
+
+                    # --- Aggregate reward breakdown if present ---
+                    info = infos[i]
+                    if info is not None and "reward_breakdown" in info:
+                        self._episode_reward_breakdowns.append(info["reward_breakdown"])
+
                     # Log V2 episode info
                     logger.debug(
                         f"V2 Episode complete: len={episode_lengths[i]}, "
@@ -686,6 +694,8 @@ class ParallelPPOTrainerV2:
             "log_probs": log_probs_arr,
             "masks": self.buffer.masks,
             "dones": np.array(self.buffer.dones),
+            # Pass breakdowns for aggregation in update
+            "episode_reward_breakdowns": self._episode_reward_breakdowns,
         }
     
     def update(self, rollout_data: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -880,6 +890,15 @@ class ParallelPPOTrainerV2:
         # Compute mean auxiliary losses
         mean_aux_loss = np.mean(auxiliary_losses) if auxiliary_losses else 0.0
         
+
+
+        # --- Aggregate episode reward breakdowns (penalties and positive rewards) ---
+        breakdowns = rollout_data.get("episode_reward_breakdowns", [])
+        all_keys = set()
+        if breakdowns:
+            for bd in breakdowns:
+                all_keys.update(bd.keys())
+
         metrics = {
             "policy_loss": np.mean(policy_losses),
             "value_loss": ppo_config.value_loss_coeff * np.mean(value_losses),
@@ -891,7 +910,14 @@ class ParallelPPOTrainerV2:
             "n_episodes": len(self.episode_rewards),
             "section_decisions_per_ep": np.mean(self.buffer.section_decisions) if self.buffer.section_decisions else 0.0,
         }
-        
+
+        # Add breakdowns to metrics
+        if breakdowns:
+            for k in all_keys:
+                vals = [bd[k] for bd in breakdowns if k in bd and isinstance(bd[k], (int, float, np.floating, np.integer))]
+                if vals:
+                    metrics[f"breakdown_{k}"] = float(np.mean(vals))
+
         # Add auxiliary loss breakdown
         for k, v_list in aux_loss_breakdown.items():
             if v_list:
@@ -1136,6 +1162,10 @@ def train_v2(
         rollout_data = trainer.collect_rollouts_parallel(audio_states, steps_per_epoch)
         rollout_time = time.time() - rollout_start
 
+        # Load Checkpoint at start of training (agent now initialized)
+        if epoch == start_epoch and checkpoint_path and trainer.agent is None:
+            trainer.load_checkpoint(checkpoint_path)
+
         # Load Checkpoint after first rollout (agent now initialized)
         if epoch == start_epoch and v1_checkpoint_path and trainer.agent is not None:
             if trainer.load_v1_weights(v1_checkpoint_path):
@@ -1146,6 +1176,16 @@ def train_v2(
         metrics = trainer.update(rollout_data)
         update_time = time.time() - update_start
 
+
+        # === LOG DETAILED EPISODE REWARD BREAKDOWN ===
+        # Log all available breakdown keys (penalties and positive rewards) every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            breakdown_keys = [k for k in metrics.keys() if k.startswith("breakdown_")]
+            if breakdown_keys:
+                breakdown = [f"{k[10:]}: {metrics[k]:.2f}" for k in breakdown_keys]
+                logger.info("Reward breakdown: " + " | ".join(breakdown))
+            else:
+                logger.info("Reward breakdown: (not available in metrics)")
         # Step learning rate schedulers
         scheduler_start = time.time()
         trainer.step_schedulers()

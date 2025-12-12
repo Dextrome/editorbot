@@ -96,15 +96,15 @@ class RewardConfig:
 class ModelConfig:
     """Neural network model configuration."""
 
-    policy_hidden_dim: int = 256
-    policy_n_layers: int = 3
-    policy_dropout: float = 0.1
+    policy_hidden_dim: int = 512
+    policy_n_layers: int = 8
+    policy_dropout: float = 0.2
     
     # NATTEN Hybrid Encoder (local attention + global pooling)
-    natten_kernel_size: int = 31  # Local neighborhood size (odd number)
-    natten_n_heads: int = 4  # Number of attention heads
-    natten_n_layers: int = 2  # Number of NATTEN layers
-    natten_dilation: int = 1  # Dilation for sparse global context (1 = no dilation)
+    natten_kernel_size: int = 33  # Local neighborhood size (odd number)
+    natten_n_heads: int = 8  # Number of attention heads
+    natten_n_layers: int = 3  # Number of NATTEN layers
+    natten_dilation: int = 2  # Dilation for sparse global context (1 = no dilation)
     
     # Value network
     value_hidden_dim: int = 256
@@ -126,19 +126,19 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.2 # PPO clipping ratio
+    clip_ratio: float = 0.5 # PPO clipping ratio (default 0.2, increased for more exploration)
     target_kl: float = 0.05  # Target KL divergence for early stopping (increased from 0.01)
-    entropy_coeff: float = 0.5  # Increased for more exploration (was 0.15)
-    entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.05  # Minimum entropy coefficient (increased)
-    value_loss_coeff: float = 0.2  # Reduced to balance with policy/aux loss
+    entropy_coeff: float = 0.75  # Increased for more exploration (was 0.15)
+    entropy_coeff_decay: bool = False  # Decay entropy over training
+    entropy_coeff_min: float = 0.25  # Minimum entropy coefficient (increased)
+    value_loss_coeff: float = 0.05  # Reduced to balance with policy/aux loss
     max_grad_norm: float = 0.5  # Standard grad clipping
-    n_epochs: int = 2  # PPO epochs per update
+    n_epochs: int = 4  # PPO epochs per update
     batch_size: int = 1024  # Larger batch for better GPU utilization (was 128)
     n_steps: int = 512
     n_workers: int = 16  # More workers for parallel data loading (was 4)
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 3  # Reduced since batch is larger
+    gradient_accumulation_steps: int = 4  # Reduced since batch is larger
     use_mixed_precision: bool = False  # Disabled - value losses ~2000+ cause FP16 overflow
 
 

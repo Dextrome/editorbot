@@ -180,6 +180,7 @@ class AudioEditingEnvV2(gym.Env):
         # If episode ended, compute the big reward
         episode_reward = 0.0
         if terminated or truncated:
+            step_reward = 0.0  # No step reward on final step
             episode_reward = self._compute_episode_reward()
         
         # Total reward = minimal step reward + episode reward
@@ -329,10 +330,10 @@ class AudioEditingEnvV2(gym.Env):
         # 1. Give negative signal when approaching/exceeding 90%
         if duration_ratio > 0.90:
             # Already over limit - strong negative penalty every step
-            reward -= 2.0
+            reward -= 1.0
         elif duration_ratio > 0.80:
             # Warning zone - mild negative penalty
-            reward -= 0.8
+            reward -= 0.5
         elif duration_ratio > 0.70:
             # Approaching warning - very mild penalty
             reward -= 0.2
@@ -683,27 +684,31 @@ class AudioEditingEnvV2(gym.Env):
         # Output = kept beats + reordered beats + extra looped beats + jumped beats
         estimated_output_beats = n_kept + total_reordered_beats + loop_extra + total_jumped_beats
         duration_ratio = estimated_output_beats / n_beats if n_beats > 0 else 1.0
-        self.episode_reward_breakdown["duration_ratio"] = duration_ratio
-        self.episode_reward_breakdown["n_reordered"] = total_reordered_beats
-        self.episode_reward_breakdown["n_jumped"] = total_jumped_beats
+        #self.episode_reward_breakdown["duration_ratio"] = duration_ratio
+        #self.episode_reward_breakdown["n_reordered"] = total_reordered_beats
+        #self.episode_reward_breakdown["n_jumped"] = total_jumped_beats
         
         # HARD CONSTRAINT: >90% duration = episode failure
         # This overrides ALL other rewards - model cannot ignore this
         if duration_ratio > 0.90:
             excess = duration_ratio - 0.90  # 0 to 0.10+
-            # MASSIVE penalty: -50 base, scaling up to -200 for 100% duration
+            # MASSIVE penalty: -50 base, scaling up to -100 for 100% duration
             # This ensures ANY positive rewards are wiped out
-            penalties["excess_duration"] = -50.0 - (excess / 0.10) * 150.0
+            penalties["excess_duration"] = -40.0
             self.episode_reward_breakdown["duration_violation"] = True
             logger.debug(f"DURATION VIOLATION: {duration_ratio:.1%} > 90% | penalty: {penalties['excess_duration']:.1f}")
-        elif duration_ratio > 0.75:
-            # Strong warning zone: 75-90% - significant penalty
-            excess = duration_ratio - 0.75  # 0 to 0.15
-            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 40.0  # up to -50
+        elif duration_ratio > 0.80:
+            # Strong warning zone: 80-90% - significant penalty
+            excess = duration_ratio - 0.80  # 0 to 0.20
+            penalties["excess_duration"] = -15
+        elif duration_ratio > 0.70:
+            # Strong warning zone: 70-80% - significant penalty
+            excess = duration_ratio - 0.70  # 0 to 0.30
+            penalties["excess_duration"] = -7
         elif duration_ratio > 0.60:
             # Soft penalty zone: 60-75% - moderate penalty
             excess = duration_ratio - 0.60  # 0 to 0.15
-            penalties["excess_duration"] = -(excess / 0.15) ** 1.5 * 10.0  # up to -10
+            penalties["excess_duration"] = -3
         elif duration_ratio > 0.40:
             # Sweet spot: 40-60% - bonus!
             closeness = 1.0 - abs(duration_ratio - 0.50) / 0.10
@@ -714,7 +719,7 @@ class AudioEditingEnvV2(gym.Env):
         else:
             # Too aggressive: <25% - penalty for cutting too much
             shortage = 0.25 - duration_ratio  # 0 to 0.25
-            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 30.0  # up to -30
+            penalties["excess_duration"] = -(shortage / 0.25) ** 2 * 20.0  # up to -20
         
         # Target: 25-45% keep ratio (centered on 35%)
         target_ratio = self.config.reward.target_keep_ratio  # 0.35
@@ -722,20 +727,19 @@ class AudioEditingEnvV2(gym.Env):
         # === INDEPENDENT REWARD COMPONENTS ===
         # Each component is scored 0-1 and contributes additively
         # Total possible: 100 points, but practically ~60-80 is good
-        
         components = {}
         
-        # Component 1: Keep Ratio Score (25 points max)
+        # Component 1: Keep Ratio Score (40 points max)
         # Gaussian centered on target, with reasonable width
         ratio_deviation = abs(keep_ratio - target_ratio)
         # Score: 1.0 at target, 0.5 at ±0.15, ~0 at ±0.30
         ratio_score = np.exp(-(ratio_deviation ** 2) / (2 * 0.10 ** 2))
-        components["keep_ratio"] = ratio_score * 25.0
+        components["keep_ratio"] = ratio_score * 40.0
         
-        # Component 2: Audio Quality (20 points max)
+        # Component 2: Audio Quality (25 points max)
         audio_quality = self._compute_audio_quality_score()
         # Diminishing returns: sqrt to prevent exploitation
-        components["audio_quality"] = np.sqrt(audio_quality) * 20.0
+        components["audio_quality"] = np.sqrt(audio_quality) * 25.0
         
         # Component 3: Energy Consistency (15 points max)
         energy_score = self._compute_edited_energy_consistency()
@@ -744,21 +748,21 @@ class AudioEditingEnvV2(gym.Env):
         # Component 4: Cut Quality (20 points max)
         # Reward for cutting LOW quality beats, keeping HIGH quality
         cut_quality = self._compute_cut_quality()
-        components["cut_quality"] = np.sqrt(cut_quality) * 20.0
+        components["cut_quality"] = np.sqrt(cut_quality) * 30.0
         
-        # Component 5: Edit Structure (15 points max)
+        # Component 5: Edit Structure (20 points max)
         # Reward for having multiple kept sections (not one big chunk or scattered)
         structure_score = self._compute_edit_structure_score()
-        components["edit_structure"] = structure_score * 15.0
+        components["edit_structure"] = structure_score * 20.0
         
-        # Component 6: Phrase Alignment (15 points max)
+        # Component 6: Phrase Alignment (20 points max)
         phrase_score = self._compute_phrase_alignment()
-        components["phrase_alignment"] = phrase_score * 15.0
+        components["phrase_alignment"] = phrase_score * 20.0
         
         # Component 7: Action Diversity Bonus (5 points max)
         # Penalize using only one type of action (prevents section-only exploit)
         diversity_score = self._compute_action_diversity()
-        components["action_diversity"] = diversity_score * 5.0
+        components["action_diversity"] = diversity_score * 10.0
         
         # Component 8: Creative Reordering Bonus (20 points max)
         # REWARD for using jumps/loops that IMPROVE the edit quality
@@ -773,10 +777,10 @@ class AudioEditingEnvV2(gym.Env):
         components["loop_bonus"] = loop_bonus * 10.0
 
         # Component 10: Section Coherence Bonus (10 points max)
-        components["structural_symmetry"] = self._compute_structural_symmetry() * 10.0  # up to 10 points
+        components["structural_symmetry"] = self._compute_structural_symmetry() * 25.0  # up to 10 points
 
         # Component 11: Novelty Bonus (10 points max)
-        components["novelty"] = self._compute_novelty_score() * 10.0  # up to 10 points
+        components["novelty"] = self._compute_novelty_score() * 25.0  # up to 10 points
         
         # === COMPUTE FINAL REWARD ===
         base_reward = sum(components.values())
