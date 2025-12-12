@@ -4,6 +4,9 @@ Load a trained model and edit audio files.
 
 This script uses the same feature extraction as training to ensure
 the model receives consistent input dimensions.
+
+Note: V1-specific run_inference function still uses V1 environment.
+For V2 inference, use infer_v2.py instead.
 """
 
 import argparse
@@ -19,8 +22,6 @@ import soundfile as sf
 from rl_editor.config import get_default_config, Config
 from rl_editor.agent import Agent
 from rl_editor.state import AudioState
-from rl_editor.environment import AudioEditingEnv
-from rl_editor.actions import KeepAction, CutAction, LoopAction, ReorderAction
 
 # Import feature extraction components used by training
 try:

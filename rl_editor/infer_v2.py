@@ -20,8 +20,8 @@ from rl_editor.state import AudioState
 from rl_editor.environment_v2 import AudioEditingEnvV2
 from rl_editor.actions_v2 import ActionSpaceV2, ActionTypeV2
 
-# Import from original infer.py
-from rl_editor.infer import load_and_process_audio, apply_crossfade
+# Import utility functions
+from rl_editor.infer_utils import load_and_process_audio, apply_crossfade
 
 logging.basicConfig(
     level=logging.INFO,

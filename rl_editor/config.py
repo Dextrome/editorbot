@@ -1,6 +1,7 @@
 """Configuration module for RL-based audio editor.
 
 Uses dataclass Config pattern for all hyperparameters.
+Simplified for train_v2.py pipeline.
 """
 
 from dataclasses import dataclass, field
@@ -15,27 +16,6 @@ class AudioConfig:
     hop_length: int = 512
     n_mels: int = 128
     n_fft: int = 2048
-    fmin: float = 0.0
-    fmax: float | None = None
-
-
-@dataclass
-class ActionSpaceConfig:
-    """Action space configuration.
-    
-    Simplified action space:
-    - KEEP: Keep current beat (1 action)
-    - CUT: Cut current beat (1 action)  
-    - LOOP: Loop current beat 2x, 3x, or 4x (3 actions)
-    - REORDER: Move current beat to position +1, +2, +3, or +4 (4 actions)
-    
-    Total: 9 actions
-    
-    Crossfades are applied automatically at edit boundaries during rendering.
-    """
-
-    max_loop_times: int = 4  # Maximum loop repetitions (2x, 3x, 4x)
-    default_crossfade_ms: int = 50  # Auto-crossfade duration at edit boundaries (ms)
 
 
 @dataclass
@@ -135,8 +115,6 @@ class PPOConfig:
     max_grad_norm: float = 0.5  # Standard grad clipping
     n_epochs: int = 4  # PPO epochs per update
     batch_size: int = 1024  # Larger batch for better GPU utilization (was 128)
-    n_steps: int = 512
-    n_workers: int = 16  # More workers for parallel data loading (was 4)
     use_gradient_accumulation: bool = True
     gradient_accumulation_steps: int = 4  # Reduced since batch is larger
     use_mixed_precision: bool = False  # Disabled - value losses ~2000+ cause FP16 overflow
@@ -147,56 +125,18 @@ class TrainingConfig:
     """Overall training configuration."""
 
     device: str = "cuda"
-    seed: int = 42
-    total_timesteps: int = 1000000
-    checkpoint_interval: int = 10000
-    eval_interval: int = 5000
-    n_eval_episodes: int = 10
     save_dir: str = "./models"
     log_dir: str = "./logs"
     use_tensorboard: bool = True
     use_wandb: bool = False
-    wandb_project: str = "rl-audio-editor"
 
 
-@dataclass
 @dataclass
 class FeatureExtractionConfig:
     """Feature extraction configuration."""
     
     # Feature mode: "basic" (4 features), "enhanced" (60+ features), "full" (with stems)
     feature_mode: str = "full"
-    
-    # Basic spectral (always available)
-    use_onset_strength: bool = True
-    use_rms: bool = True
-    use_spectral_centroid: bool = True
-    use_zcr: bool = True
-    
-    # Extended spectral
-    use_spectral_rolloff: bool = True
-    use_spectral_bandwidth: bool = True
-    use_spectral_flatness: bool = True
-    use_spectral_contrast: bool = True
-    n_contrast_bands: int = 6
-    
-    # Timbral (MFCCs)
-    use_mfcc: bool = True
-    n_mfcc: int = 13
-    use_mfcc_delta: bool = True
-    
-    # Harmonic (Chroma)
-    use_chroma: bool = True
-    n_chroma: int = 12
-    
-    # Rhythmic
-    use_tempo_features: bool = True
-    use_beat_phase: bool = True
-    
-    # Temporal context
-    use_delta_features: bool = True
-    
-    # Stem features (requires Demucs, slow without cache)
     use_stem_features: bool = True
 
 
@@ -281,7 +221,6 @@ class Config:
     """Master configuration combining all sub-configs."""
 
     audio: AudioConfig = field(default_factory=AudioConfig)
-    action_space: ActionSpaceConfig = field(default_factory=ActionSpaceConfig)
     state: StateConfig = field(default_factory=StateConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -295,7 +234,6 @@ class Config:
         """Convert config to dictionary."""
         return {
             "audio": self.audio.__dict__,
-            "action_space": self.action_space.__dict__,
             "state": self.state.__dict__,
             "reward": self.reward.__dict__,
             "model": self.model.__dict__,
@@ -311,7 +249,6 @@ class Config:
         """Create config from dictionary."""
         return cls(
             audio=AudioConfig(**config_dict.get("audio", {})),
-            action_space=ActionSpaceConfig(**config_dict.get("action_space", {})),
             state=StateConfig(**config_dict.get("state", {})),
             reward=RewardConfig(**config_dict.get("reward", {})),
             model=ModelConfig(**config_dict.get("model", {})),
