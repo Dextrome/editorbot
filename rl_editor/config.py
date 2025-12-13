@@ -84,8 +84,8 @@ class ModelConfig:
     """Neural network model configuration."""
 
     policy_hidden_dim: int = 512
-    policy_n_layers: int = 8
-    policy_dropout: float = 0.2
+    policy_n_layers: int = 5
+    policy_dropout: float = 0.15
     
     # NATTEN Hybrid Encoder (local attention + global pooling)
     natten_kernel_size: int = 33  # Local neighborhood size (odd number)
@@ -94,8 +94,8 @@ class ModelConfig:
     natten_dilation: int = 2  # Dilation for sparse global context (1 = no dilation)
     
     # Value network
-    value_hidden_dim: int = 256
-    value_n_layers: int = 3
+    value_hidden_dim: int = 384
+    value_n_layers: int = 4
     value_dropout: float = 0.1
 
 
@@ -103,7 +103,7 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 4e-5  # Reduced for stability (was 3e-5)
+    learning_rate: float = 2e-5  # Lower LR for stability with high entropy
     lr_decay: bool = False  # Enable learning rate decay
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
     lr_min_ratio: float = 0.5  # Decay from 2e-5 to 1e-5
@@ -113,18 +113,18 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.3  # PPO clipping ratio (0.2-0.3 is standard, was 0.5)
-    target_kl: float = 0.03  # Target KL divergence for early stopping
-    entropy_coeff: float = 0.3  # Start moderate, decay over time (was 0.75 - too high!)
-    entropy_coeff_decay: bool = True  # ENABLED: decay entropy to allow convergence
-    entropy_coeff_min: float = 0.05  # Decay to low value for fine-tuning
-    value_loss_coeff: float = 0.05  # Reduced to balance with policy/aux loss
+    clip_ratio: float = 0.2  # PPO clipping ratio - tighter for stability
+    target_kl: float = 0.02  # Tighter KL target to prevent collapse
+    entropy_coeff: float = 0.3  # High entropy for exploration (decay to 0.05)
+    entropy_coeff_decay: bool = True  # Decay entropy over training
+    entropy_coeff_min: float = 0.05  # Higher floor to maintain exploration
+    value_loss_coeff: float = 0.5  # Standard value coeff (targets are normalized now)
     max_grad_norm: float = 0.5  # Standard grad clipping
-    n_epochs: int = 4  # PPO epochs per update
+    n_epochs: int = 6  # More PPO epochs for stable updates
     batch_size: int = 2048  # Larger batch for better GPU utilization (was 128)
     use_gradient_accumulation: bool = True
     gradient_accumulation_steps: int = 2  # Reduced since batch is larger
-    use_mixed_precision: bool = True  # Enabled - returns are clipped to prevent FP16 overflow
+    use_mixed_precision: bool = True  # Enabled with proper inf grad handling
 
 
 @dataclass

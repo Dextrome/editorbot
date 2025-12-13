@@ -248,39 +248,49 @@ class HybridNATTENEncoder(nn.Module):
         Returns:
             Encoded tensor (batch_size, hidden_dim) or (batch_size, seq_len, hidden_dim)
         """
-        # Handle 2D input (single position, no sequence)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)  # (B, 1, D)
-            squeeze_output = True
-        else:
-            squeeze_output = False
+        # Run encoder in FP32 to avoid mixed precision NaN issues
+        # NATTEN and attention computations are sensitive to FP16 overflow
+        with torch.amp.autocast('cuda', enabled=False):
+            # Convert to FP32 for encoder operations
+            original_dtype = x.dtype
+            x = x.float()
             
-        B, L, _ = x.shape
-        
-        # Project to hidden dimension
-        x = self.input_projection(x)  # (B, L, hidden_dim)
-        
-        # Apply NATTEN layers for local context
-        local_features = x
-        for layer in self.natten_layers:
-            local_features = layer(local_features)  # (B, L, hidden_dim)
-        
-        # Global pooling: mean over sequence dimension
-        global_summary = x.mean(dim=1, keepdim=True)  # (B, 1, hidden_dim)
-        global_summary = self.global_proj(global_summary)  # (B, 1, hidden_dim)
-        global_summary = global_summary.expand(-1, L, -1)  # (B, L, hidden_dim)
-        
-        # Combine local and global
-        combined = torch.cat([local_features, global_summary], dim=-1)  # (B, L, hidden_dim*2)
-        combined = self.combine_proj(combined)  # (B, L, hidden_dim)
-        
-        # Feed-forward + residual
-        out = combined + self.ffn(combined)
-        out = self.final_norm(out)
-        
-        if squeeze_output:
-            out = out.squeeze(1)  # (B, hidden_dim)
+            # Handle 2D input (single position, no sequence)
+            if x.dim() == 2:
+                x = x.unsqueeze(1)  # (B, 1, D)
+                squeeze_output = True
+            else:
+                squeeze_output = False
+                
+            B, L, _ = x.shape
             
+            # Project to hidden dimension
+            x = self.input_projection(x)  # (B, L, hidden_dim)
+            
+            # Apply NATTEN layers for local context
+            local_features = x
+            for layer in self.natten_layers:
+                local_features = layer(local_features)  # (B, L, hidden_dim)
+            
+            # Global pooling: mean over sequence dimension
+            global_summary = x.mean(dim=1, keepdim=True)  # (B, 1, hidden_dim)
+            global_summary = self.global_proj(global_summary)  # (B, 1, hidden_dim)
+            global_summary = global_summary.expand(-1, L, -1)  # (B, L, hidden_dim)
+            
+            # Combine local and global
+            combined = torch.cat([local_features, global_summary], dim=-1)  # (B, L, hidden_dim*2)
+            combined = self.combine_proj(combined)  # (B, L, hidden_dim)
+            
+            # Feed-forward + residual
+            out = combined + self.ffn(combined)
+            out = self.final_norm(out)
+            
+            if squeeze_output:
+                out = out.squeeze(1)  # (B, hidden_dim)
+            
+            # Clamp outputs to prevent extreme values
+            out = torch.clamp(out, -100.0, 100.0)
+                
         return out
 
 
@@ -590,6 +600,10 @@ class Agent:
             Values tensor (B,)
         """
         values = self.value_net(states)
+        # Cast to FP32 and handle NaN/Inf for numerical stability
+        values = values.float()
+        values = torch.nan_to_num(values, nan=0.0, posinf=100.0, neginf=-100.0)
+        values = torch.clamp(values, -100.0, 100.0)
         return values.squeeze(-1)
 
     def evaluate_actions(
@@ -610,10 +624,16 @@ class Agent:
         """
         logits = self.policy_net.get_logits(states)
         
-        # Handle NaN values in logits
-        if torch.isnan(logits).any():
-            logger.warning("NaN in logits during evaluate_actions, replacing with zeros")
-            logits = torch.nan_to_num(logits, nan=0.0)
+        # Cast to FP32 for stable distribution calculations (FP16 causes underflow in softmax/log)
+        logits = logits.float()
+        
+        # Handle NaN/Inf values in logits
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logger.warning("NaN/Inf in logits during evaluate_actions, replacing")
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Clamp logits to prevent extreme values
+        logits = torch.clamp(logits, -20.0, 20.0)
         
         # Add moderate noise to logits to prevent distribution from collapsing
         # This keeps exploration active even when policy becomes confident
@@ -628,6 +648,10 @@ class Agent:
         dist = torch.distributions.Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
+        
+        # Handle NaN in outputs (can happen with extreme probabilities)
+        log_probs = torch.nan_to_num(log_probs, nan=-5.0, posinf=0.0, neginf=-10.0)
+        entropy = torch.nan_to_num(entropy, nan=0.5, posinf=3.0, neginf=0.0)
         
         # Ensure minimum entropy to prevent policy collapse
         entropy = torch.clamp(entropy, min=min_entropy)

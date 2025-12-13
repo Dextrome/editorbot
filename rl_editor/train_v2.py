@@ -307,6 +307,9 @@ class ParallelPPOTrainerV2:
         # Target KL for early stopping
         self.target_kl = getattr(config.ppo, 'target_kl', 0.01)
 
+        # Pending checkpoint (loaded after agent initialization)
+        self._pending_checkpoint: Optional[Dict] = None
+
         # Reward normalization attributes
         self.reward_mean = 0.0
         self.reward_var = 1.0
@@ -373,75 +376,13 @@ class ParallelPPOTrainerV2:
         
         if self.policy_scheduler:
             logger.info(f"LR schedulers initialized for {self.total_epochs} epochs")
-    
-    def load_v1_weights(self, v1_checkpoint_path: str, strict_encoder: bool = True) -> bool:
-        """Load V1 weights for transfer learning.
         
-        The encoder (feature extraction) can transfer directly.
-        The value network can transfer directly.
-        The policy head must be reinitialized for the new action space.
-        
-        Args:
-            v1_checkpoint_path: Path to V1 checkpoint
-            strict_encoder: If True, fail if encoder weights don't match exactly
-            
-        Returns:
-            True if weights were loaded successfully
-        """
-        if not Path(v1_checkpoint_path).exists():
-            logger.warning(f"V1 checkpoint not found: {v1_checkpoint_path}")
-            return False
-        
-        try:
-            checkpoint = torch.load(v1_checkpoint_path, map_location=self.device, weights_only=False)
-            v1_policy_state = checkpoint.get("policy_state_dict", checkpoint.get("policy_net_state_dict"))
-            v1_value_state = checkpoint.get("value_state_dict", checkpoint.get("value_net_state_dict"))
-            
-            if v1_policy_state is None or v1_value_state is None:
-                logger.warning("V1 checkpoint missing policy or value state dict")
-                return False
-            
-            # Load encoder weights (should match)
-            encoder_keys = [k for k in v1_policy_state.keys() if 'encoder' in k]
-            encoder_state = {k: v for k, v in v1_policy_state.items() if 'encoder' in k}
-            
-            if encoder_state:
-                # Load encoder into policy network
-                missing, unexpected = self.agent.policy_net.load_state_dict(encoder_state, strict=False)
-                if strict_encoder and missing:
-                    missing_encoder = [k for k in missing if 'encoder' in k]
-                    if missing_encoder:
-                        logger.warning(f"Missing encoder keys: {missing_encoder}")
-                        return False
-                
-                logger.info(f"Loaded {len(encoder_state)} encoder weights from V1")
-            
-            # Load value network (should match exactly)
-            missing, unexpected = self.agent.value_net.load_state_dict(v1_value_state, strict=False)
-            if not missing:
-                logger.info("Value network weights loaded from V1")
-            else:
-                logger.warning(f"Value network partial load - missing: {len(missing)} keys")
-            
-            # Policy head is NOT loaded - it's reinitialized for V2 action space
-            logger.info("Policy head reinitialized for V2 action space (13 actions)")
-            
-            # Also copy encoder weights to value network if it has one
-            if hasattr(self.agent.value_net, 'encoder'):
-                value_encoder_state = {k.replace('encoder.', ''): v 
-                                       for k, v in encoder_state.items()}
-                try:
-                    self.agent.value_net.encoder.load_state_dict(value_encoder_state, strict=False)
-                    logger.info("Encoder weights also copied to value network")
-                except Exception as e:
-                    logger.debug(f"Could not copy encoder to value net: {e}")
-            
-            logger.info(f"V1 weights loaded for transfer learning from {v1_checkpoint_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to load V1 weights: {e}")
-            return False
+        # Load pending checkpoint if one was stored before agent init
+        if self._pending_checkpoint is not None:
+            logger.info("Loading deferred checkpoint weights...")
+            self._load_checkpoint_weights(self._pending_checkpoint)
+            self._pending_checkpoint = None  # Clear after loading
+            logger.info("✓ Checkpoint weights loaded successfully")
     
     def step_schedulers(self):
         """Step the learning rate schedulers after each epoch."""
@@ -655,10 +596,11 @@ class ParallelPPOTrainerV2:
         # === MONTE CARLO RETURNS ===
         # Pure episode returns - NO value function bootstrapping
         # This forces true multi-step credit assignment
+        # CRITICAL: normalize=False to preserve actual return scale for value learning
         returns, _ = compute_trajectory_return(
             self.buffer.rewards, 
             gamma=self.config.ppo.gamma,
-            normalize=True  # Don't normalize yet - do it after advantage computation
+            normalize=False  # Keep raw returns - value network needs to learn actual scale
         )
         
         # Convert to numpy arrays with NaN handling
@@ -673,22 +615,37 @@ class ParallelPPOTrainerV2:
         returns_arr = np.nan_to_num(returns_arr, nan=0.0, posinf=1e6, neginf=-1e6)
         log_probs_arr = np.nan_to_num(log_probs_arr, nan=-5.0, posinf=0.0, neginf=-10.0)
         
-        # === REWARD NORMALIZATION ===
-        normalized_returns = self.normalize_rewards(returns_arr)
-        # === MONTE CARLO ADVANTAGE ===
-        mean_return = normalized_returns.mean()
-        advantages = normalized_returns - mean_return
-        # Normalize advantages for stable gradients
+        # === VALUE TARGETS ===
+        # Normalize returns for value targets (value loss stays ~1.0 scale)
+        # This prevents huge value losses that dominate training
+        ret_mean = returns_arr.mean()
+        ret_std = returns_arr.std()
+        if ret_std < 1e-8 or np.isnan(ret_std):
+            ret_std = 1.0
+        value_targets = (returns_arr - ret_mean) / (ret_std + 1e-8)
+        value_targets = np.clip(value_targets, -10.0, 10.0)  # Clip normalized values
+        
+        # === ADVANTAGE COMPUTATION ===
+        # Advantages = raw returns - scaled value predictions
+        # Scale value predictions back to raw return scale for proper baseline subtraction
+        # Value predicts normalized returns, so we compute advantages in normalized space
+        # This is equivalent to: (R - mean) / std - V_normalized
+        values_normalized = values_arr  # Value network outputs normalized scale
+        advantages = value_targets - values_normalized  # Both in normalized space
+        
+        # Normalize advantages for stable policy gradients (mean=0, std=1)
+        adv_mean = advantages.mean()
         adv_std = advantages.std()
         if adv_std < 1e-8 or np.isnan(adv_std):
             adv_std = 1.0
-        advantages = advantages / (adv_std + 1e-8)
+        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
         advantages = np.nan_to_num(advantages, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         return {
             "states": states_arr,
             "actions": np.array(self.buffer.actions),
             "rewards": np.array(self.buffer.rewards),
-            "returns": normalized_returns,
+            "returns": value_targets,  # Use clamped returns as value targets
             "values": values_arr,
             "advantages": advantages,
             "log_probs": log_probs_arr,
@@ -771,57 +728,77 @@ class ParallelPPOTrainerV2:
                     # Forward pass
                     new_log_probs, entropy = self.agent.evaluate_actions(batch_states, batch_actions)
                     
-                    # Handle NaN in outputs
-                    if torch.isnan(new_log_probs).any():
-                        new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0)
-                    if torch.isnan(entropy).any():
-                        entropy = torch.nan_to_num(entropy, nan=0.0)
-                    
-                    # Compute ratio with clamping
-                    log_ratio = new_log_probs - batch_old_log_probs
-                    log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
-                    ratio = torch.exp(log_ratio)
-                    
-                    # Approximate KL divergence for early stopping
-                    with torch.no_grad():
-                        approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                # Cast back to FP32 for stable loss computation
+                new_log_probs = new_log_probs.float()
+                entropy = entropy.float()
+                batch_advantages = batch_advantages.float()
+                batch_returns = batch_returns.float()
+                batch_old_log_probs = batch_old_log_probs.float()
+                
+                # Handle NaN in outputs
+                if torch.isnan(new_log_probs).any() or torch.isinf(new_log_probs).any():
+                    new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0, posinf=-1.0, neginf=-10.0)
+                if torch.isnan(entropy).any() or torch.isinf(entropy).any():
+                    entropy = torch.nan_to_num(entropy, nan=0.5, posinf=3.0, neginf=0.0)
+                
+                # Compute ratio with clamping (in FP32)
+                log_ratio = new_log_probs - batch_old_log_probs
+                log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
+                ratio = torch.exp(log_ratio)
+                ratio = torch.clamp(ratio, 1e-6, 1e6)  # Prevent extreme ratios
+                
+                # Approximate KL divergence for early stopping
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                    if not np.isnan(approx_kl):
                         epoch_kl_divs.append(approx_kl)
-                    
-                    surr1 = ratio * batch_advantages
-                    surr2 = torch.clamp(ratio, 1 - ppo_config.clip_ratio, 1 + ppo_config.clip_ratio) * batch_advantages
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # Value loss
+                
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 1 - ppo_config.clip_ratio, 1 + ppo_config.clip_ratio) * batch_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # Value loss with FP16 forward, FP32 loss
+                with torch.amp.autocast('cuda', enabled=self.scaler.is_enabled()):
                     values = self.agent.compute_value_batch(batch_states)
-                    if torch.isnan(values).any():
-                        values = torch.nan_to_num(values, nan=0.0)
-                    value_loss = nn.functional.mse_loss(values, batch_returns)
-                    
-                    # Entropy bonus
-                    entropy_loss = -entropy.mean()
-                    current_entropy_coeff = self.get_current_entropy_coeff()
-                    
-                    # === AUXILIARY TASK LOSSES ===
-                    aux_loss = torch.tensor(0.0, device=self.device)
-                    if self.agent.auxiliary_module is not None and batch_aux_targets:
+                values = values.float()
+                values = torch.clamp(values, -100.0, 100.0)  # Clamp value predictions
+                if torch.isnan(values).any():
+                    values = torch.nan_to_num(values, nan=0.0)
+                value_loss = nn.functional.mse_loss(values, batch_returns)
+                value_loss = torch.clamp(value_loss, 0.0, 100.0)  # Prevent huge value loss
+                
+                # Entropy bonus
+                entropy_loss = -entropy.mean()
+                current_entropy_coeff = self.get_current_entropy_coeff()
+                
+                # === AUXILIARY TASK LOSSES ===
+                aux_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                if self.agent.auxiliary_module is not None and batch_aux_targets:
+                    with torch.amp.autocast('cuda', enabled=self.scaler.is_enabled()):
                         aux_loss, aux_breakdown = self.agent.compute_auxiliary_loss(
                             batch_states, 
                             batch_aux_targets,
                             epoch=self.current_epoch,
                         )
-                        # Track breakdown for logging
-                        for k, v in aux_breakdown.items():
-                            if k not in aux_loss_breakdown:
-                                aux_loss_breakdown[k] = []
-                            aux_loss_breakdown[k].append(v)
-                    
-                    # Combined loss: policy + value + entropy + auxiliary
-                    loss = (
-                        policy_loss 
-                        + ppo_config.value_loss_coeff * value_loss 
-                        + current_entropy_coeff * entropy_loss
-                        + aux_loss  # Auxiliary tasks add to total loss
-                    )
+                    aux_loss = aux_loss.float()
+                    # Clamp auxiliary loss for stability
+                    aux_loss = torch.clamp(aux_loss, 0.0, 10.0)
+                    # Track breakdown for logging
+                    for k, v in aux_breakdown.items():
+                        if k not in aux_loss_breakdown:
+                            aux_loss_breakdown[k] = []
+                        aux_loss_breakdown[k].append(v)
+                
+                # Clamp individual losses before combining
+                policy_loss = torch.clamp(policy_loss, -10.0, 10.0)
+                
+                # Combined loss (all in FP32)
+                loss = (
+                    policy_loss 
+                    + ppo_config.value_loss_coeff * value_loss 
+                    + current_entropy_coeff * entropy_loss
+                    + aux_loss
+                )
                 
                 # Final NaN check
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -842,6 +819,20 @@ class ParallelPPOTrainerV2:
                 self.scaler.unscale_(self.value_optimizer)
                 if self.auxiliary_optimizer is not None:
                     self.scaler.unscale_(self.auxiliary_optimizer)
+                
+                # Check for inf gradients (FP16 overflow) - skip this batch if found
+                def has_inf_grads(optimizer):
+                    for group in optimizer.param_groups:
+                        for p in group['params']:
+                            if p.grad is not None and (torch.isinf(p.grad).any() or torch.isnan(p.grad).any()):
+                                return True
+                    return False
+                
+                if has_inf_grads(self.policy_optimizer) or has_inf_grads(self.value_optimizer):
+                    # Scaler will handle this - just update and continue
+                    self.scaler.update()
+                    nan_batches_skipped += 1
+                    continue
                 
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.agent.policy_net.parameters(), ppo_config.max_grad_norm)
@@ -941,11 +932,21 @@ class ParallelPPOTrainerV2:
             for k, v_list in aux_loss_breakdown.items():
                 if v_list and k != "warmup_factor":
                     self.training_logger.log_scalar(f"aux/{k}", np.mean(v_list), self.global_step)
+            
+            # Log reward breakdown components to TensorBoard
+            for k in all_keys:
+                if f"breakdown_{k}" in metrics:
+                    self.training_logger.log_scalar(f"reward/{k}", metrics[f"breakdown_{k}"], self.global_step)
         
         return metrics
     
     def save_checkpoint(self, path: str):
         """Save training checkpoint."""
+        # Get auxiliary module state if it exists
+        auxiliary_module_state = None
+        if self.agent and self.agent.auxiliary_module is not None:
+            auxiliary_module_state = self.agent.auxiliary_module.state_dict()
+        
         checkpoint = {
             "version": "v2",  # Mark as V2 checkpoint
             "global_step": self.global_step,
@@ -953,6 +954,7 @@ class ParallelPPOTrainerV2:
             "current_epoch": self.current_epoch,
             "policy_state_dict": self.agent.policy_net.state_dict() if self.agent else None,
             "value_state_dict": self.agent.value_net.state_dict() if self.agent else None,
+            "auxiliary_module_state": auxiliary_module_state,  # Save auxiliary module weights
             "policy_optimizer": self.policy_optimizer.state_dict() if self.policy_optimizer else None,
             "value_optimizer": self.value_optimizer.state_dict() if self.value_optimizer else None,
             "policy_scheduler": self.policy_scheduler.state_dict() if self.policy_scheduler else None,
@@ -974,16 +976,43 @@ class ParallelPPOTrainerV2:
         if version != "v2":
             logger.warning(f"Loading V1 checkpoint into V2 trainer - use load_v1_weights for transfer learning")
         
+        # Always load training state (epoch, step, best_reward)
         self.global_step = checkpoint["global_step"]
         self.best_reward = checkpoint["best_reward"]
         self.current_epoch = checkpoint.get("current_epoch", 0)
         
-        if self.agent and checkpoint["policy_state_dict"]:
+        # If agent not initialized yet, store checkpoint for later
+        if self.agent is None:
+            logger.info(f"Agent not initialized - storing checkpoint for deferred loading")
+            self._pending_checkpoint = checkpoint
+            logger.info(f"Loaded training state from {path} (epoch {self.current_epoch}, best_reward={self.best_reward:.2f})")
+            logger.info(f"Model weights will be loaded after agent initialization")
+            return
+        
+        # Load model weights
+        self._load_checkpoint_weights(checkpoint)
+        logger.info(f"Loaded checkpoint from {path} (epoch {self.current_epoch}, best_reward={self.best_reward:.2f})")
+    
+    def _load_checkpoint_weights(self, checkpoint: Dict):
+        """Load model weights and optimizer states from checkpoint dict."""
+        if checkpoint.get("policy_state_dict"):
             self.agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
+            logger.info("Loaded policy network weights")
+        if checkpoint.get("value_state_dict"):
             self.agent.value_net.load_state_dict(checkpoint["value_state_dict"])
-        if self.policy_optimizer and checkpoint["policy_optimizer"]:
+            logger.info("Loaded value network weights")
+        
+        # Load auxiliary module weights
+        if self.agent.auxiliary_module is not None and checkpoint.get("auxiliary_module_state"):
+            self.agent.auxiliary_module.load_state_dict(checkpoint["auxiliary_module_state"])
+            logger.info("Loaded auxiliary module weights")
+            
+        if self.policy_optimizer and checkpoint.get("policy_optimizer"):
             self.policy_optimizer.load_state_dict(checkpoint["policy_optimizer"])
+            logger.info("Loaded policy optimizer state")
+        if self.value_optimizer and checkpoint.get("value_optimizer"):
             self.value_optimizer.load_state_dict(checkpoint["value_optimizer"])
+            logger.info("Loaded value optimizer state")
             
         if self.policy_scheduler and checkpoint.get("policy_scheduler"):
             self.policy_scheduler.load_state_dict(checkpoint["policy_scheduler"])
@@ -999,8 +1028,6 @@ class ParallelPPOTrainerV2:
                 self.scaler.load_state_dict(checkpoint["scaler"])
             except RuntimeError as e:
                 logger.warning(f"Could not load scaler state: {e} - using fresh scaler")
-        
-        logger.info(f"Loaded checkpoint from {path} (epoch {self.current_epoch}, best_reward={self.best_reward:.2f})")
 
 
 def train_v2(
@@ -1010,7 +1037,6 @@ def train_v2(
     n_envs: int = 4,
     steps_per_epoch: int = 2048,
     checkpoint_path: Optional[str] = None,
-    v1_checkpoint_path: Optional[str] = None,
     target_loss: float = 0.01,
     use_subprocess: bool = False,
 ):
@@ -1023,7 +1049,6 @@ def train_v2(
         n_envs: Number of parallel environments
         steps_per_epoch: Steps to collect per epoch
         checkpoint_path: Optional V2 checkpoint to resume from
-        v1_checkpoint_path: Optional V1 checkpoint for transfer learning
         target_loss: Stop training when loss reaches this value
         use_subprocess: Use subprocess-based parallelism (true multiprocessing)
     """
@@ -1061,6 +1086,24 @@ def train_v2(
     
     logger.info(f"Loaded {len(dataset)} training samples ({len(dataset.pairs)} pairs, {len(dataset.reference_files)} reference)")
     
+    # Log augmentation configuration
+    if dataset.augmentor is not None:
+        aug_cfg = dataset.augmentor.config
+        enabled_augs = []
+        if aug_cfg.noise_enabled:
+            enabled_augs.append(f"noise(p={aug_cfg.noise_prob})")
+        if aug_cfg.gain_enabled:
+            enabled_augs.append(f"gain(p={aug_cfg.gain_prob})")
+        if aug_cfg.eq_enabled:
+            enabled_augs.append(f"eq(p={aug_cfg.eq_prob})")
+        if aug_cfg.pitch_shift_enabled:
+            enabled_augs.append(f"pitch_shift(p={aug_cfg.pitch_shift_prob})")
+        if aug_cfg.time_stretch_enabled:
+            enabled_augs.append(f"time_stretch(p={aug_cfg.time_stretch_prob})")
+        logger.info(f"Augmentation enabled: {', '.join(enabled_augs) if enabled_augs else 'none'} (overall p={aug_cfg.augment_prob})")
+    else:
+        logger.info("Augmentation: disabled")
+    
     # Load learned reward model if enabled
     learned_reward_model = None
     if config.reward.use_learned_rewards:
@@ -1081,13 +1124,9 @@ def train_v2(
         use_subprocess=use_subprocess,
     )
     
-    # Handle checkpoint loading
-    # Priority: V2 checkpoint > V1 transfer learning
-    # Ensure agent/optimizers are initialized before loading checkpoint
+    # Handle checkpoint loading (deferred - weights loaded after agent init)
     if checkpoint_path and Path(checkpoint_path).exists():
         trainer.load_checkpoint(checkpoint_path)
-    elif v1_checkpoint_path and Path(v1_checkpoint_path).exists():
-        logger.info("Initializing agent for V1 weight transfer...")
         
     # Determine starting epoch
     start_epoch = trainer.current_epoch
@@ -1096,7 +1135,7 @@ def train_v2(
     
     # Training loop
     start_time = time.time()
-    MAXBEATS = 3000  # Limit beats for tractable action space
+    MAXBEATS = 5000  # Limit beats for tractable action space
     logger.info(f"Max Beats per sample set to {MAXBEATS} for V2 training")
     
     for epoch in range(start_epoch, n_epochs):
@@ -1109,11 +1148,11 @@ def train_v2(
 
 
         # === Curriculum parameters ===
-        initial_short_beats = 400
-        final_short_beats = 1200
+        initial_short_beats = 500
+        final_short_beats = 2000
         initial_short_prob = 1.0  # 100% short at start
-        final_short_prob = 0.2    # 20% short at end
-        curriculum_steps = 10000    # Number of epochs to anneal over
+        final_short_prob = 0.25    # 25% short at end
+        curriculum_steps = 20000    # Number of epochs to anneal over
 
         # Compute current probability of sampling a short segment
         progress = min(epoch / curriculum_steps, 1.0)
@@ -1161,15 +1200,6 @@ def train_v2(
         rollout_start = time.time()
         rollout_data = trainer.collect_rollouts_parallel(audio_states, steps_per_epoch)
         rollout_time = time.time() - rollout_start
-
-        # Load Checkpoint at start of training (agent now initialized)
-        if epoch == start_epoch and checkpoint_path and trainer.agent is None:
-            trainer.load_checkpoint(checkpoint_path)
-
-        # Load Checkpoint after first rollout (agent now initialized)
-        if epoch == start_epoch and v1_checkpoint_path and trainer.agent is not None:
-            if trainer.load_v1_weights(v1_checkpoint_path):
-                logger.info("✓ V1 weights loaded for transfer learning - encoder pretrained, policy head fresh")
 
         # Update networks
         update_start = time.time()
@@ -1250,8 +1280,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
     parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--steps", type=int, default=2048, help="Steps per epoch")
-    parser.add_argument("--checkpoint", type=str, default=None, help="V2 checkpoint to resume from")
-    parser.add_argument("--v1_checkpoint", type=str, default=None, help="V1 checkpoint for transfer learning")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument("--target_loss", type=float, default=0.01, help="Target loss to stop training")
     parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model (RLHF)")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
@@ -1298,7 +1327,6 @@ if __name__ == "__main__":
         n_envs=args.n_envs,
         steps_per_epoch=args.steps,
         checkpoint_path=args.checkpoint,
-        v1_checkpoint_path=args.v1_checkpoint,
         target_loss=args.target_loss,
         use_subprocess=args.subprocess,
     )

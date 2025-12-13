@@ -365,6 +365,13 @@ class PairedAudioDataset(Dataset):
                 )
                 logger.info("Data augmentation enabled")
         
+        # Feature-space augmentation settings (fast, no re-extraction needed)
+        # These simulate gain/noise variations directly on features
+        self.feature_aug_enabled = use_augmentation
+        self.feature_aug_gain_range = (-0.15, 0.15)  # ±15% feature scaling
+        self.feature_aug_noise_std = 0.02  # Small additive noise
+        self.feature_aug_prob = 0.5  # 50% chance to apply
+        
         # Initialize stem processor for Demucs separation
         self.stem_processor = None
         feature_mode = getattr(config.features, 'feature_mode', 'basic') if hasattr(config, 'features') else 'basic'
@@ -441,34 +448,81 @@ class PairedAudioDataset(Dataset):
         
         This is called at initialization to avoid repeated disk I/O during training.
         Audio is loaded into the global in-memory cache in utils.py.
+        
+        NOTE: With feature caching, we skip preloading files that have cached features
+        since _process_file() won't need the raw audio for those files.
         """
         all_files = []
         
-        # Collect all files to preload
+        # Collect all files to preload (only those WITHOUT cached features)
         for raw_path, edited_path in self.pairs:
-            all_files.append(raw_path)
-            all_files.append(edited_path)
+            # Only preload if features aren't cached
+            if not self.feature_cache or self.feature_cache.load_features(raw_path) is None:
+                all_files.append(raw_path)
+            if not self.feature_cache or self.feature_cache.load_features(edited_path) is None:
+                all_files.append(edited_path)
         
         for ref_path in self.reference_files:
-            all_files.append(ref_path)
+            if not self.feature_cache or self.feature_cache.load_features(ref_path) is None:
+                all_files.append(ref_path)
         
         if not all_files:
+            logger.info("All files have cached features - skipping audio preload")
             return
         
-        logger.info(f"Pre-loading {len(all_files)} audio files into memory cache...")
+        logger.info(f"Pre-loading {len(all_files)} audio files into memory cache (skipping cached)...")
         
         loaded = 0
-        for file_path in all_files:
+        for i, file_path in enumerate(all_files):
             try:
                 # This will cache the audio in memory via load_audio's cache
                 load_audio(str(file_path), sr=self.config.audio.sample_rate)
                 loaded += 1
+                # Progress logging every 20 files
+                if (i + 1) % 20 == 0:
+                    logger.info(f"  Pre-loaded {i+1}/{len(all_files)} files...")
             except Exception as e:
                 logger.warning(f"Failed to preload {file_path}: {e}")
         
         # Log cache stats
         stats = get_audio_cache_stats()
         logger.info(f"Pre-loaded {loaded}/{len(all_files)} files ({stats['size_mb']:.1f} MB in cache)")
+
+    def _apply_feature_augmentation(self, data: Dict) -> Dict:
+        """Apply fast feature-space augmentation (no re-extraction needed).
+        
+        This simulates audio variations by scaling and adding noise to features.
+        Much faster than re-extracting from augmented audio.
+        
+        Args:
+            data: Dict containing 'beat_features' tensor of shape (n_beats, feature_dim)
+            
+        Returns:
+            Augmented data dict (modified in place)
+        """
+        features = data.get("beat_features")
+        if features is None:
+            return data
+        
+        # Convert to numpy for augmentation
+        if isinstance(features, torch.Tensor):
+            features = features.numpy().copy()  # Copy to avoid modifying cached data
+        else:
+            features = features.copy()
+        
+        # Random gain (multiplicative scaling) - simulates volume/EQ changes
+        gain_low, gain_high = self.feature_aug_gain_range
+        gain = 1.0 + np.random.uniform(gain_low, gain_high)
+        features = features * gain
+        
+        # Random noise (additive) - simulates recording noise
+        if self.feature_aug_noise_std > 0:
+            noise = np.random.normal(0, self.feature_aug_noise_std, features.shape).astype(np.float32)
+            features = features + noise
+        
+        # Convert back to tensor
+        data["beat_features"] = torch.from_numpy(features.astype(np.float32))
+        return data
 
     def __len__(self) -> int:
         return len(self.pairs) + len(self.reference_files)
@@ -571,6 +625,11 @@ class PairedAudioDataset(Dataset):
                 "edited_path": str(edited_path),
                 "is_reference": False,
             }
+            
+            # Apply fast feature-space augmentation (after loading cached data)
+            if self.feature_aug_enabled and np.random.random() < self.feature_aug_prob:
+                data["raw"] = self._apply_feature_augmentation(data["raw"])
+                data["edited"] = self._apply_feature_augmentation(data["edited"])
 
             #t1 = time.perf_counter()
             #print(f"__getitem__({idx}) took {t1-t0:.4f}s")    
@@ -709,20 +768,6 @@ class PairedAudioDataset(Dataset):
         if not apply_augment and self.feature_cache:
             cached = self.feature_cache.load_features(file_path)
             if cached is not None:
-                # We have cached beat features, load audio minimally
-                y, sr = load_audio(str(file_path), sr=self.config.audio.sample_rate)
-                
-                # Load cached mel or compute
-                mel = self.feature_cache.load_mel(file_path)
-                if mel is None:
-                    mel = compute_mel_spectrogram(
-                        y, sr=sr,
-                        n_mels=self.config.audio.n_mels,
-                        n_fft=self.config.audio.n_fft,
-                        hop_length=self.config.audio.hop_length
-                    )
-                    self.feature_cache.save_mel(file_path, mel)
-                
                 beat_features = cached["beat_features"]
                 beats = cached["beats"]
                 beat_times = cached["beat_times"]
@@ -734,28 +779,27 @@ class PairedAudioDataset(Dataset):
                 cached_dim = beat_features.shape[-1] if beat_features.ndim > 1 else 0
                 
                 if self.stem_processor is not None and len(beats) > 0 and cached_dim < expected_full_dim:
-                    # Cached features don't include stems - need to add them
-                    stems = self.feature_cache.load_stems(file_path)
-                    if stems is None:
-                        stems = self.stem_processor.separate(str(file_path))
-                        if stems:
-                            self.feature_cache.save_stems(file_path, stems)
-                    
-                    if stems:
-                        stem_features = self.stem_processor.get_stem_features(
-                            stems, beats, hop_length=self.config.audio.hop_length
-                        )
-                        beat_features = np.concatenate([beat_features, stem_features], axis=1)
+                    # Cached features don't include stems - just pad with zeros
+                    # (Computing stem features from raw stems is too slow for training)
+                    stem_dim = expected_full_dim - cached_dim
+                    zero_stems = np.zeros((len(beats), stem_dim), dtype=beat_features.dtype)
+                    beat_features = np.concatenate([beat_features, zero_stems], axis=1)
+                    logger.debug(f"Using zero-padded stem features for {file_path.name}")
                 
+                # Estimate duration from beat_times without loading audio
+                duration = float(beat_times[-1]) + 0.5 if len(beat_times) > 0 else 0.0
+                
+                # Skip audio/mel loading - training only needs beat_features, beat_times, tempo
+                # Placeholder tensors for interface compatibility (not used in training)
                 return {
-                    "audio": torch.from_numpy(y).float(),
-                    "mel": torch.from_numpy(mel).float(),
+                    "audio": torch.zeros(1),  # Placeholder - not used in training
+                    "mel": torch.zeros(1, 1),  # Placeholder - not used in training
                     "beats": torch.from_numpy(beats).long(),
                     "beat_times": torch.from_numpy(beat_times).float(),
                     "beat_features": torch.from_numpy(beat_features).float(),
                     "tempo": torch.tensor(tempo).float(),
-                    "duration": torch.tensor(len(y) / sr).float(),
-                    "sample_rate": sr,
+                    "duration": torch.tensor(duration).float(),
+                    "sample_rate": self.config.audio.sample_rate,
                 }
         
         # Not cached or augmenting - compute from scratch
