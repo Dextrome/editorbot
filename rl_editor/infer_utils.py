@@ -1,7 +1,6 @@
 """Inference utilities for the RL audio editor.
 
 Provides utility functions for loading audio and creating edited output.
-Used by both V1 infer.py and V2 infer_v2.py.
 """
 
 import logging

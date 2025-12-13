@@ -1,13 +1,15 @@
-"""Factored Action Space Training Script.
+"""Training Script - Factored Action Space with Episode Rewards.
 
 Uses 3-head policy network: (action_type, action_size, action_amount)
 Combined log prob = log P(type) + log P(size|type) + log P(amount|type)
 
-Key differences from single-head training:
-1. Actions are tuples (type, size, amount) not single integers
-2. Three separate masks for type/size/amount validity
-3. Log probs are summed across heads
-4. Rollout buffer stores 3-component actions
+Features:
+- Factored action space: 18 types × 5 sizes × 5 amounts = 450 combinations
+- Subprocess parallelism for true multiprocessing
+- Episode-level rewards (Monte Carlo returns)
+- Curriculum learning (short segments → long segments)
+- Auxiliary tasks for better representation learning
+- RLHF support via learned reward model
 """
 
 import time
@@ -22,6 +24,7 @@ if sys.platform == 'win32':
 import logging
 import math
 import os
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -37,16 +40,17 @@ from torch.cuda.amp import autocast
 
 from .config import Config, get_default_config
 from .data import PairedAudioDataset, AudioDataset
-from .environment_factored import AudioEditingEnvFactored
-from .actions_factored import (
+from .environment import AudioEditingEnvFactored
+from .actions import (
     ActionType, ActionSize, ActionAmount,
     FactoredAction, FactoredActionSpace,
     N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,
 )
-from .agent_factored import FactoredAgent
+from .agent import Agent
 from .state import AudioState, EditHistory
 from .reward import compute_trajectory_return
 from .logging_utils import TrainingLogger, create_logger
+from .learned_reward_integration import LearnedRewardIntegration
 from .auxiliary_tasks import AuxiliaryConfig, AuxiliaryTargetComputer, compute_auxiliary_targets
 
 logger = logging.getLogger(__name__)
@@ -76,6 +80,12 @@ def get_lr_scheduler(optimizer: optim.Optimizer, config: Config, total_epochs: i
         elif decay_type == "linear":
             progress = epochs_after_warmup / max(decay_epochs, 1)
             return max(min_ratio, 1.0 - (1.0 - min_ratio) * progress)
+        elif decay_type == "exponential":
+            decay_rate = -math.log(min_ratio) / max(ppo_config.lr_decay_epochs, 1)
+            return max(min_ratio, math.exp(-decay_rate * epochs_after_warmup))
+        elif decay_type == "step":
+            n_steps = epochs_after_warmup // ppo_config.lr_step_interval
+            return max(min_ratio, ppo_config.lr_step_factor ** n_steps)
         else:
             return 1.0
     
@@ -83,7 +93,7 @@ def get_lr_scheduler(optimizer: optim.Optimizer, config: Config, total_epochs: i
 
 
 @dataclass
-class FactoredRolloutBuffer:
+class RolloutBuffer:
     """Buffer for storing rollout data with factored actions."""
     states: List[np.ndarray] = field(default_factory=list)
     action_types: List[int] = field(default_factory=list)
@@ -99,16 +109,16 @@ class FactoredRolloutBuffer:
     # Episode tracking
     episode_rewards: List[float] = field(default_factory=list)
     episode_lengths: List[int] = field(default_factory=list)
+    section_decisions: List[int] = field(default_factory=list)
     beat_indices: List[int] = field(default_factory=list)
     # Auxiliary task targets
     auxiliary_targets: Dict[str, List[np.ndarray]] = field(default_factory=lambda: {
         "tempo": [],
         "energy": [],
-        "phrase_boundary": [],
-        "beat_reconstruction": [],
+        "phrase": [],
+        "reconstruction": [],
+        "reconstruction_mask": [],
     })
-    episode_lengths: List[int] = field(default_factory=list)
-    beat_indices: List[int] = field(default_factory=list)
     
     def clear(self):
         self.states = []
@@ -124,12 +134,14 @@ class FactoredRolloutBuffer:
         self.amount_masks = []
         self.episode_rewards = []
         self.episode_lengths = []
+        self.section_decisions = []
         self.beat_indices = []
         self.auxiliary_targets = {
             "tempo": [],
             "energy": [],
-            "phrase_boundary": [],
-            "beat_reconstruction": [],
+            "phrase": [],
+            "reconstruction": [],
+            "reconstruction_mask": [],
         }
     
     def add(
@@ -179,8 +191,8 @@ class FactoredRolloutBuffer:
         return len(self.states)
 
 
-class VectorizedEnvFactoredWrapper:
-    """Wrapper for running multiple factored environments in parallel."""
+class VectorizedEnvWrapper:
+    """Wrapper for running multiple environments in parallel via threading."""
     
     def __init__(self, config: Config, n_envs: int = 4, learned_reward_model: Optional[Any] = None):
         self.config = config
@@ -262,7 +274,7 @@ class VectorizedEnvFactoredWrapper:
         return None, {}
 
 
-class FactoredPPOTrainer:
+class PPOTrainer:
     """PPO trainer for factored action space."""
     
     def __init__(
@@ -287,17 +299,18 @@ class FactoredPPOTrainer:
         
         # Vectorized environments
         if use_subprocess:
-            # For now, fall back to thread-based since subprocess requires more work
-            # TODO: Implement subprocess-based factored environment
-            logger.warning("Subprocess parallelism not yet implemented for factored actions, using threads")
-        self.vec_env = VectorizedEnvFactoredWrapper(config, n_envs)
-        logger.info(f"Using thread-based parallel environments ({n_envs} threads)")
+            from .subprocess_vec_env import make_subprocess_vec_env
+            self.vec_env = make_subprocess_vec_env(config, n_envs, learned_reward_model=learned_reward_model)
+            logger.info(f"Using subprocess-based parallel environments ({n_envs} processes)")
+        else:
+            self.vec_env = VectorizedEnvWrapper(config, n_envs, learned_reward_model=learned_reward_model)
+            logger.info(f"Using thread-based parallel environments ({n_envs} threads)")
         
         # Set learned reward model on environments
         self.learned_reward_model = learned_reward_model
         
         # Agent (initialized later)
-        self.agent: Optional[FactoredAgent] = None
+        self.agent: Optional[Agent] = None
         self.optimizer: Optional[optim.Adam] = None
         self.scheduler: Optional[LambdaLR] = None
         
@@ -305,13 +318,16 @@ class FactoredPPOTrainer:
         self.scaler = torch.amp.GradScaler('cuda', enabled=config.ppo.use_mixed_precision and torch.cuda.is_available())
         
         # Buffer
-        self.buffer = FactoredRolloutBuffer()
+        self.buffer = RolloutBuffer()
         
         # Tracking
         self.global_step = 0
         self.best_reward = -np.inf
         self.episode_rewards = []
         self.episode_lengths = []
+        
+        # Episode reward breakdowns for logging
+        self._episode_reward_breakdowns: List[Dict[str, float]] = []
         
         # Target KL
         self.target_kl = getattr(config.ppo, 'target_kl', 0.01)
@@ -337,12 +353,12 @@ class FactoredPPOTrainer:
         # Directories
         Path(config.training.save_dir).mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Initialized FactoredPPOTrainer with {n_envs} envs on {self.device}")
+        logger.info(f"Initialized PPOTrainer with {n_envs} envs on {self.device}")
         logger.info(f"Factored action space: {N_ACTION_TYPES} types × {N_ACTION_SIZES} sizes × {N_ACTION_AMOUNTS} amounts")
     
     def _init_agent(self, input_dim: int, beat_feature_dim: int = 121):
-        """Initialize factored agent and optimizer."""
-        self.agent = FactoredAgent(
+        """Initialize agent and optimizer."""
+        self.agent = Agent(
             config=self.config,
             input_dim=input_dim,
             beat_feature_dim=beat_feature_dim,
@@ -388,6 +404,12 @@ class FactoredPPOTrainer:
         current = self.initial_entropy_coeff - progress * decay_range
         return max(current, self.entropy_coeff_min)
     
+    def get_current_lr(self) -> float:
+        """Get the current learning rate."""
+        if self.optimizer:
+            return self.optimizer.param_groups[0]['lr']
+        return self.config.ppo.learning_rate
+    
     def step_scheduler(self):
         if self.scheduler:
             self.scheduler.step()
@@ -404,6 +426,9 @@ class FactoredPPOTrainer:
         n_steps: int,
     ) -> Dict[str, np.ndarray]:
         """Collect rollouts with factored actions."""
+        # Clear auxiliary target cache
+        self.aux_target_computer._cache.clear()
+        
         # Setup environments
         self.vec_env.set_audio_states(audio_states)
         obs_list, _ = self.vec_env.reset_all()
@@ -414,8 +439,10 @@ class FactoredPPOTrainer:
             self._init_agent(input_dim)
         
         self.buffer.clear()
+        self._episode_reward_breakdowns = []
         episode_rewards = [0.0] * len(obs_list)
         episode_lengths = [0] * len(obs_list)
+        section_decisions = [0] * len(obs_list)
         
         # Exploration rate
         exploration_rate = max(0.15, 0.5 - self.global_step / 2000000)
@@ -482,12 +509,38 @@ class FactoredPPOTrainer:
             # Step environments
             next_obs_list, rewards, terminateds, truncateds, infos = self.vec_env.step_all(actions)
             
-            # Skip per-step aux targets for speed - they're computed in batch during update
-            # aux_targets_list is empty for now
+            # Batch auxiliary target computation
+            beat_indices = []
+            aux_targets_list = []
+            
+            if self.use_subprocess:
+                # Subprocess mode - aux targets computed in subprocess workers
+                for i in range(len(obs_list)):
+                    info = infos[i] if infos[i] else {}
+                    beat_idx = info.get("beat", 0)
+                    beat_indices.append(beat_idx)
+                    aux_targets = info.get("aux_targets")
+                    if aux_targets is not None and "reconstruction" in aux_targets:
+                        if isinstance(aux_targets["reconstruction"], list):
+                            aux_targets["reconstruction"] = np.array(aux_targets["reconstruction"])
+                    aux_targets_list.append(aux_targets)
+            else:
+                # Threading mode - access env data directly
+                for i in range(len(obs_list)):
+                    env = self.vec_env.envs[i]
+                    if env is not None and env.audio_state is not None:
+                        beat_indices.append(env.current_beat)
+                        # Skip per-step aux targets for speed
+                        aux_targets_list.append(None)
+                    else:
+                        beat_indices.append(0)
+                        aux_targets_list.append(None)
             
             # Store in buffer
             for i in range(len(obs_list)):
-                beat_idx = infos[i].get("beat", 0) if infos[i] else 0
+                # Track section-level decisions
+                if sizes_np[i] >= ActionSize.BAR.value:  # BAR or larger
+                    section_decisions[i] += 1
                 
                 self.buffer.add(
                     state=obs_list[i],
@@ -501,8 +554,8 @@ class FactoredPPOTrainer:
                     type_mask=type_masks[i],
                     size_mask=size_masks[i],
                     amount_mask=amount_masks[i],
-                    beat_index=beat_idx,
-                    aux_targets=None,  # Skip aux targets for speed
+                    beat_index=beat_indices[i],
+                    aux_targets=aux_targets_list[i],
                 )
                 episode_rewards[i] += rewards[i]
                 episode_lengths[i] += 1
@@ -514,11 +567,18 @@ class FactoredPPOTrainer:
                     self.episode_lengths.append(episode_lengths[i])
                     self.buffer.episode_rewards.append(episode_rewards[i])
                     self.buffer.episode_lengths.append(episode_lengths[i])
+                    self.buffer.section_decisions.append(section_decisions[i])
+                    
+                    # Aggregate reward breakdown
+                    info = infos[i] if infos[i] else {}
+                    if "reward_breakdown" in info:
+                        self._episode_reward_breakdowns.append(info["reward_breakdown"])
                     
                     logger.debug(f"Episode complete: len={episode_lengths[i]}, reward={episode_rewards[i]:.2f}")
                     
                     episode_rewards[i] = 0.0
                     episode_lengths[i] = 0
+                    section_decisions[i] = 0
                     
                     obs, _ = self.vec_env.reset_env(i)
                     next_obs_list[i] = obs
@@ -576,6 +636,7 @@ class FactoredPPOTrainer:
             "size_masks": self.buffer.size_masks,
             "amount_masks": self.buffer.amount_masks,
             "dones": np.array(self.buffer.dones),
+            "episode_reward_breakdowns": self._episode_reward_breakdowns,
         }
     
     def update(self, rollout_data: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -609,6 +670,9 @@ class FactoredPPOTrainer:
         approx_kl_divs = []
         nan_batches_skipped = 0
         early_stop = False
+        
+        # Track auxiliary loss breakdown
+        aux_loss_breakdown = {}
         
         for epoch in range(ppo_config.n_epochs):
             if early_stop:
@@ -694,12 +758,17 @@ class FactoredPPOTrainer:
                 # Auxiliary loss (if available)
                 aux_loss = torch.tensor(0.0, device=self.device)
                 if self.agent.auxiliary_module is not None and aux_targets:
-                    batch_aux_targets = {k: v[batch_indices] for k, v in aux_targets.items() if len(v) > 0}
+                    batch_aux_targets = {k: v[batch_indices] for k, v in aux_targets.items() if len(v) >= len(batch_indices)}
                     if batch_aux_targets:
-                        aux_loss, _ = self.agent.compute_auxiliary_loss(
+                        aux_loss, breakdown = self.agent.compute_auxiliary_loss(
                             batch_states, batch_aux_targets, self.current_epoch
                         )
                         aux_loss = torch.clamp(aux_loss, 0.0, 10.0)
+                        # Track breakdown
+                        for k, v in breakdown.items():
+                            if k not in aux_loss_breakdown:
+                                aux_loss_breakdown[k] = []
+                            aux_loss_breakdown[k].append(v)
                 
                 # Total loss
                 loss = (
@@ -756,6 +825,13 @@ class FactoredPPOTrainer:
                 "approx_kl": 0.0,
             }
         
+        # Aggregate episode reward breakdowns
+        breakdowns = rollout_data.get("episode_reward_breakdowns", [])
+        all_keys = set()
+        if breakdowns:
+            for bd in breakdowns:
+                all_keys.update(bd.keys())
+        
         metrics = {
             "policy_loss": np.mean(policy_losses),
             "value_loss": ppo_config.value_loss_coeff * np.mean(value_losses),
@@ -765,7 +841,15 @@ class FactoredPPOTrainer:
             "total_loss": np.mean(policy_losses) + ppo_config.value_loss_coeff * np.mean(value_losses),
             "approx_kl": np.mean(approx_kl_divs) if approx_kl_divs else 0.0,
             "n_episodes": len(self.episode_rewards),
+            "section_decisions_per_ep": np.mean(self.buffer.section_decisions) if self.buffer.section_decisions else 0.0,
         }
+        
+        # Add breakdowns to metrics
+        if breakdowns:
+            for k in all_keys:
+                vals = [bd[k] for bd in breakdowns if k in bd and isinstance(bd[k], (int, float, np.floating, np.integer))]
+                if vals:
+                    metrics[f"breakdown_{k}"] = float(np.mean(vals))
         
         # Log
         if self.training_logger:
@@ -778,6 +862,12 @@ class FactoredPPOTrainer:
                 episode_length=int(np.mean(self.episode_lengths[-100:])) if self.episode_lengths else 0,
             )
             self.training_logger.log_scalar("approx_kl", metrics["approx_kl"], self.global_step)
+            self.training_logger.log_scalar("section_decisions_per_ep", metrics["section_decisions_per_ep"], self.global_step)
+            
+            # Log reward breakdown
+            for k in all_keys:
+                if f"breakdown_{k}" in metrics:
+                    self.training_logger.log_scalar(f"reward/{k}", metrics[f"breakdown_{k}"], self.global_step)
         
         return metrics
     
@@ -798,7 +888,7 @@ class FactoredPPOTrainer:
             "config": self.config,
         }
         torch.save(checkpoint, path)
-        logger.info(f"Saved factored checkpoint to {path}")
+        logger.info(f"Saved checkpoint to {path}")
     
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
@@ -806,7 +896,7 @@ class FactoredPPOTrainer:
         
         version = checkpoint.get("version", "v1")
         if version not in ("factored",):
-            logger.warning(f"Loading non-factored checkpoint (version={version})")
+            logger.warning(f"Loading non-factored checkpoint (version={version}) - encoder weights only")
         
         self.global_step = checkpoint["global_step"]
         self.best_reward = checkpoint["best_reward"]
@@ -841,7 +931,7 @@ class FactoredPPOTrainer:
             self.scheduler.load_state_dict(checkpoint["scheduler"])
 
 
-def train_factored(
+def train(
     config: Config,
     data_dir: str,
     n_epochs: int = 1000,
@@ -851,7 +941,7 @@ def train_factored(
     use_subprocess: bool = False,
     learned_reward_model: Optional[Any] = None,
 ):
-    """Main training function for factored action space.
+    """Main training function.
     
     Args:
         config: Configuration
@@ -870,7 +960,7 @@ def train_factored(
     )
     
     logger.info("=" * 60)
-    logger.info("FACTORED ACTION SPACE TRAINING")
+    logger.info("RL AUDIO EDITOR TRAINING")
     logger.info("=" * 60)
     logger.info(f"Device: {config.training.device}")
     logger.info(f"Epochs: {n_epochs}, Envs: {n_envs}, Steps/epoch: {steps_per_epoch}")
@@ -888,15 +978,25 @@ def train_factored(
         config, 
         cache_dir=cache_dir,
         include_reference=True,
-        use_augmentation=False,  # Disable augmentation for faster loading
+        use_augmentation=True,
     )
     if len(dataset) == 0:
         logger.error(f"No data found in {data_dir}")
         return
     logger.info(f"Loaded {len(dataset)} samples (cache: {cache_dir})")
     
+    # Load learned reward model if enabled
+    if config.reward.use_learned_rewards and learned_reward_model is None:
+        reward_integration = LearnedRewardIntegration(config)
+        if reward_integration.load_model():
+            learned_reward_model = reward_integration.model
+            logger.info("Learned reward model loaded for RLHF training")
+        else:
+            logger.warning("Could not load learned reward model - using dense rewards only")
+            config.reward.use_learned_rewards = False
+    
     # Trainer
-    trainer = FactoredPPOTrainer(
+    trainer = PPOTrainer(
         config=config,
         n_envs=n_envs,
         total_epochs=n_epochs,
@@ -910,25 +1010,69 @@ def train_factored(
     
     # Training loop
     save_dir = Path(config.training.save_dir)
+    MAXBEATS = 5000  # Limit beats for tractable action space
+    logger.info(f"Max beats per sample: {MAXBEATS}")
     
     for epoch in range(trainer.current_epoch, n_epochs):
         epoch_start = time.time()
         
+        # === Curriculum parameters ===
+        # Start with short segments, gradually increase
+        initial_short_beats = 500
+        final_short_beats = 2000
+        initial_short_prob = 1.0  # 100% short at start
+        final_short_prob = 0.25   # 25% short at end
+        curriculum_steps = 20000  # Number of epochs to anneal over
+        
+        progress = min(epoch / curriculum_steps, 1.0)
+        short_prob = initial_short_prob * (1 - progress) + final_short_prob * progress
+        short_max_beats = int(initial_short_beats + (final_short_beats - initial_short_beats) * progress)
+        
+        # Log curriculum parameters
+        if trainer.training_logger is not None:
+            trainer.training_logger.log_scalar("curriculum/short_prob", short_prob, trainer.global_step)
+            trainer.training_logger.log_scalar("curriculum/short_max_beats", short_max_beats, trainer.global_step)
+        
         # Sample audio states
         data_start = time.time()
         audio_states = []
-        for _ in range(n_envs):
-            idx = np.random.randint(len(dataset))
-            sample = dataset[idx]
+        idxs = np.random.randint(0, len(dataset), size=n_envs)
+        
+        for idx in idxs:
+            if random.random() < short_prob:
+                max_beats = min(MAXBEATS, short_max_beats)
+            else:
+                max_beats = MAXBEATS
             
-            # PairedAudioDataset returns {'raw': {...}, 'edited': {...}, ...}
-            raw_data = sample.get('raw', sample)  # Fallback for AudioDataset
+            sample = dataset[idx]
+            raw_data = sample.get('raw', sample)
+            
+            beat_times = raw_data["beat_times"]
+            beat_features = raw_data["beat_features"]
+            
+            # Convert to numpy if tensor
+            if hasattr(beat_times, 'numpy'):
+                beat_times = beat_times.numpy()
+            if hasattr(beat_features, 'numpy'):
+                beat_features = beat_features.numpy()
+            
+            # Limit to max_beats
+            if len(beat_times) > max_beats:
+                start_idx = np.random.randint(0, len(beat_times) - max_beats)
+                end_idx = start_idx + max_beats
+                beat_times = beat_times[start_idx:end_idx]
+                beat_features = beat_features[start_idx:end_idx]
+                beat_times = beat_times - beat_times[0]  # Reset to 0
+            
+            tempo = raw_data.get("tempo", 120)
+            if hasattr(tempo, 'item'):
+                tempo = tempo.item()
             
             audio_state = AudioState(
                 beat_index=0,
-                beat_times=raw_data["beat_times"],
-                beat_features=raw_data["beat_features"],
-                tempo=raw_data.get("tempo"),
+                beat_times=beat_times,
+                beat_features=beat_features,
+                tempo=tempo,
                 raw_audio=raw_data.get("audio"),
                 sample_rate=raw_data.get("sample_rate", 22050),
             )
@@ -952,30 +1096,38 @@ def train_factored(
         
         # Log
         if epoch % 10 == 0:
+            aux_loss = metrics.get('auxiliary_loss', 0.0)
+            section_dec = metrics.get('section_decisions_per_ep', 0)
             logger.info(
                 f"Epoch {epoch:5d} | "
                 f"Reward: {metrics['episode_reward']:7.2f} | "
-                f"Policy: {metrics['policy_loss']:.4f} | "
-                f"Value: {metrics['value_loss']:.4f} | "
+                f"Loss: {metrics['total_loss']:.4f} (P:{metrics['policy_loss']:.4f} V:{metrics['value_loss']:.4f} A:{aux_loss:.4f}) | "
                 f"KL: {metrics['approx_kl']:.4f} | "
+                f"Sec: {section_dec:.1f} | "
                 f"Time: {epoch_time:.1f}s (D:{data_time:.2f}s R:{rollout_time:.1f}s U:{update_time:.1f}s)"
             )
+            
+            # Log reward breakdown
+            breakdown_keys = [k for k in metrics.keys() if k.startswith("breakdown_")]
+            if breakdown_keys:
+                breakdown = [f"{k[10:]}: {metrics[k]:.2f}" for k in breakdown_keys]
+                logger.info("  Reward breakdown: " + " | ".join(breakdown))
         
         # Save checkpoints
         checkpoint_interval = getattr(config.training, 'checkpoint_interval', 100)
         if epoch % checkpoint_interval == 0 and epoch > 0:
-            ckpt_path = save_dir / f"checkpoint_factored_epoch_{epoch}.pt"
+            ckpt_path = save_dir / f"checkpoint_epoch_{epoch}.pt"
             trainer.save_checkpoint(str(ckpt_path))
         
         # Best model
         if metrics["episode_reward"] > trainer.best_reward:
             trainer.best_reward = metrics["episode_reward"]
-            best_path = save_dir / "best_factored.pt"
+            best_path = save_dir / "best.pt"
             trainer.save_checkpoint(str(best_path))
             logger.info(f"New best reward: {trainer.best_reward:.2f}")
     
     # Final save
-    final_path = save_dir / "final_factored.pt"
+    final_path = save_dir / "final.pt"
     trainer.save_checkpoint(str(final_path))
     logger.info(f"Training complete. Final checkpoint: {final_path}")
 
@@ -984,9 +1136,9 @@ def main():
     """Entry point."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Train factored action space RL editor")
+    parser = argparse.ArgumentParser(description="Train RL audio editor")
     parser.add_argument("--data_dir", type=str, default="training_data", help="Training data directory")
-    parser.add_argument("--save_dir", type=str, default="models_factored", help="Save directory")
+    parser.add_argument("--save_dir", type=str, default="models", help="Save directory")
     parser.add_argument("--epochs", type=int, default=10000, help="Number of epochs")
     parser.add_argument("--n_envs", type=int, default=16, help="Parallel environments")
     parser.add_argument("--steps", type=int, default=512, help="Steps per epoch")
@@ -994,6 +1146,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--subprocess", action="store_true", help="Use subprocess parallelism")
+    parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model (RLHF)")
+    parser.add_argument("--no_lr_decay", action="store_true", help="Disable learning rate decay")
     
     args = parser.parse_args()
     
@@ -1003,7 +1157,15 @@ def main():
     config.ppo.learning_rate = args.lr
     config.ppo.batch_size = args.batch_size
     
-    train_factored(
+    if args.no_lr_decay:
+        config.ppo.lr_decay = False
+        logger.info("Learning rate decay DISABLED")
+    
+    if args.use_learned_rewards:
+        config.reward.use_learned_rewards = True
+        logger.info("Learned rewards ENABLED (RLHF mode)")
+    
+    train(
         config=config,
         data_dir=args.data_dir,
         n_epochs=args.epochs,

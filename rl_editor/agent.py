@@ -3,6 +3,11 @@
 Uses hybrid NATTEN encoder: local neighborhood attention + global pooling.
 This provides efficient local context (O(n*k) instead of O(n²)) while
 maintaining global awareness through pooled summary features.
+
+Architecture:
+- 3-head factored policy: type (18), size (5), amount (5) = 450 combinations
+- Shared encoder between policy heads
+- Separate value network with same encoder architecture
 """
 
 from typing import Optional, Tuple, Dict
@@ -12,6 +17,11 @@ import torch.nn.functional as F
 import logging
 
 from .config import Config
+from .actions import (
+    N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,
+    ActionType, ActionSize, ActionAmount,
+    FactoredAction, FactoredActionSpace, EditHistoryFactored,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +101,6 @@ class NATTENLayer(nn.Module):
             out = natten.na1d(q, k, v, kernel_size=effective_kernel, dilation=self.dilation)
         else:
             # Sliding window attention fallback (provides same locality as NATTEN)
-            # Used when NATTEN unavailable OR sequence too short for kernel
             out = self._sliding_window_attention(q, k, v)
         
         # Reshape and project
@@ -109,9 +118,6 @@ class NATTENLayer(nn.Module):
     ) -> torch.Tensor:
         """Sliding window attention fallback when NATTEN is not available.
         
-        This provides the same locality benefits as NATTEN - each position
-        only attends to its local neighborhood (kernel_size positions).
-        
         Args:
             q, k, v: Query, Key, Value tensors (B, L, H, head_dim)
             
@@ -123,16 +129,12 @@ class NATTENLayer(nn.Module):
         half_k = kernel // 2
         
         # Create sliding window attention mask
-        # Each position i attends to positions [i - half_k, i + half_k]
         positions = torch.arange(L, device=q.device)
-        # Distance matrix: |i - j|
         dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
-        # Mask: True where distance <= half_k (within window)
         mask = dist <= half_k  # (L, L)
         
         # Apply dilation if specified
         if self.dilation > 1:
-            # With dilation, we attend to every dilation-th position within window
             dilated_dist = dist // self.dilation
             mask = (dilated_dist <= half_k) & (dist % self.dilation == 0)
         
@@ -145,20 +147,16 @@ class NATTENLayer(nn.Module):
         scale = D ** -0.5
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, H, L, L)
         
-        # Apply sliding window mask (set non-neighbor positions to -inf)
+        # Apply sliding window mask
         attn = attn.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
         
         # Softmax over keys
         attn = F.softmax(attn, dim=-1)
-        
-        # Handle all-masked rows (shouldn't happen with proper kernel size)
         attn = torch.nan_to_num(attn, nan=0.0)
         
         # Apply attention to values
         out = torch.matmul(attn, v)  # (B, H, L, D)
-        
-        # Transpose back: (B, L, H, D)
-        out = out.transpose(1, 2)
+        out = out.transpose(1, 2)  # (B, L, H, D)
         
         return out
 
@@ -172,10 +170,6 @@ class HybridNATTENEncoder(nn.Module):
     3. Pool global summary (mean over sequence)
     4. Concatenate local features with global summary
     5. Final projection to output dimension
-    
-    This gives:
-    - Sharp local context from NATTEN (efficient gradients for local patterns)
-    - Global awareness from pooled summary (duration, overall energy, etc.)
     """
     
     def __init__(
@@ -188,17 +182,6 @@ class HybridNATTENEncoder(nn.Module):
         dilation: int = 1,
         dropout: float = 0.1,
     ) -> None:
-        """Initialize hybrid NATTEN encoder.
-        
-        Args:
-            input_dim: Input feature dimension
-            hidden_dim: Hidden dimension for NATTEN layers
-            n_heads: Number of attention heads
-            n_layers: Number of NATTEN layers
-            kernel_size: Neighborhood size for local attention (odd number)
-            dilation: Dilation factor (1 = no dilation)
-            dropout: Dropout rate
-        """
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -218,10 +201,10 @@ class HybridNATTENEncoder(nn.Module):
             for _ in range(n_layers)
         ])
         
-        # Global pooling projection (projects pooled features)
+        # Global pooling projection
         self.global_proj = nn.Linear(hidden_dim, hidden_dim)
         
-        # Final combination: local (hidden_dim) + global (hidden_dim) -> hidden_dim
+        # Final combination: local + global -> hidden_dim
         self.combine_proj = nn.Linear(hidden_dim * 2, hidden_dim)
         
         # Feed-forward network after combination
@@ -248,16 +231,13 @@ class HybridNATTENEncoder(nn.Module):
         Returns:
             Encoded tensor (batch_size, hidden_dim) or (batch_size, seq_len, hidden_dim)
         """
-        # Run encoder in FP32 to avoid mixed precision NaN issues
-        # NATTEN and attention computations are sensitive to FP16 overflow
         with torch.amp.autocast('cuda', enabled=False):
-            # Convert to FP32 for encoder operations
             original_dtype = x.dtype
             x = x.float()
             
             # Handle 2D input (single position, no sequence)
             if x.dim() == 2:
-                x = x.unsqueeze(1)  # (B, 1, D)
+                x = x.unsqueeze(1)
                 squeeze_output = True
             else:
                 squeeze_output = False
@@ -265,192 +245,44 @@ class HybridNATTENEncoder(nn.Module):
             B, L, _ = x.shape
             
             # Project to hidden dimension
-            x = self.input_projection(x)  # (B, L, hidden_dim)
+            x = self.input_projection(x)
             
             # Apply NATTEN layers for local context
             local_features = x
             for layer in self.natten_layers:
-                local_features = layer(local_features)  # (B, L, hidden_dim)
+                local_features = layer(local_features)
             
-            # Global pooling: mean over sequence dimension
-            global_summary = x.mean(dim=1, keepdim=True)  # (B, 1, hidden_dim)
-            global_summary = self.global_proj(global_summary)  # (B, 1, hidden_dim)
-            global_summary = global_summary.expand(-1, L, -1)  # (B, L, hidden_dim)
+            # Global pooling
+            global_summary = x.mean(dim=1, keepdim=True)
+            global_summary = self.global_proj(global_summary)
+            global_summary = global_summary.expand(-1, L, -1)
             
             # Combine local and global
-            combined = torch.cat([local_features, global_summary], dim=-1)  # (B, L, hidden_dim*2)
-            combined = self.combine_proj(combined)  # (B, L, hidden_dim)
+            combined = torch.cat([local_features, global_summary], dim=-1)
+            combined = self.combine_proj(combined)
             
             # Feed-forward + residual
             out = combined + self.ffn(combined)
             out = self.final_norm(out)
             
             if squeeze_output:
-                out = out.squeeze(1)  # (B, hidden_dim)
+                out = out.squeeze(1)
             
-            # Clamp outputs to prevent extreme values
             out = torch.clamp(out, -100.0, 100.0)
                 
         return out
 
 
-class PolicyNetwork(nn.Module):
-    """Policy network for action selection.
-
-    Uses hybrid NATTEN encoder for efficient local-global context.
-    Outputs action logits for discrete action space.
-    """
-
-    def __init__(
-        self, config: Config, input_dim: int, n_actions: int
-    ) -> None:
-        """Initialize policy network.
-
-        Args:
-            config: Configuration object
-            input_dim: Input state dimension
-            n_actions: Number of actions
-        """
-        super().__init__()
-        self.config = config
-        self.input_dim = input_dim
-        self.n_actions = n_actions
-
-        model_config = config.model
-
-        # Hybrid NATTEN encoder (local attention + global pooling)
-        self.encoder = HybridNATTENEncoder(
-            input_dim=input_dim,
-            hidden_dim=model_config.policy_hidden_dim,
-            n_heads=model_config.natten_n_heads,
-            n_layers=model_config.natten_n_layers,
-            kernel_size=model_config.natten_kernel_size,
-            dilation=model_config.natten_dilation,
-            dropout=model_config.policy_dropout,
-        )
-        self.head = nn.Linear(model_config.policy_hidden_dim, n_actions)
-
-    def forward(
-        self, state: torch.Tensor, mask: Optional[torch.Tensor] = None, temperature: float = 1.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
-
-        Args:
-            state: State tensor (batch_size, input_dim)
-            mask: Optional action mask (batch_size, n_actions) binary
-            temperature: Softmax temperature for exploration (higher = more random)
-
-        Returns:
-            Tuple of (action_logits, action_probs)
-        """
-        # Encode state
-        encoded = self.encoder(state)
-
-        # Compute logits
-        logits = self.head(encoded)
-
-        # Apply mask if provided (set invalid actions to -inf)
-        if mask is not None:
-            logits = logits.masked_fill(~mask.bool(), float("-inf"))
-
-        # Apply temperature scaling for exploration (higher temp = more exploration)
-        scaled_logits = logits / max(temperature, 0.1)
-
-        # Compute probabilities
-        probs = torch.softmax(scaled_logits, dim=-1)
-
-        return logits, probs
-
-    def get_logits(self, state: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Get action logits for a batch of states.
-
-        Args:
-            state: State tensor (batch_size, input_dim)
-            mask: Optional action mask (batch_size, n_actions)
-
-        Returns:
-            Logits tensor (batch_size, n_actions)
-        """
-        # Handle NaN in input states
-        if torch.isnan(state).any():
-            state = torch.nan_to_num(state, nan=0.0)
-            
-        encoded = self.encoder(state)
-        
-        # Handle NaN in encoded
-        if torch.isnan(encoded).any():
-            encoded = torch.nan_to_num(encoded, nan=0.0)
-            
-        logits = self.head(encoded)
-        
-        # Handle NaN in logits
-        if torch.isnan(logits).any():
-            logits = torch.nan_to_num(logits, nan=0.0)
-            
-        if mask is not None:
-            logits = logits.masked_fill(~mask.bool(), float("-inf"))
-        return logits
-
-    def get_action_and_value(
-        self,
-        state: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        deterministic: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get action and log probability.
-
-        Args:
-            state: State tensor
-            mask: Optional action mask
-            deterministic: If True, return greedy action; else sample from distribution
-
-        Returns:
-            Tuple of (action, log_prob)
-        """
-        logits, probs = self.forward(state, mask)
-        
-        # Handle case where all actions are masked (probs sum to 0 or have NaN)
-        # Replace NaN/zero rows with uniform distribution
-        probs_sum = probs.sum(dim=-1, keepdim=True)
-        invalid_mask = (probs_sum < 1e-8) | torch.isnan(probs_sum)
-        if invalid_mask.any():
-            uniform = torch.ones_like(probs) / probs.shape[-1]
-            probs = torch.where(invalid_mask.expand_as(probs), uniform, probs)
-            # Re-normalize
-            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        if deterministic:
-            action = torch.argmax(logits, dim=-1)
-            log_prob = torch.log(torch.gather(probs, -1, action.unsqueeze(-1)) + 1e-10).squeeze(-1)
-        else:
-            dist = torch.distributions.Categorical(probs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-
-        return action, log_prob
-
-
 class ValueNetwork(nn.Module):
-    """Value network for state evaluation.
-
-    Uses hybrid NATTEN encoder for consistent feature extraction with policy.
-    Outputs state value for TD learning.
-    """
+    """Value network for state evaluation."""
 
     def __init__(self, config: Config, input_dim: int) -> None:
-        """Initialize value network.
-
-        Args:
-            config: Configuration object
-            input_dim: Input state dimension
-        """
         super().__init__()
         self.config = config
         self.input_dim = input_dim
 
         model_config = config.model
 
-        # Hybrid NATTEN encoder (same architecture as policy for consistency)
         self.encoder = HybridNATTENEncoder(
             input_dim=input_dim,
             hidden_dim=model_config.value_hidden_dim,
@@ -461,51 +293,265 @@ class ValueNetwork(nn.Module):
             dropout=model_config.value_dropout,
         )
         
-        # Value head
         self.head = nn.Linear(model_config.value_hidden_dim, 1)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            state: State tensor (batch_size, input_dim)
-
-        Returns:
-            State value tensor (batch_size,)
-        """
         encoded = self.encoder(state)
         value = self.head(encoded).squeeze(-1)
         return value
 
 
+class PolicyNetwork(nn.Module):
+    """Multi-head policy network for factored action space.
+    
+    Outputs logits for 3 action components:
+    - Type: What action (18 options)
+    - Size: How many beats (5 options)
+    - Amount: Intensity/direction (5 options)
+    """
+
+    def __init__(self, config: Config, input_dim: int) -> None:
+        super().__init__()
+        self.config = config
+        self.input_dim = input_dim
+        
+        model_config = config.model
+
+        # Shared encoder
+        self.encoder = HybridNATTENEncoder(
+            input_dim=input_dim,
+            hidden_dim=model_config.policy_hidden_dim,
+            n_heads=model_config.natten_n_heads,
+            n_layers=model_config.natten_n_layers,
+            kernel_size=model_config.natten_kernel_size,
+            dilation=model_config.natten_dilation,
+            dropout=model_config.policy_dropout,
+        )
+        
+        hidden_dim = model_config.policy_hidden_dim
+        
+        # Type head: What action to take
+        self.type_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, N_ACTION_TYPES),
+        )
+        
+        # Type embedding for conditioning size/amount heads
+        self.type_embedding = nn.Embedding(N_ACTION_TYPES, 32)
+        
+        # Size head: How many beats (conditioned on type)
+        self.size_head = nn.Sequential(
+            nn.Linear(hidden_dim + 32, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, N_ACTION_SIZES),
+        )
+        
+        # Amount head: Intensity (conditioned on type)
+        self.amount_head = nn.Sequential(
+            nn.Linear(hidden_dim + 32, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, N_ACTION_AMOUNTS),
+        )
+        
+        logger.info(f"PolicyNetwork: {N_ACTION_TYPES} types, {N_ACTION_SIZES} sizes, {N_ACTION_AMOUNTS} amounts")
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        type_mask: Optional[torch.Tensor] = None,
+        size_mask: Optional[torch.Tensor] = None,
+        amount_mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass returning logits for all three heads."""
+        encoded = self.encoder(state)
+        
+        # Type logits
+        type_logits = self.type_head(encoded)
+        if type_mask is not None:
+            type_logits = type_logits.masked_fill(~type_mask.bool(), float("-inf"))
+        type_logits = type_logits / max(temperature, 0.1)
+        
+        # Soft attention over types for conditioning
+        type_probs = F.softmax(type_logits, dim=-1)
+        type_embed = torch.matmul(type_probs, self.type_embedding.weight)
+        
+        # Size logits (conditioned on type)
+        size_input = torch.cat([encoded, type_embed], dim=-1)
+        size_logits = self.size_head(size_input)
+        if size_mask is not None:
+            size_logits = size_logits.masked_fill(~size_mask.bool(), float("-inf"))
+        size_logits = size_logits / max(temperature, 0.1)
+        
+        # Amount logits (conditioned on type)
+        amount_input = torch.cat([encoded, type_embed], dim=-1)
+        amount_logits = self.amount_head(amount_input)
+        if amount_mask is not None:
+            amount_logits = amount_logits.masked_fill(~amount_mask.bool(), float("-inf"))
+        amount_logits = amount_logits / max(temperature, 0.1)
+        
+        return type_logits, size_logits, amount_logits
+    
+    def get_action_and_log_prob(
+        self,
+        state: torch.Tensor,
+        type_mask: Optional[torch.Tensor] = None,
+        size_mask: Optional[torch.Tensor] = None,
+        amount_mask: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample actions and compute log probabilities."""
+        encoded = self.encoder(state)
+        
+        # === Type selection ===
+        type_logits = self.type_head(encoded)
+        if type_mask is not None:
+            type_logits = type_logits.masked_fill(~type_mask.bool(), float("-inf"))
+        
+        type_probs = F.softmax(type_logits, dim=-1)
+        type_probs = self._fix_probs(type_probs)
+        
+        if deterministic:
+            type_action = type_logits.argmax(dim=-1)
+        else:
+            type_dist = torch.distributions.Categorical(type_probs)
+            type_action = type_dist.sample()
+        
+        type_log_prob = torch.log(type_probs.gather(-1, type_action.unsqueeze(-1)) + 1e-10).squeeze(-1)
+        
+        # === Size selection (conditioned on chosen type) ===
+        type_embed = self.type_embedding(type_action)
+        size_input = torch.cat([encoded, type_embed], dim=-1)
+        size_logits = self.size_head(size_input)
+        if size_mask is not None:
+            size_logits = size_logits.masked_fill(~size_mask.bool(), float("-inf"))
+        
+        size_probs = F.softmax(size_logits, dim=-1)
+        size_probs = self._fix_probs(size_probs)
+        
+        if deterministic:
+            size_action = size_logits.argmax(dim=-1)
+        else:
+            size_dist = torch.distributions.Categorical(size_probs)
+            size_action = size_dist.sample()
+        
+        size_log_prob = torch.log(size_probs.gather(-1, size_action.unsqueeze(-1)) + 1e-10).squeeze(-1)
+        
+        # === Amount selection (conditioned on chosen type) ===
+        amount_input = torch.cat([encoded, type_embed], dim=-1)
+        amount_logits = self.amount_head(amount_input)
+        if amount_mask is not None:
+            amount_logits = amount_logits.masked_fill(~amount_mask.bool(), float("-inf"))
+        
+        amount_probs = F.softmax(amount_logits, dim=-1)
+        amount_probs = self._fix_probs(amount_probs)
+        
+        if deterministic:
+            amount_action = amount_logits.argmax(dim=-1)
+        else:
+            amount_dist = torch.distributions.Categorical(amount_probs)
+            amount_action = amount_dist.sample()
+        
+        amount_log_prob = torch.log(amount_probs.gather(-1, amount_action.unsqueeze(-1)) + 1e-10).squeeze(-1)
+        
+        # Combined log probability
+        combined_log_prob = type_log_prob + size_log_prob + amount_log_prob
+        
+        return type_action, size_action, amount_action, combined_log_prob
+    
+    def evaluate_actions(
+        self,
+        state: torch.Tensor,
+        type_action: torch.Tensor,
+        size_action: torch.Tensor,
+        amount_action: torch.Tensor,
+        type_mask: Optional[torch.Tensor] = None,
+        size_mask: Optional[torch.Tensor] = None,
+        amount_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate log probability and entropy for given actions."""
+        encoded = self.encoder(state)
+        
+        # === Type evaluation ===
+        type_logits = self.type_head(encoded)
+        if type_mask is not None:
+            type_logits = type_logits.masked_fill(~type_mask.bool(), float("-inf"))
+        type_logits = torch.clamp(type_logits, -20.0, 20.0)
+        type_logits = type_logits + torch.randn_like(type_logits) * 0.1
+        type_logits = type_logits / 1.5
+        
+        type_dist = torch.distributions.Categorical(logits=type_logits)
+        type_log_prob = type_dist.log_prob(type_action)
+        type_entropy = type_dist.entropy()
+        
+        # === Size evaluation (conditioned on actual type taken) ===
+        type_embed = self.type_embedding(type_action)
+        size_input = torch.cat([encoded, type_embed], dim=-1)
+        size_logits = self.size_head(size_input)
+        if size_mask is not None:
+            size_logits = size_logits.masked_fill(~size_mask.bool(), float("-inf"))
+        size_logits = torch.clamp(size_logits, -20.0, 20.0)
+        size_logits = size_logits + torch.randn_like(size_logits) * 0.1
+        size_logits = size_logits / 1.5
+        
+        size_dist = torch.distributions.Categorical(logits=size_logits)
+        size_log_prob = size_dist.log_prob(size_action)
+        size_entropy = size_dist.entropy()
+        
+        # === Amount evaluation ===
+        amount_input = torch.cat([encoded, type_embed], dim=-1)
+        amount_logits = self.amount_head(amount_input)
+        if amount_mask is not None:
+            amount_logits = amount_logits.masked_fill(~amount_mask.bool(), float("-inf"))
+        amount_logits = torch.clamp(amount_logits, -20.0, 20.0)
+        amount_logits = amount_logits + torch.randn_like(amount_logits) * 0.1
+        amount_logits = amount_logits / 1.5
+        
+        amount_dist = torch.distributions.Categorical(logits=amount_logits)
+        amount_log_prob = amount_dist.log_prob(amount_action)
+        amount_entropy = amount_dist.entropy()
+        
+        # Combined
+        combined_log_prob = type_log_prob + size_log_prob + amount_log_prob
+        combined_entropy = type_entropy + size_entropy + amount_entropy
+        
+        # Handle NaN
+        combined_log_prob = torch.nan_to_num(combined_log_prob, nan=-5.0, posinf=0.0, neginf=-15.0)
+        combined_entropy = torch.nan_to_num(combined_entropy, nan=0.5, posinf=5.0, neginf=0.0)
+        combined_entropy = torch.clamp(combined_entropy, min=0.1)
+        
+        return combined_log_prob, combined_entropy
+    
+    def _fix_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Fix probability distributions that sum to 0 or have NaN."""
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+        invalid = (probs_sum < 1e-8) | torch.isnan(probs_sum)
+        if invalid.any():
+            uniform = torch.ones_like(probs) / probs.shape[-1]
+            probs = torch.where(invalid.expand_as(probs), uniform, probs)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return probs
+
+
 class Agent:
-    """RL agent combining policy and value networks with auxiliary tasks."""
+    """RL Agent with multi-head factored policy and value networks."""
 
     def __init__(
-        self, 
-        config: Config, 
-        input_dim: int, 
-        n_actions: int,
+        self,
+        config: Config,
+        input_dim: int,
         beat_feature_dim: int = 121,
         use_auxiliary_tasks: bool = True,
     ) -> None:
-        """Initialize agent.
-
-        Args:
-            config: Configuration object
-            input_dim: Input state dimension
-            n_actions: Number of actions
-            beat_feature_dim: Dimension of beat features (for reconstruction task)
-            use_auxiliary_tasks: Whether to use auxiliary task heads
-        """
         self.config = config
         self.device = torch.device(config.training.device)
         self.use_auxiliary_tasks = use_auxiliary_tasks
 
-        self.policy_net = PolicyNetwork(config, input_dim, n_actions).to(self.device)
+        self.policy_net = PolicyNetwork(config, input_dim).to(self.device)
         self.value_net = ValueNetwork(config, input_dim).to(self.device)
         
-        # Auxiliary task module (shares encoder with policy)
+        # Auxiliary task module (optional)
         self.auxiliary_module = None
         if use_auxiliary_tasks:
             try:
@@ -523,251 +569,177 @@ class Agent:
                 self.auxiliary_module = None
 
         logger.info(
-            f"Initialized agent with {input_dim} input dims, {n_actions} actions on device {self.device}"
+            f"Initialized Agent with {input_dim} input dims, "
+            f"{N_ACTION_TYPES} types, {N_ACTION_SIZES} sizes, {N_ACTION_AMOUNTS} amounts"
         )
 
     def select_action(
         self,
         state: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        type_mask: Optional[torch.Tensor] = None,
+        size_mask: Optional[torch.Tensor] = None,
+        amount_mask: Optional[torch.Tensor] = None,
         deterministic: bool = False,
-    ) -> Tuple[int, float]:
-        """Select action given state.
-
-        Args:
-            state: State tensor
-            mask: Optional action mask
-            deterministic: Use greedy policy
-
-        Returns:
-            Tuple of (action_index, log_prob)
-        """
+    ) -> Tuple[Tuple[int, int, int], float]:
+        """Select factored action given state."""
         with torch.no_grad():
             if state.dim() == 1:
                 state = state.unsqueeze(0)
 
-            action, log_prob = self.policy_net.get_action_and_value(
-                state, mask, deterministic
+            type_act, size_act, amount_act, log_prob = self.policy_net.get_action_and_log_prob(
+                state, type_mask, size_mask, amount_mask, deterministic
             )
 
-            return int(action[0].item()), float(log_prob[0].item())
+            return (
+                (int(type_act[0].item()), int(size_act[0].item()), int(amount_act[0].item())),
+                float(log_prob[0].item())
+            )
 
     def select_action_batch(
         self,
         states: torch.Tensor,
-        masks: torch.Tensor,
+        type_masks: torch.Tensor,
+        size_masks: torch.Tensor,
+        amount_masks: torch.Tensor,
         deterministic: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Select actions for a batch of states.
-
-        Args:
-            states: Batch of state tensors (B, state_dim)
-            masks: Batch of action masks (B, n_actions)
-            deterministic: Whether to use deterministic policy
-
-        Returns:
-            Tuple of (actions, log_probs) tensors
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Select actions for batch of states."""
         with torch.no_grad():
-            actions, log_probs = self.policy_net.get_action_and_value(
-                states, masks, deterministic
+            return self.policy_net.get_action_and_log_prob(
+                states, type_masks, size_masks, amount_masks, deterministic
             )
-            return actions, log_probs
-
-    def compute_value(self, state: torch.Tensor) -> float:
-        """Compute value of state.
-
-        Args:
-            state: State tensor
-
-        Returns:
-            State value
-        """
-        with torch.no_grad():
-            if state.dim() == 1:
-                state = state.unsqueeze(0)
-
-            value = self.value_net(state)
-            return float(value[0].item())
 
     def compute_value_batch(self, states: torch.Tensor) -> torch.Tensor:
-        """Compute values for a batch of states.
-
-        Args:
-            states: Batch of state tensors (B, state_dim)
-
-        Returns:
-            Values tensor (B,)
-        """
+        """Compute values for batch of states."""
         values = self.value_net(states)
-        # Cast to FP32 and handle NaN/Inf for numerical stability
         values = values.float()
         values = torch.nan_to_num(values, nan=0.0, posinf=100.0, neginf=-100.0)
         values = torch.clamp(values, -100.0, 100.0)
         return values.squeeze(-1)
 
+    def compute_value(self, state: torch.Tensor) -> float:
+        """Compute value of single state."""
+        with torch.no_grad():
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            value = self.value_net(state)
+            return float(value[0].item())
+
     def evaluate_actions(
         self,
         states: torch.Tensor,
-        actions: torch.Tensor,
-        min_entropy: float = 0.1,
+        type_actions: torch.Tensor,
+        size_actions: torch.Tensor,
+        amount_actions: torch.Tensor,
+        type_masks: Optional[torch.Tensor] = None,
+        size_masks: Optional[torch.Tensor] = None,
+        amount_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate log probabilities and entropy for given state-action pairs.
+        """Evaluate log probabilities and entropy for given actions."""
+        return self.policy_net.evaluate_actions(
+            states, type_actions, size_actions, amount_actions,
+            type_masks, size_masks, amount_masks
+        )
 
-        Args:
-            states: Batch of states (B, state_dim)
-            actions: Batch of actions (B,)
-            min_entropy: Minimum entropy to maintain exploration
-
-        Returns:
-            Tuple of (log_probs, entropy) tensors
-        """
-        logits = self.policy_net.get_logits(states)
-        
-        # Cast to FP32 for stable distribution calculations (FP16 causes underflow in softmax/log)
-        logits = logits.float()
-        
-        # Handle NaN/Inf values in logits
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            logger.warning("NaN/Inf in logits during evaluate_actions, replacing")
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
-        
-        # Clamp logits to prevent extreme values
-        logits = torch.clamp(logits, -20.0, 20.0)
-        
-        # Add moderate noise to logits to prevent distribution from collapsing
-        # This keeps exploration active even when policy becomes confident
-        noise = torch.randn_like(logits) * 0.1  # Increased from 0.01
-        logits = logits + noise
-        
-        # Temperature scaling - soften distribution to encourage exploration
-        # Higher temperature = more uniform distribution = more exploration
-        training_temperature = 1.5  # > 1.0 means softer distribution
-        logits = logits / training_temperature
-        
-        dist = torch.distributions.Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)
-        entropy = dist.entropy()
-        
-        # Handle NaN in outputs (can happen with extreme probabilities)
-        log_probs = torch.nan_to_num(log_probs, nan=-5.0, posinf=0.0, neginf=-10.0)
-        entropy = torch.nan_to_num(entropy, nan=0.5, posinf=3.0, neginf=0.0)
-        
-        # Ensure minimum entropy to prevent policy collapse
-        entropy = torch.clamp(entropy, min=min_entropy)
-        
-        return log_probs, entropy
-    
     def get_encoder_output(self, states: torch.Tensor) -> torch.Tensor:
-        """Get encoded representation from policy encoder.
-        
-        Args:
-            states: Batch of states (B, state_dim)
-            
-        Returns:
-            Encoded features (B, hidden_dim)
-        """
+        """Get encoded representation from policy encoder."""
         return self.policy_net.encoder(states)
-    
-    def get_auxiliary_predictions(
-        self, 
-        states: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Get predictions from auxiliary task heads.
-        
-        Args:
-            states: Batch of states (B, state_dim)
-            
-        Returns:
-            Dict of task name -> predictions
-        """
-        if self.auxiliary_module is None:
-            return {}
-        
-        # Get encoded representation from shared encoder
-        encoded = self.get_encoder_output(states)
-        
-        # Get auxiliary predictions
-        return self.auxiliary_module(encoded)
-    
+
     def compute_auxiliary_loss(
         self,
         states: torch.Tensor,
         targets: Dict[str, torch.Tensor],
         epoch: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute auxiliary task losses.
-        
-        Args:
-            states: Batch of states (B, state_dim)
-            targets: Dict of task name -> target tensors
-            epoch: Current epoch for curriculum learning
-            
-        Returns:
-            Tuple of (total_auxiliary_loss, loss_breakdown)
-        """
+        """Compute auxiliary task losses."""
         if self.auxiliary_module is None:
             return torch.tensor(0.0, device=self.device), {}
         
-        predictions = self.get_auxiliary_predictions(states)
+        encoded = self.get_encoder_output(states)
+        predictions = self.auxiliary_module(encoded)
         return self.auxiliary_module.compute_losses(predictions, targets, epoch)
-    
+
+    def get_auxiliary_predictions(self, states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Get predictions from auxiliary task heads."""
+        if self.auxiliary_module is None:
+            return {}
+        encoded = self.get_encoder_output(states)
+        return self.auxiliary_module(encoded)
+
+    def get_policy_parameters(self):
+        return self.policy_net.parameters()
+
+    def get_value_parameters(self):
+        return self.value_net.parameters()
+
     def get_auxiliary_parameters(self):
-        """Get auxiliary module parameters for optimization."""
         if self.auxiliary_module is None:
             return []
         return self.auxiliary_module.parameters()
 
-    def get_policy_parameters(self):
-        """Get policy network parameters for optimization."""
-        return self.policy_net.parameters()
-
-    def get_value_parameters(self):
-        """Get value network parameters for optimization."""
-        return self.value_net.parameters()
-
     def get_all_parameters(self):
-        """Get all network parameters."""
         return list(self.policy_net.parameters()) + list(self.value_net.parameters())
 
     def save(self, path: str) -> None:
-        """Save agent networks.
-
-        Args:
-            path: Path to save checkpoint
-        """
+        """Save agent checkpoint."""
         checkpoint = {
             "policy_net": self.policy_net.state_dict(),
             "value_net": self.value_net.state_dict(),
+            "version": "merged",
         }
         if self.auxiliary_module is not None:
             checkpoint["auxiliary_module"] = self.auxiliary_module.state_dict()
         torch.save(checkpoint, path)
-        logger.info(f"Saved agent checkpoint to {path}")
+        logger.info(f"Saved agent to {path}")
 
     def load(self, path: str) -> None:
-        """Load agent networks.
-
-        Args:
-            path: Path to load checkpoint
-        """
-        checkpoint = torch.load(path, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint["policy_net"])
-        self.value_net.load_state_dict(checkpoint["value_net"])
-        if self.auxiliary_module is not None and "auxiliary_module" in checkpoint:
-            self.auxiliary_module.load_state_dict(checkpoint["auxiliary_module"])
-        logger.info(f"Loaded agent checkpoint from {path}")
+        """Load agent checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        
+        version = checkpoint.get("version", "unknown")
+        
+        if version in ("factored", "merged"):
+            # New format from train.py
+            policy_key = "policy_state_dict" if "policy_state_dict" in checkpoint else "policy_net"
+            value_key = "value_state_dict" if "value_state_dict" in checkpoint else "value_net"
+            aux_key = "auxiliary_state_dict" if "auxiliary_state_dict" in checkpoint else "auxiliary_module"
+            
+            self.policy_net.load_state_dict(checkpoint[policy_key])
+            self.value_net.load_state_dict(checkpoint[value_key])
+            if self.auxiliary_module is not None and checkpoint.get(aux_key):
+                self.auxiliary_module.load_state_dict(checkpoint[aux_key])
+            logger.info(f"Loaded checkpoint from {path} (epoch {checkpoint.get('current_epoch', 'N/A')})")
+        else:
+            # Legacy checkpoint - transfer encoder weights only
+            logger.warning("Loading legacy checkpoint - encoder weights only")
+            old_policy = checkpoint.get("policy_state_dict", checkpoint.get("policy_net", {}))
+            new_policy = self.policy_net.state_dict()
+            
+            transferred = 0
+            for key in list(old_policy.keys()):
+                if key.startswith("encoder.") and key in new_policy:
+                    new_policy[key] = old_policy[key]
+                    transferred += 1
+            
+            self.policy_net.load_state_dict(new_policy)
+            old_value = checkpoint.get("value_state_dict", checkpoint.get("value_net", {}))
+            if old_value:
+                self.value_net.load_state_dict(old_value)
+            logger.info(f"Transferred {transferred} encoder weights from legacy checkpoint")
 
     def train(self) -> None:
-        """Set networks to train mode."""
         self.policy_net.train()
         self.value_net.train()
         if self.auxiliary_module is not None:
             self.auxiliary_module.train()
 
     def eval(self) -> None:
-        """Set networks to eval mode."""
         self.policy_net.eval()
         self.value_net.eval()
         if self.auxiliary_module is not None:
             self.auxiliary_module.eval()
+
+
+# Aliases for backward compatibility
+FactoredAgent = Agent
+FactoredPolicyNetwork = PolicyNetwork

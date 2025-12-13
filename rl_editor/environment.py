@@ -14,7 +14,7 @@ import logging
 
 from .config import Config
 from .state import AudioState, StateRepresentation
-from .actions_factored import (
+from .actions import (
     ActionType, ActionSize, ActionAmount,
     FactoredAction, FactoredActionSpace, EditHistoryFactored,
     N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,

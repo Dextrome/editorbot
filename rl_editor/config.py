@@ -1,7 +1,7 @@
 """Configuration module for RL-based audio editor.
 
 Uses dataclass Config pattern for all hyperparameters.
-Simplified for train_v2.py pipeline.
+Used by train.py with factored action space.
 """
 
 from dataclasses import dataclass, field

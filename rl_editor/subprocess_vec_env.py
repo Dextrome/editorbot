@@ -2,8 +2,8 @@
 Subprocess-based vectorized environment for true multiprocessing.
 Each environment runs in its own process, bypassing the GIL.
 
-Key optimization: Auxiliary targets are computed locally in each subprocess,
-avoiding expensive IPC overhead for large numpy arrays.
+Supports factored action space: actions are tuples (type, size, amount).
+Auxiliary targets are computed locally in each subprocess to avoid IPC overhead.
 """
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
@@ -43,11 +43,14 @@ def _worker(
             
             if cmd == "batched_rollout":
                 # Run N steps with pre-computed actions (batched to reduce IPC)
+                # actions is list of (type, size, amount) tuples
                 actions, n_steps = data
                 results = []
                 for step_idx in range(n_steps):
-                    action = actions[step_idx] if step_idx < len(actions) else 0
-                    obs, reward, terminated, truncated, info = env.step(action)
+                    action = actions[step_idx] if step_idx < len(actions) else (0, 0, 0)
+                    # Convert tuple to array for factored env
+                    action_array = np.array(action, dtype=np.int64)
+                    obs, reward, terminated, truncated, info = env.step(action_array)
                     
                     # Compute auxiliary targets locally
                     aux_dict = {}
@@ -77,10 +80,19 @@ def _worker(
                                     aux_dict[k] = 0.0
                     info["aux_targets"] = aux_dict
                     
-                    # Get action mask for next step
-                    mask = env.get_action_mask()
+                    # Get factored action masks for next step
+                    type_mask, size_mask, amount_mask = env.get_action_masks()
                     
-                    results.append((obs.tolist(), reward, terminated, truncated, info, mask.tolist()))
+                    results.append((
+                        obs.tolist(), 
+                        reward, 
+                        terminated, 
+                        truncated, 
+                        info, 
+                        type_mask.tolist(),
+                        size_mask.tolist(),
+                        amount_mask.tolist(),
+                    ))
                     
                     if terminated or truncated:
                         # Reset and continue
@@ -90,7 +102,9 @@ def _worker(
                 remote.send(results)
                 
             elif cmd == "step":
-                obs, reward, terminated, truncated, info = env.step(data)
+                # data is (type, size, amount) tuple
+                action_array = np.array(data, dtype=np.int64)
+                obs, reward, terminated, truncated, info = env.step(action_array)
                 
                 # Compute auxiliary targets locally (fast, no IPC for big arrays)
                 if env.audio_state is not None and env.audio_state.beat_features is not None:
@@ -133,9 +147,10 @@ def _worker(
                 aux_computer.clear_cache()
                 remote.send((obs, info))
                 
-            elif cmd == "get_action_mask":
-                mask = env.get_action_mask()
-                remote.send(mask)
+            elif cmd == "get_action_masks":
+                # Return factored masks
+                type_mask, size_mask, amount_mask = env.get_action_masks()
+                remote.send((type_mask, size_mask, amount_mask))
                 
             elif cmd == "set_audio_state":
                 env.set_audio_state(data)
@@ -168,12 +183,14 @@ def _worker(
             env.close()
 
 
-class SubprocessVecEnvV2:
+class SubprocessVecEnv:
     """
     Vectorized environment using subprocesses for true parallelism.
     
     Each environment runs in its own process, allowing true parallel
     execution that bypasses Python's GIL.
+    
+    Supports factored action space with (type, size, amount) tuples.
     """
     
     def __init__(
@@ -211,10 +228,14 @@ class SubprocessVecEnvV2:
             self.processes.append(process)
             work_remote.close()  # Close in parent process
         
-        logger.info(f"Started {self.n_envs} subprocess environments")
+        logger.info(f"Started {self.n_envs} subprocess environments (factored actions)")
     
-    def step_async(self, actions: List[int]):
-        """Send step commands to all environments asynchronously."""
+    def step_async(self, actions: List[Tuple[int, int, int]]):
+        """Send step commands to all environments asynchronously.
+        
+        Args:
+            actions: List of (type, size, amount) tuples
+        """
         for remote, action in zip(self.remotes, actions):
             remote.send(("step", action))
         self.waiting = True
@@ -232,8 +253,12 @@ class SubprocessVecEnvV2:
         
         return obs_list, rewards, terminateds, truncateds, infos
     
-    def step_all(self, actions: List[int]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
-        """Step all environments synchronously."""
+    def step_all(self, actions: List[Tuple[int, int, int]]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
+        """Step all environments synchronously.
+        
+        Args:
+            actions: List of (type, size, amount) tuples
+        """
         self.step_async(actions)
         return self.step_wait()
     
@@ -248,13 +273,21 @@ class SubprocessVecEnvV2:
         
         return obs_list, info_list
     
-    def get_action_masks(self) -> List[np.ndarray]:
-        """Get action masks from all environments."""
-        for remote in self.remotes:
-            remote.send(("get_action_mask", None))
+    def get_action_masks(self) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """Get factored action masks from all environments.
         
-        masks = [remote.recv() for remote in self.remotes]
-        return masks
+        Returns:
+            Tuple of (type_masks, size_masks, amount_masks)
+        """
+        for remote in self.remotes:
+            remote.send(("get_action_masks", None))
+        
+        results = [remote.recv() for remote in self.remotes]
+        type_masks = [r[0] for r in results]
+        size_masks = [r[1] for r in results]
+        amount_masks = [r[2] for r in results]
+        
+        return type_masks, size_masks, amount_masks
     
     def reset_env(self, i: int) -> Tuple[np.ndarray, dict]:
         """Reset a single environment."""
@@ -271,12 +304,16 @@ class SubprocessVecEnvV2:
         for remote in self.remotes:
             remote.recv()
     
-
-    def batched_rollout(self, actions_per_env, n_steps):
+    def batched_rollout(self, actions_per_env: List[List[Tuple[int, int, int]]], n_steps: int):
         """Run batched rollouts in all environments in parallel.
         
         Each subprocess runs n_steps with pre-computed actions, reducing IPC from
         O(n_envs * n_steps) to O(n_envs).
+        
+        Args:
+            actions_per_env: List of action lists, one per environment.
+                            Each action is (type, size, amount) tuple.
+            n_steps: Number of steps to run
         """
         # Send batched rollout commands to all workers (parallel)
         for remote, actions in zip(self.remotes, actions_per_env):
@@ -287,14 +324,16 @@ class SubprocessVecEnvV2:
         for remote in self.remotes:
             env_results = remote.recv()
             processed = []
-            for obs, reward, term, trunc, info, mask in env_results:
+            for obs, reward, term, trunc, info, type_mask, size_mask, amount_mask in env_results:
                 processed.append((
                     np.array(obs),
                     reward,
                     term,
                     trunc,
                     info,
-                    np.array(mask),
+                    np.array(type_mask),
+                    np.array(size_mask),
+                    np.array(amount_mask),
                 ))
             all_results.append(processed)
         
@@ -327,25 +366,24 @@ def make_subprocess_vec_env(
     config,
     n_envs: int,
     learned_reward_model: Optional[Any] = None,
-) -> SubprocessVecEnvV2:
+) -> SubprocessVecEnv:
     """
     Factory function to create subprocess vectorized environment.
     
     Args:
         config: Configuration object
         n_envs: Number of parallel environments
-        learned_reward_model: Optional learned reward model (currently not used in V2 env)
+        learned_reward_model: Optional learned reward model for RLHF
         
     Returns:
-        SubprocessVecEnvV2 instance
+        SubprocessVecEnv instance with factored action support
     """
-    from rl_editor.environment_v2 import AudioEditingEnvV2
+    from rl_editor.environment import AudioEditingEnvFactored
     
-    # Note: learned_reward_model is not passed to V2 env (reward computed in trainer)
     def make_env():
-        return AudioEditingEnvV2(config)
+        return AudioEditingEnvFactored(config, learned_reward_model=learned_reward_model)
     
     env_fns = [make_env for _ in range(n_envs)]
     
-    return SubprocessVecEnvV2(env_fns, start_method="spawn")
+    return SubprocessVecEnv(env_fns, start_method="spawn")
 
