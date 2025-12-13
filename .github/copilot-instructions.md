@@ -25,12 +25,13 @@ Input Audio  [RL Agent: Factored actions]  Output
             Reward: Episode-end audio quality metrics (Monte Carlo)
 ```
 
-### Factored Action Space (18 types × 5 sizes × 5 amounts)
-**Action Types** (18):
+### Factored Action Space (20 types × 5 sizes × 5 amounts)
+**Action Types** (20):
 - **Core**: KEEP, CUT, LOOP, REORDER
 - **Navigation**: JUMP_BACK, SKIP
 - **Volume**: FADE_IN, FADE_OUT, GAIN
-- **Time**: DOUBLE_TIME, HALF_TIME, REVERSE
+- **Time/Speed**: SPEED_UP, SPEED_DOWN, REVERSE (amount affects intensity)
+- **Pitch**: PITCH_UP, PITCH_DOWN (amount affects semitones)
 - **EQ**: EQ_LOW, EQ_HIGH
 - **Effects**: DISTORTION, REVERB
 - **Structure**: REPEAT_PREV, SWAP_NEXT
@@ -38,6 +39,10 @@ Input Audio  [RL Agent: Factored actions]  Output
 **Action Sizes** (5): BEAT (1), BAR (4), PHRASE (8), TWO_BARS (8), TWO_PHRASES (16)
 
 **Action Amounts** (5): NEG_LARGE, NEG_SMALL, NEUTRAL, POS_SMALL, POS_LARGE
+- For SPEED_UP: 1.1x to 2.0x
+- For SPEED_DOWN: 0.5x to 0.9x
+- For PITCH_UP: +1 to +6 semitones
+- For PITCH_DOWN: -6 to -1 semitones
 
 ### State Representation
 - **Current position** in track (beat index)

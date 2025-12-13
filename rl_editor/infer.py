@@ -382,6 +382,15 @@ def apply_time_stretch(audio: np.ndarray, sr: int, rate: float) -> np.ndarray:
         return audio
 
 
+def apply_pitch_shift(audio: np.ndarray, sr: int, n_steps: int) -> np.ndarray:
+    """Apply pitch shift in semitones (librosa)."""
+    try:
+        return librosa.effects.pitch_shift(audio, sr=sr, n_steps=n_steps)
+    except Exception as e:
+        logger.warning(f"Pitch shift failed: {e}")
+        return audio
+
+
 def create_edited_audio(
     audio: np.ndarray,
     sr: int,
@@ -397,7 +406,8 @@ def create_edited_audio(
     - LOOP: Duplicate the segment 2x
     - FADE_IN/OUT: Apply fade effects
     - GAIN: Volume change
-    - DOUBLE_TIME/HALF_TIME: Time stretch
+    - SPEED_UP/SPEED_DOWN: Time stretch (amount determines intensity)
+    - PITCH_UP/PITCH_DOWN: Pitch shift (amount determines semitones)
     - REVERSE: Play backwards
     - And more...
     
@@ -485,20 +495,22 @@ def create_edited_audio(
                 "action": f"GAIN_{db}dB"
             })
             
-        elif action.action_type == ActionType.DOUBLE_TIME:
-            stretched = apply_time_stretch(segment, sr, 2.0)
+        elif action.action_type == ActionType.SPEED_UP:
+            speed_factor = action.speed_factor
+            stretched = apply_time_stretch(segment, sr, speed_factor)
             segments.append({
                 "beat": current_beat,
                 "audio": stretched,
-                "action": "DOUBLE_TIME"
+                "action": f"SPEED_UP_{speed_factor}x"
             })
             
-        elif action.action_type == ActionType.HALF_TIME:
-            stretched = apply_time_stretch(segment, sr, 0.5)
+        elif action.action_type == ActionType.SPEED_DOWN:
+            speed_factor = action.speed_factor
+            stretched = apply_time_stretch(segment, sr, speed_factor)
             segments.append({
                 "beat": current_beat,
                 "audio": stretched,
-                "action": "HALF_TIME"
+                "action": f"SPEED_DOWN_{speed_factor}x"
             })
             
         elif action.action_type == ActionType.REVERSE:
@@ -507,6 +519,24 @@ def create_edited_audio(
                 "beat": current_beat,
                 "audio": reversed_seg,
                 "action": "REVERSE"
+            })
+            
+        elif action.action_type == ActionType.PITCH_UP:
+            semitones = action.pitch_semitones
+            pitched = apply_pitch_shift(segment, sr, semitones)
+            segments.append({
+                "beat": current_beat,
+                "audio": pitched,
+                "action": f"PITCH_UP_{semitones}"
+            })
+            
+        elif action.action_type == ActionType.PITCH_DOWN:
+            semitones = action.pitch_semitones
+            pitched = apply_pitch_shift(segment, sr, semitones)
+            segments.append({
+                "beat": current_beat,
+                "audio": pitched,
+                "action": f"PITCH_DOWN_{semitones}"
             })
             
         elif action.action_type == ActionType.REORDER:

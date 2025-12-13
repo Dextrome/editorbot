@@ -1,11 +1,11 @@
 """Factored Action Space for RL-based audio editor.
 
 Instead of a single discrete action (39+ values), we use 3 output heads:
-1. Action Type (18 types): WHAT to do
+1. Action Type (20 types): WHAT to do
 2. Action Size (5 sizes): HOW MANY beats
 3. Action Amount (5 amounts): HOW MUCH (intensity/direction)
 
-This gives us 18 * 5 * 5 = 450 possible action combinations from just 28 outputs.
+This gives us 20 * 5 * 5 = 500 possible action combinations from just 30 outputs.
 The model learns "what" separately from "how much", making it easier to generalize.
 
 Example combinations:
@@ -22,7 +22,7 @@ import numpy as np
 
 
 class ActionType(IntEnum):
-    """What kind of action to take (18 types)."""
+    """What kind of action to take (20 types)."""
     # Core editing
     KEEP = 0        # Keep audio segment
     CUT = 1         # Cut/remove audio segment
@@ -38,22 +38,26 @@ class ActionType(IntEnum):
     FADE_OUT = 7    # Fade out effect
     GAIN = 8        # Volume change
     
-    # Effects - Time
-    DOUBLE_TIME = 9   # 2x speed
-    HALF_TIME = 10    # 0.5x speed
+    # Effects - Time/Speed (amount determines intensity)
+    SPEED_UP = 9      # Speed up (amount: small=1.25x, large=2x)
+    SPEED_DOWN = 10   # Slow down (amount: small=0.75x, large=0.5x)
     REVERSE = 11      # Play backwards
     
+    # Effects - Pitch (amount determines intensity)
+    PITCH_UP = 12     # Pitch up (amount: small=+3, large=+6 semitones)
+    PITCH_DOWN = 13   # Pitch down (amount: small=-3, large=-6 semitones)
+    
     # Effects - EQ
-    EQ_LOW = 12     # Bass boost/cut
-    EQ_HIGH = 13    # Treble boost/cut
+    EQ_LOW = 14     # Bass boost/cut
+    EQ_HIGH = 15    # Treble boost/cut
     
     # Effects - Creative
-    DISTORTION = 14 # Distortion effect
-    REVERB = 15     # Reverb effect
+    DISTORTION = 16 # Distortion effect
+    REVERB = 17     # Reverb effect
     
     # Movement/Copy
-    REPEAT_PREV = 16  # Copy previous section here (drop/repeat)
-    SWAP_NEXT = 17    # Swap with next section
+    REPEAT_PREV = 18  # Copy previous section here (drop/repeat)
+    SWAP_NEXT = 19    # Swap with next section
 
 
 class ActionSize(IntEnum):
@@ -78,7 +82,7 @@ class ActionAmount(IntEnum):
 
 
 # Constants for easy access
-N_ACTION_TYPES = len(ActionType)      # 18
+N_ACTION_TYPES = len(ActionType)      # 20
 N_ACTION_SIZES = len(ActionSize)      # 5
 N_ACTION_AMOUNTS = len(ActionAmount)  # 5
 
@@ -109,6 +113,42 @@ AMOUNT_TO_JUMP = {
     ActionAmount.POS_LARGE: 8,
 }
 
+# Amount to speed factor mapping for SPEED_UP
+AMOUNT_TO_SPEED_UP = {
+    ActionAmount.NEG_LARGE: 1.1,   # Minimal speed up
+    ActionAmount.NEG_SMALL: 1.15,
+    ActionAmount.NEUTRAL: 1.25,    # Default
+    ActionAmount.POS_SMALL: 1.5,
+    ActionAmount.POS_LARGE: 2.0,   # Double speed
+}
+
+# Amount to speed factor mapping for SPEED_DOWN
+AMOUNT_TO_SPEED_DOWN = {
+    ActionAmount.NEG_LARGE: 0.5,   # Half speed
+    ActionAmount.NEG_SMALL: 0.6,
+    ActionAmount.NEUTRAL: 0.75,    # Default
+    ActionAmount.POS_SMALL: 0.85,
+    ActionAmount.POS_LARGE: 0.9,   # Minimal slow down
+}
+
+# Amount to semitones mapping for PITCH_UP
+AMOUNT_TO_PITCH_UP = {
+    ActionAmount.NEG_LARGE: 1,     # +1 semitone
+    ActionAmount.NEG_SMALL: 2,     # +2 semitones
+    ActionAmount.NEUTRAL: 3,       # +3 semitones (default)
+    ActionAmount.POS_SMALL: 5,     # +5 semitones
+    ActionAmount.POS_LARGE: 6,     # +6 semitones (tritone)
+}
+
+# Amount to semitones mapping for PITCH_DOWN
+AMOUNT_TO_PITCH_DOWN = {
+    ActionAmount.NEG_LARGE: -6,    # -6 semitones (tritone down)
+    ActionAmount.NEG_SMALL: -5,    # -5 semitones
+    ActionAmount.NEUTRAL: -3,      # -3 semitones (default)
+    ActionAmount.POS_SMALL: -2,    # -2 semitones
+    ActionAmount.POS_LARGE: -1,    # -1 semitone
+}
+
 
 class FactoredAction(NamedTuple):
     """A factored action with type, size, and amount."""
@@ -131,6 +171,24 @@ class FactoredAction(NamedTuple):
     def jump_beats(self) -> int:
         """Jump distance for JUMP_BACK actions."""
         return AMOUNT_TO_JUMP[self.action_amount]
+    
+    @property
+    def speed_factor(self) -> float:
+        """Speed factor for SPEED_UP/SPEED_DOWN actions."""
+        if self.action_type == ActionType.SPEED_UP:
+            return AMOUNT_TO_SPEED_UP[self.action_amount]
+        elif self.action_type == ActionType.SPEED_DOWN:
+            return AMOUNT_TO_SPEED_DOWN[self.action_amount]
+        return 1.0
+    
+    @property
+    def pitch_semitones(self) -> int:
+        """Pitch shift in semitones for PITCH_UP/PITCH_DOWN actions."""
+        if self.action_type == ActionType.PITCH_UP:
+            return AMOUNT_TO_PITCH_UP[self.action_amount]
+        elif self.action_type == ActionType.PITCH_DOWN:
+            return AMOUNT_TO_PITCH_DOWN[self.action_amount]
+        return 0
     
     def to_tuple(self) -> Tuple[int, int, int]:
         """Convert to integer tuple for network output."""
@@ -239,8 +297,12 @@ class FactoredActionSpace:
             mask[ActionType.FADE_OUT] = False
         
         if len(edit_history.time_changes) >= 3:
-            mask[ActionType.DOUBLE_TIME] = False
-            mask[ActionType.HALF_TIME] = False
+            mask[ActionType.SPEED_UP] = False
+            mask[ActionType.SPEED_DOWN] = False
+        
+        if len(edit_history.pitch_changes) >= 3:
+            mask[ActionType.PITCH_UP] = False
+            mask[ActionType.PITCH_DOWN] = False
         
         if len(edit_history.reversed_sections) >= 3:
             mask[ActionType.REVERSE] = False
@@ -387,6 +449,7 @@ class EditHistoryFactored:
         self.reordered_beats: set = set()  # Track reordered beats for get_edited_beats
         self.fade_markers: list = []  # [(start_beat, n_beats, 'in'|'out')]
         self.time_changes: list = []  # [(start_beat, n_beats, factor)]
+        self.pitch_changes: list = []  # [(start_beat, n_beats, semitones)]
         self.reversed_sections: list = []  # [(start_beat, n_beats)]
         self.gain_changes: list = []  # [(start_beat, n_beats, db_change)]
         self.eq_changes: list = []  # [(start_beat, n_beats, eq_type)]
@@ -550,22 +613,38 @@ def apply_factored_action(
         edit_history.gain_changes.append((current_beat, n_beats_affected, db))
         return n_beats_affected
     
-    # DOUBLE_TIME
-    elif atype == ActionType.DOUBLE_TIME:
+    # SPEED_UP
+    elif atype == ActionType.SPEED_UP:
+        speed_factor = action.speed_factor
         edit_history.add_keep_section(current_beat, n_beats_affected)
-        edit_history.time_changes.append((current_beat, n_beats_affected, 2.0))
+        edit_history.time_changes.append((current_beat, n_beats_affected, speed_factor))
         return n_beats_affected
     
-    # HALF_TIME
-    elif atype == ActionType.HALF_TIME:
+    # SPEED_DOWN
+    elif atype == ActionType.SPEED_DOWN:
+        speed_factor = action.speed_factor
         edit_history.add_keep_section(current_beat, n_beats_affected)
-        edit_history.time_changes.append((current_beat, n_beats_affected, 0.5))
+        edit_history.time_changes.append((current_beat, n_beats_affected, speed_factor))
         return n_beats_affected
     
     # REVERSE
     elif atype == ActionType.REVERSE:
         edit_history.add_keep_section(current_beat, n_beats_affected)
         edit_history.reversed_sections.append((current_beat, n_beats_affected))
+        return n_beats_affected
+    
+    # PITCH_UP
+    elif atype == ActionType.PITCH_UP:
+        semitones = action.pitch_semitones
+        edit_history.add_keep_section(current_beat, n_beats_affected)
+        edit_history.pitch_changes.append((current_beat, n_beats_affected, semitones))
+        return n_beats_affected
+    
+    # PITCH_DOWN
+    elif atype == ActionType.PITCH_DOWN:
+        semitones = action.pitch_semitones
+        edit_history.add_keep_section(current_beat, n_beats_affected)
+        edit_history.pitch_changes.append((current_beat, n_beats_affected, semitones))
         return n_beats_affected
     
     # EQ_LOW

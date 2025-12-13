@@ -4,7 +4,7 @@ Uses 3-head policy network: (action_type, action_size, action_amount)
 Combined log prob = log P(type) + log P(size|type) + log P(amount|type)
 
 Features:
-- Factored action space: 18 types × 5 sizes × 5 amounts = 450 combinations
+- Factored action space: 20 types × 5 sizes × 5 amounts = 500 combinations
 - Subprocess parallelism for true multiprocessing
 - Episode-level rewards (Monte Carlo returns)
 - Curriculum learning (short segments → long segments)

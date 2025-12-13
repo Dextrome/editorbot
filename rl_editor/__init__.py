@@ -5,7 +5,7 @@ with section-level actions (KEEP_PHRASE, CUT_BAR, LOOP, etc.).
 Crossfades are applied automatically at edit boundaries.
 
 Uses factored 3-head action space:
-- Type head: What action (18 types: KEEP, CUT, LOOP, FADE, etc.)
+- Type head: What action (20 types: KEEP, CUT, LOOP, FADE, SPEED, PITCH, etc.)
 - Size head: How many beats (5 sizes: BEAT, BAR, PHRASE, etc.)
 - Amount head: Intensity/direction (5 amounts: -3dB to +3dB, etc.)
 

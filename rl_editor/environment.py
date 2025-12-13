@@ -19,9 +19,61 @@ from .actions import (
     FactoredAction, FactoredActionSpace, EditHistoryFactored,
     N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,
     apply_factored_action,
+    AMOUNT_TO_PITCH_UP, AMOUNT_TO_PITCH_DOWN, AMOUNT_TO_DB,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Feature indices (based on default FeatureConfig order)
+# These assume default feature extraction settings
+FEATURE_RMS_IDX = 1  # Energy/loudness
+FEATURE_CHROMA_START = 40  # Start of 12 chroma bins (pitch class)
+FEATURE_CHROMA_END = 52    # End of chroma bins
+
+
+def _get_chroma_from_beat(beat_features: np.ndarray, beat_idx: int) -> Optional[np.ndarray]:
+    """Extract chroma (pitch class) features from a beat.
+    
+    Returns normalized 12-dimensional chroma vector or None if unavailable.
+    """
+    if beat_features is None or beat_idx < 0 or beat_idx >= len(beat_features):
+        return None
+    
+    feat_dim = beat_features.shape[1] if beat_features.ndim > 1 else 0
+    if feat_dim < FEATURE_CHROMA_END:
+        return None  # Not enough features
+    
+    chroma = beat_features[beat_idx, FEATURE_CHROMA_START:FEATURE_CHROMA_END]
+    
+    # Normalize to unit vector for cosine similarity
+    norm = np.linalg.norm(chroma)
+    if norm > 1e-6:
+        return chroma / norm
+    return chroma
+
+
+def _get_rms_from_beat(beat_features: np.ndarray, beat_idx: int) -> Optional[float]:
+    """Extract RMS (energy) from a beat."""
+    if beat_features is None or beat_idx < 0 or beat_idx >= len(beat_features):
+        return None
+    
+    feat_dim = beat_features.shape[1] if beat_features.ndim > 1 else 0
+    if feat_dim <= FEATURE_RMS_IDX:
+        return None
+    
+    return float(beat_features[beat_idx, FEATURE_RMS_IDX])
+
+
+def _shift_chroma(chroma: np.ndarray, semitones: int) -> np.ndarray:
+    """Shift chroma vector by semitones (circular rotation)."""
+    return np.roll(chroma, semitones)
+
+
+def _chroma_similarity(chroma1: np.ndarray, chroma2: np.ndarray) -> float:
+    """Compute cosine similarity between two chroma vectors."""
+    dot = np.dot(chroma1, chroma2)
+    return float(np.clip(dot, -1.0, 1.0))
 
 
 class AudioEditingEnvFactored(gym.Env):
@@ -359,8 +411,9 @@ class AudioEditingEnvFactored(gym.Env):
         # === 5. Creative action bonus ===
         creative_types = {
             ActionType.FADE_IN, ActionType.FADE_OUT,
-            ActionType.DOUBLE_TIME, ActionType.HALF_TIME,
+            ActionType.SPEED_UP, ActionType.SPEED_DOWN,
             ActionType.REVERSE, ActionType.GAIN,
+            ActionType.PITCH_UP, ActionType.PITCH_DOWN,
             ActionType.EQ_LOW, ActionType.EQ_HIGH,
             ActionType.DISTORTION, ActionType.REVERB,
             ActionType.REPEAT_PREV, ActionType.SWAP_NEXT,
@@ -394,7 +447,12 @@ class AudioEditingEnvFactored(gym.Env):
         reward += efficiency_reward
         self.episode_reward_breakdown['efficiency'] = efficiency_reward
         
-        # === 8. Learned reward model (RLHF) ===
+        # === 8. Smart effect rewards (pitch/gain appropriateness) ===
+        smart_effect_reward = self._compute_smart_effect_reward()
+        reward += smart_effect_reward
+        self.episode_reward_breakdown['smart_effects'] = smart_effect_reward
+        
+        # === 9. Learned reward model (RLHF) ===
         learned_reward = 0.0
         if self.learned_reward_model is not None:
             try:
@@ -429,6 +487,111 @@ class AudioEditingEnvFactored(gym.Env):
         self.episode_reward_breakdown['total'] = reward
         
         return reward
+
+    def _compute_smart_effect_reward(self) -> float:
+        """Compute reward for appropriate use of pitch/gain effects.
+        
+        Rewards:
+        - PITCH_UP/PITCH_DOWN: Better if shifted pitch aligns harmonically with next beat
+        - GAIN: Better if gain change creates smoother energy transitions
+        - SPEED_UP/SPEED_DOWN: Small bonus for using amount appropriately
+        
+        Returns:
+            Smart effect reward (can be positive or negative)
+        """
+        if self.audio_state is None or self.audio_state.beat_features is None:
+            return 0.0
+        
+        beat_features = self.audio_state.beat_features
+        n_beats = len(self.audio_state.beat_times)
+        
+        pitch_reward = 0.0
+        gain_reward = 0.0
+        speed_reward = 0.0
+        n_pitch_actions = 0
+        n_gain_actions = 0
+        n_speed_actions = 0
+        
+        for action in self.episode_actions:
+            beat_idx = action.beat_index
+            next_beat_idx = min(beat_idx + action.n_beats, n_beats - 1)
+            prev_beat_idx = max(beat_idx - 1, 0)
+            
+            # === PITCH_UP / PITCH_DOWN ===
+            if action.action_type in (ActionType.PITCH_UP, ActionType.PITCH_DOWN):
+                current_chroma = _get_chroma_from_beat(beat_features, beat_idx)
+                next_chroma = _get_chroma_from_beat(beat_features, next_beat_idx)
+                
+                if current_chroma is not None and next_chroma is not None:
+                    # Get semitone shift
+                    if action.action_type == ActionType.PITCH_UP:
+                        semitones = AMOUNT_TO_PITCH_UP[action.action_amount]
+                    else:
+                        semitones = AMOUNT_TO_PITCH_DOWN[action.action_amount]
+                    
+                    # Compute similarity before and after shift
+                    original_sim = _chroma_similarity(current_chroma, next_chroma)
+                    shifted_chroma = _shift_chroma(current_chroma, semitones)
+                    shifted_sim = _chroma_similarity(shifted_chroma, next_chroma)
+                    
+                    # Reward if shift improved harmonic alignment
+                    improvement = shifted_sim - original_sim
+                    if improvement > 0.1:
+                        pitch_reward += 3.0  # Good pitch shift
+                    elif improvement > 0:
+                        pitch_reward += 1.0  # Slight improvement
+                    elif improvement < -0.2:
+                        pitch_reward -= 2.0  # Made it worse
+                    
+                    n_pitch_actions += 1
+            
+            # === GAIN ===
+            elif action.action_type == ActionType.GAIN:
+                current_rms = _get_rms_from_beat(beat_features, beat_idx)
+                prev_rms = _get_rms_from_beat(beat_features, prev_beat_idx)
+                next_rms = _get_rms_from_beat(beat_features, next_beat_idx)
+                
+                if current_rms is not None and prev_rms is not None and next_rms is not None:
+                    db_change = AMOUNT_TO_DB[action.action_amount]
+                    
+                    # Convert dB to linear scale for RMS comparison
+                    gain_factor = 10 ** (db_change / 20)
+                    adjusted_rms = current_rms * gain_factor
+                    
+                    # Compute how well the adjusted RMS fits between neighbors
+                    # Target: smooth transition (closer to average of prev and next)
+                    target_rms = (prev_rms + next_rms) / 2
+                    
+                    # How close is adjusted_rms to target vs original?
+                    original_error = abs(current_rms - target_rms)
+                    adjusted_error = abs(adjusted_rms - target_rms)
+                    
+                    if adjusted_error < original_error * 0.7:
+                        gain_reward += 2.0  # Good gain adjustment
+                    elif adjusted_error < original_error:
+                        gain_reward += 0.5  # Slight improvement
+                    elif adjusted_error > original_error * 1.3:
+                        gain_reward -= 1.5  # Made transition worse
+                    
+                    n_gain_actions += 1
+            
+            # === SPEED_UP / SPEED_DOWN ===
+            elif action.action_type in (ActionType.SPEED_UP, ActionType.SPEED_DOWN):
+                # Small bonus for using varied amounts (not always default)
+                if action.action_amount != ActionAmount.NEUTRAL:
+                    speed_reward += 0.5
+                n_speed_actions += 1
+        
+        # Normalize by number of actions (avoid over-rewarding many effects)
+        total_reward = 0.0
+        if n_pitch_actions > 0:
+            total_reward += min(pitch_reward, 18.0)  # Cap at 18
+        if n_gain_actions > 0:
+            total_reward += min(gain_reward, 13.0)    # Cap at 13
+        if n_speed_actions > 0:
+            total_reward += min(speed_reward, 9.0)   # Cap at 9
+        
+        return total_reward
 
     def set_learned_reward_model(self, model: Any) -> None:
         """Set learned reward model for RLHF."""
