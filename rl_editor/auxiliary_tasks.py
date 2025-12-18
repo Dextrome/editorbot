@@ -44,7 +44,14 @@ class AuxiliaryConfig:
     phrase_loss_weight: float = 0.03     # Was 0.2
     reconstruction_loss_weight: float = 0.001  # Was 0.1 - MSE can be huge!
     similarity_loss_weight: float = 0.02
+    # Mel-spectrogram reconstruction (per-beat) from training pairs
+    use_mel_reconstruction: bool = True
+    mel_reconstruction_weight: float = 0.01
+    mel_dim: int = 128
     
+    # Binary good/bad edit classifier
+    use_good_bad_classifier: bool = True
+    good_bad_loss_weight: float = 1.0
     # Task-specific settings
     tempo_bins: int = 20  # Discretize tempo into bins (60-180 BPM)
     tempo_min: float = 60.0
@@ -210,6 +217,25 @@ class EnergyPredictor(nn.Module):
         return targets
 
 
+class GoodBadClassifier(nn.Module):
+    """Binary classifier head for predicting whether an edited beat is 'good'.
+
+    Takes encoder output (B, hidden_dim) and returns a single logit per sample.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, encoded: torch.Tensor) -> torch.Tensor:
+        return self.head(encoded)
+
+
 class PhraseBoundaryDetector(nn.Module):
     """Detect phrase boundaries (every 4 or 8 beats typically).
     
@@ -322,6 +348,27 @@ class BeatReconstructor(nn.Module):
                 valid_mask[i] = 0.0
         
         return targets, valid_mask
+
+
+class MelReconstructor(nn.Module):
+    """Predict per-beat mel-spectrogram vector for the edited output.
+
+    This uses the encoder's hidden representation to predict a mel vector
+    representing the edited audio for the current beat (aligned to beats).
+    """
+
+    def __init__(self, hidden_dim: int, mel_dim: int = 128):
+        super().__init__()
+        self.mel_dim = mel_dim
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, mel_dim),
+        )
+
+    def forward(self, encoded: torch.Tensor) -> torch.Tensor:
+        return self.head(encoded)
 
 
 class SectionSimilarityPredictor(nn.Module):
@@ -577,6 +624,123 @@ def compute_auxiliary_targets(
     return targets
 
 
+class AuxiliaryTaskModule(nn.Module):
+    """Combined auxiliary task module used by the Agent.
+
+    Provides multiple prediction heads and a unified loss computation.
+    """
+
+    def __init__(self, hidden_dim: int, beat_feature_dim: int, config: Optional[AuxiliaryConfig] = None):
+        super().__init__()
+        self.config = config or AuxiliaryConfig()
+        self.hidden_dim = hidden_dim
+        self.beat_feature_dim = beat_feature_dim
+
+        # Heads
+        self.tempo_predictor = TempoPredictor(hidden_dim, self.config.tempo_bins) if self.config.use_tempo_prediction else None
+        self.energy_predictor = EnergyPredictor(hidden_dim, self.config.energy_bins) if self.config.use_energy_prediction else None
+        self.phrase_detector = PhraseBoundaryDetector(hidden_dim) if self.config.use_phrase_boundary else None
+        self.reconstructor = BeatReconstructor(hidden_dim, beat_feature_dim) if self.config.use_beat_reconstruction else None
+        self.mel_reconstructor = MelReconstructor(hidden_dim, self.config.mel_dim) if self.config.use_mel_reconstruction else None
+        self.good_bad_classifier = GoodBadClassifier(hidden_dim) if self.config.use_good_bad_classifier else None
+        self.similarity_predictor = SectionSimilarityPredictor(hidden_dim) if self.config.use_section_similarity else None
+
+    def forward(self, encoded: torch.Tensor, encoded2: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        preds: Dict[str, torch.Tensor] = {}
+        if self.tempo_predictor is not None:
+            preds["tempo"] = self.tempo_predictor(encoded)
+        if self.energy_predictor is not None:
+            preds["energy"] = self.energy_predictor(encoded)
+        if self.phrase_detector is not None:
+            preds["phrase"] = self.phrase_detector(encoded)
+        if self.reconstructor is not None:
+            preds["reconstruction"] = self.reconstructor(encoded)
+        if self.mel_reconstructor is not None:
+            preds["mel_reconstruction"] = self.mel_reconstructor(encoded)
+        if self.good_bad_classifier is not None:
+            preds["good_bad"] = self.good_bad_classifier(encoded)
+        if self.similarity_predictor is not None and encoded2 is not None:
+            preds["similarity"] = self.similarity_predictor(encoded, encoded2)
+        return preds
+
+    def compute_losses(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], epoch: int = 0) -> Tuple[torch.Tensor, Dict[str, float]]:
+        losses: Dict[str, float] = {}
+        device = next(self.parameters()).device
+        total_loss = torch.tensor(0.0, device=device)
+
+        warmup_factor = min(1.0, epoch / max(self.config.warmup_epochs, 1))
+
+        if "tempo" in predictions and "tempo" in targets:
+            tempo_loss = F.cross_entropy(predictions["tempo"], targets["tempo"].to(device))
+            w = self.config.tempo_loss_weight * warmup_factor
+            total_loss = total_loss + w * tempo_loss
+            losses["tempo_loss"] = float(tempo_loss.item())
+
+        if "energy" in predictions and "energy" in targets:
+            energy_loss = F.cross_entropy(predictions["energy"], targets["energy"].to(device))
+            w = self.config.energy_loss_weight * warmup_factor
+            total_loss = total_loss + w * energy_loss
+            losses["energy_loss"] = float(energy_loss.item())
+
+        if "phrase" in predictions and "phrase" in targets:
+            phrase_pred = predictions["phrase"].squeeze(-1)
+            phrase_t = targets["phrase"].to(device).float()
+            phrase_loss = F.binary_cross_entropy_with_logits(phrase_pred, phrase_t)
+            w = self.config.phrase_loss_weight * warmup_factor
+            total_loss = total_loss + w * phrase_loss
+            losses["phrase_loss"] = float(phrase_loss.item())
+
+        if "reconstruction" in predictions and "reconstruction" in targets:
+            pred = predictions["reconstruction"]
+            tgt = targets["reconstruction"].to(device)
+            mask = targets.get("reconstruction_mask", torch.ones(pred.shape[0], device=device))
+            # Normalize
+            tgt_mean = tgt.mean(); tgt_std = tgt.std() + 1e-8
+            pred_mean = pred.mean(); pred_std = pred.std() + 1e-8
+            pred_n = (pred - pred_mean) / pred_std
+            tgt_n = (tgt - tgt_mean) / tgt_std
+            recon_loss = F.mse_loss(pred_n, tgt_n, reduction='none')
+            recon_loss = (recon_loss.mean(dim=-1) * mask).sum() / (mask.sum().clamp(min=1.0))
+            recon_loss = torch.clamp(recon_loss, 0.0, 10.0)
+            w = self.config.reconstruction_loss_weight * warmup_factor
+            total_loss = total_loss + w * recon_loss
+            losses["reconstruction_loss"] = float(recon_loss.item())
+
+        if "mel_reconstruction" in predictions and "mel_reconstruction" in targets:
+            pred = predictions["mel_reconstruction"]
+            tgt = targets["mel_reconstruction"].to(device)
+            mask = targets.get("mel_reconstruction_mask", torch.ones(pred.shape[0], device=device))
+            pred_mean = pred.mean(); pred_std = pred.std() + 1e-8
+            tgt_mean = tgt.mean(); tgt_std = tgt.std() + 1e-8
+            pred_n = (pred - pred_mean) / pred_std
+            tgt_n = (tgt - tgt_mean) / tgt_std
+            mel_loss = F.mse_loss(pred_n, tgt_n, reduction='none')
+            mel_loss = (mel_loss.mean(dim=-1) * mask).sum() / (mask.sum().clamp(min=1.0))
+            mel_loss = torch.clamp(mel_loss, 0.0, 50.0)
+            w = self.config.mel_reconstruction_weight * warmup_factor
+            total_loss = total_loss + w * mel_loss
+            losses["mel_reconstruction_loss"] = float(mel_loss.item())
+
+        if "good_bad" in predictions and "good_bad" in targets:
+            gb_pred = predictions["good_bad"].squeeze(-1)
+            gb_t = targets["good_bad"].to(device).float()
+            gb_loss = F.binary_cross_entropy_with_logits(gb_pred, gb_t)
+            w = self.config.good_bad_loss_weight * warmup_factor
+            total_loss = total_loss + w * gb_loss
+            losses["good_bad_loss"] = float(gb_loss.item())
+
+        if "similarity" in predictions and "similarity" in targets:
+            sim_pred = predictions["similarity"].squeeze(-1)
+            sim_t = targets["similarity"].to(device).float()
+            sim_loss = F.binary_cross_entropy_with_logits(sim_pred, sim_t)
+            w = self.config.similarity_loss_weight * warmup_factor
+            total_loss = total_loss + w * sim_loss
+            losses["similarity_loss"] = float(sim_loss.item())
+
+        losses["total_auxiliary_loss"] = float(total_loss.item())
+        return total_loss, losses
+
+
 class AuxiliaryTargetComputer:
     """Caches and computes auxiliary targets efficiently during training."""
     
@@ -590,6 +754,7 @@ class AuxiliaryTargetComputer:
         beat_times: np.ndarray,
         beat_features: np.ndarray,
         beat_indices: np.ndarray,
+        edited_mel: Optional[np.ndarray] = None,
     ) -> Dict[str, np.ndarray]:
         """Get auxiliary targets, using cache when possible.
         
@@ -624,6 +789,37 @@ class AuxiliaryTargetComputer:
             )
             targets["reconstruction"] = recon_targets
             targets["reconstruction_mask"] = recon_mask
+
+        # Handle mel reconstruction targets (if provided)
+        if self.config.use_mel_reconstruction and edited_mel is not None:
+            # Expect edited_mel as (n_beats, mel_dim) or (n_frames, n_mels)
+            try:
+                n_beats = len(beat_times)
+                if edited_mel.shape[0] == n_beats:
+                    # Per-beat mel vectors available
+                    safe_indices = np.clip(beat_indices, 0, n_beats - 1)
+                    targets["mel_reconstruction"] = edited_mel[safe_indices]
+                    targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
+                else:
+                    # Fallback: compute simple per-beat mel summary by averaging frames
+                    # edited_mel shape (n_mels, n_frames) or (n_frames, n_mels)
+                    mel = np.array(edited_mel)
+                    if mel.ndim == 2:
+                        if mel.shape[0] == self.config.mel_dim:
+                            # (n_mels, n_frames) -> compute mean per beat across frames
+                            frames = mel.shape[1]
+                            per_beat = np.zeros((n_beats, mel.shape[0]), dtype=np.float32)
+                            frames_per_beat = max(1, frames // max(1, n_beats))
+                            for i in range(n_beats):
+                                s = i * frames_per_beat
+                                e = min(frames, (i + 1) * frames_per_beat)
+                                per_beat[i] = mel[:, s:e].mean(axis=1)
+                            safe_indices = np.clip(beat_indices, 0, n_beats - 1)
+                            targets["mel_reconstruction"] = per_beat[safe_indices]
+                            targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
+            except Exception:
+                # If anything fails, skip mel targets
+                pass
         
         return targets
     

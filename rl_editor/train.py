@@ -15,6 +15,8 @@ Features:
 import time
 import sys
 import multiprocessing as mp
+
+from rl_editor.features import BeatFeatureExtractor
 if sys.platform == 'win32':
     try:
         mp.set_start_method('spawn', force=True)
@@ -118,6 +120,8 @@ class RolloutBuffer:
         "phrase": [],
         "reconstruction": [],
         "reconstruction_mask": [],
+        "mel_reconstruction": [],
+        "mel_reconstruction_mask": [],
     })
     
     def clear(self):
@@ -142,6 +146,8 @@ class RolloutBuffer:
             "phrase": [],
             "reconstruction": [],
             "reconstruction_mask": [],
+            "mel_reconstruction": [],
+            "mel_reconstruction_mask": [],
         }
     
     def add(
@@ -339,6 +345,15 @@ class PPOTrainer:
         self.reward_mean = 0.0
         self.reward_var = 1.0
         self.reward_count = 1
+
+        # BC (behavior cloning) dataset for mixed supervised loss
+        self.bc_states = None
+        self.bc_type_labels = None
+        self.bc_size_labels = None
+        self.bc_amount_labels = None
+        self.bc_good_bad_labels = None
+        self.bc_loss_weight = 0.0
+        self.bc_batch_size = 64
         
         # Auxiliary tasks
         self.aux_config = AuxiliaryConfig()
@@ -432,7 +447,7 @@ class PPOTrainer:
         # Setup environments
         self.vec_env.set_audio_states(audio_states)
         obs_list, _ = self.vec_env.reset_all()
-        
+                                       
         # Initialize agent if needed
         if self.agent is None:
             input_dim = obs_list[0].shape[0]
@@ -529,9 +544,24 @@ class PPOTrainer:
                 for i in range(len(obs_list)):
                     env = self.vec_env.envs[i]
                     if env is not None and env.audio_state is not None:
-                        beat_indices.append(env.current_beat)
-                        # Skip per-step aux targets for speed
-                        aux_targets_list.append(None)
+                        beat_idx = int(env.current_beat)
+                        beat_indices.append(beat_idx)
+                        # Compute per-step auxiliary targets using available edited mel if present
+                        try:
+                            edited_mel = getattr(env.audio_state, 'target_mel', None)
+                            aux = self.aux_target_computer.get_targets(
+                                audio_id=env.audio_state.pair_id or f"idx_{i}",
+                                beat_times=env.audio_state.beat_times,
+                                beat_features=env.audio_state.beat_features,
+                                beat_indices=np.array([beat_idx]),
+                                edited_mel=edited_mel,
+                            )
+                            # Squeeze batch dim for single-sample aux targets
+                            if aux is not None:
+                                aux = {k: (v[0] if isinstance(v, np.ndarray) and v.shape[0] == 1 else v) for k, v in aux.items()}
+                        except Exception:
+                            aux = None
+                        aux_targets_list.append(aux)
                     else:
                         beat_indices.append(0)
                         aux_targets_list.append(None)
@@ -758,7 +788,19 @@ class PPOTrainer:
                 # Auxiliary loss (if available)
                 aux_loss = torch.tensor(0.0, device=self.device)
                 if self.agent.auxiliary_module is not None and aux_targets:
-                    batch_aux_targets = {k: v[batch_indices] for k, v in aux_targets.items() if len(v) >= len(batch_indices)}
+                    # Safely index auxiliary targets: only use targets that match rollout sample count
+                    batch_aux_targets = {}
+                    for k, v in aux_targets.items():
+                        try:
+                            # v is a tensor on device; ensure first dimension equals n_samples
+                            if getattr(v, 'shape', None) and v.shape[0] == n_samples:
+                                # batch_indices is numpy array of indices into the rollout (0..n_samples-1)
+                                idx_tensor = torch.from_numpy(batch_indices).long().to(self.device)
+                                batch_aux_targets[k] = v[idx_tensor]
+                        except Exception:
+                            # If indexing fails, skip this auxiliary target
+                            logger.debug(f"Skipping aux target {k} due to indexing mismatch")
+
                     if batch_aux_targets:
                         aux_loss, breakdown = self.agent.compute_auxiliary_loss(
                             batch_states, batch_aux_targets, self.current_epoch
@@ -777,6 +819,46 @@ class PPOTrainer:
                     current_entropy_coeff * entropy_loss +
                     aux_loss
                 )
+
+                # Mixed BC loss: sample a mini-batch from bc dataset and add supervision
+                if self.bc_states is not None and self.bc_loss_weight > 0.0:
+                    try:
+                        # Random sample indices
+                        bc_n = self.bc_states.shape[0]
+                        bc_bs = min(self.bc_batch_size, bc_n)
+                        idx = np.random.randint(0, bc_n, size=bc_bs)
+                        bc_states_batch = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                        bc_type = torch.from_numpy(self.bc_type_labels[idx]).long().to(self.device)
+                        bc_size = torch.from_numpy(self.bc_size_labels[idx]).long().to(self.device)
+                        bc_amount = torch.from_numpy(self.bc_amount_labels[idx]).long().to(self.device)
+
+                        encoded = self.agent.policy_net.encoder(bc_states_batch)
+                        type_logits = self.agent.policy_net.type_head(encoded)
+                        # Use ground-truth type embedding to compute size/amount logits
+                        type_embed = self.agent.policy_net.type_embedding(bc_type)
+                        size_input = torch.cat([encoded, type_embed], dim=-1)
+                        size_logits = self.agent.policy_net.size_head(size_input)
+                        amount_input = torch.cat([encoded, type_embed], dim=-1)
+                        amount_logits = self.agent.policy_net.amount_head(amount_input)
+
+                        ce = nn.CrossEntropyLoss()
+                        bc_loss_type = ce(type_logits, bc_type)
+                        bc_loss_size = ce(size_logits, bc_size)
+                        bc_loss_amount = ce(amount_logits, bc_amount)
+                        bc_loss = bc_loss_type + bc_loss_size + bc_loss_amount
+                        # Optional binary classifier BC loss
+                        if self.bc_good_bad_labels is not None and self.agent.auxiliary_module is not None and getattr(self.agent.auxiliary_module, 'good_bad_classifier', None) is not None:
+                            try:
+                                bc_gb = torch.from_numpy(self.bc_good_bad_labels[idx]).float().to(self.device)
+                                gb_preds = self.agent.auxiliary_module.good_bad_classifier(encoded).squeeze(-1)
+                                bce = nn.BCEWithLogitsLoss()
+                                bc_gb_loss = bce(gb_preds, bc_gb)
+                                bc_loss = bc_loss + bc_gb_loss
+                            except Exception:
+                                logger.exception("BC mixed good/bad loss failed")
+                        loss = loss + self.bc_loss_weight * bc_loss
+                    except Exception:
+                        logger.exception("BC mixed loss failed")
                 
                 # NaN check
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -788,11 +870,17 @@ class PPOTrainer:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 
-                # Gradient clip
-                torch.nn.utils.clip_grad_norm_(
+                # Gradient clip (capture norm for logging)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     list(self.agent.policy_net.parameters()) + list(self.agent.value_net.parameters()),
                     ppo_config.max_grad_norm
                 )
+                # Log gradient norm to training logger (per update)
+                try:
+                    if self.training_logger is not None:
+                        self.training_logger.log_scalar("grad_norm", float(grad_norm), self.global_step)
+                except Exception:
+                    logger.exception('Failed to log grad_norm')
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -864,28 +952,52 @@ class PPOTrainer:
             self.training_logger.log_scalar("approx_kl", metrics["approx_kl"], self.global_step)
             self.training_logger.log_scalar("section_decisions_per_ep", metrics["section_decisions_per_ep"], self.global_step)
             
-            # Log reward breakdown
+            # Log reward breakdowns and counters
             for k in all_keys:
-                if f"breakdown_{k}" in metrics:
-                    self.training_logger.log_scalar(f"reward/{k}", metrics[f"breakdown_{k}"], self.global_step)
+                if f"breakdown_{k}" not in metrics:
+                    continue
+                val = metrics[f"breakdown_{k}"]
+                # Route action counters to a separate counters/ section
+                if k in ("n_actions", "n_creative", "n_keep_ratio"):
+                    self.training_logger.log_scalar(f"counters/{k}", val, self.global_step)
+                else:
+                    # Log all other reward/penalty components under rewards/
+                    self.training_logger.log_scalar(f"rewards/{k}", val, self.global_step)
         
         return metrics
     
     def save_checkpoint(self, path: str):
         """Save checkpoint."""
+        # Prefer live agent weights, but fall back to any pending checkpoint saved earlier
+        policy_sd = None
+        value_sd = None
+        aux_sd = None
+        if self.agent:
+            policy_sd = self.agent.policy_net.state_dict()
+            value_sd = self.agent.value_net.state_dict()
+            aux_sd = self.agent.auxiliary_module.state_dict() if self.agent.auxiliary_module else None
+        else:
+            # If agent not initialized, try to reuse weights from deferred checkpoint
+            if self._pending_checkpoint is not None:
+                policy_sd = self._pending_checkpoint.get('policy_state_dict')
+                value_sd = self._pending_checkpoint.get('value_state_dict')
+                aux_sd = self._pending_checkpoint.get('auxiliary_state_dict')
+
         checkpoint = {
             "version": "factored",
             "global_step": self.global_step,
             "best_reward": self.best_reward,
             "current_epoch": self.current_epoch,
-            "policy_state_dict": self.agent.policy_net.state_dict() if self.agent else None,
-            "value_state_dict": self.agent.value_net.state_dict() if self.agent else None,
-            "auxiliary_state_dict": self.agent.auxiliary_module.state_dict() if self.agent and self.agent.auxiliary_module else None,
+            "policy_state_dict": policy_sd,
+            "value_state_dict": value_sd,
+            "auxiliary_state_dict": aux_sd,
             "optimizer": self.optimizer.state_dict() if self.optimizer else None,
             "auxiliary_optimizer": self.auxiliary_optimizer.state_dict() if self.auxiliary_optimizer else None,
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "scaler": self.scaler.state_dict(),
             "config": self.config,
+            "bc_mixed_loaded": True if self.bc_states is not None else False,
+            "bc_loss_weight": float(self.bc_loss_weight),
         }
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
@@ -930,6 +1042,148 @@ class PPOTrainer:
         if self.scheduler and checkpoint.get("scheduler"):
             self.scheduler.load_state_dict(checkpoint["scheduler"])
 
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.config.ppo.learning_rate
+
+    def load_bc_dataset(self, npz_path: str, weight: float = 0.0, batch_size: int = 64):
+        """Load BC NPZ (states + type/size/amount labels) into trainer memory."""
+        try:
+            import numpy as _np
+            data = _np.load(npz_path, allow_pickle=True)
+            self.bc_states = data['states']
+            self.bc_type_labels = data['type_labels']
+            self.bc_size_labels = data['size_labels']
+            self.bc_amount_labels = data['amount_labels']
+            # optional binary good/bad labels (per-beat)
+            if 'good_bad' in data:
+                try:
+                    self.bc_good_bad_labels = data['good_bad']
+                    logger.info(f"Loaded BC good_bad labels (n={self.bc_good_bad_labels.shape[0]})")
+                except Exception:
+                    self.bc_good_bad_labels = None
+            self.bc_loss_weight = float(weight)
+            self.bc_batch_size = int(batch_size)
+            logger.info(f"Loaded BC dataset: {npz_path} (n={self.bc_states.shape[0]})")
+        except Exception:
+            logger.exception(f"Failed to load BC dataset: {npz_path}")
+
+    def bc_pretrain(self, epochs: int = 3, lr: float = 1e-4):
+        """Simple supervised pretraining of policy_net on BC dataset.
+
+        Trains only policy parameters (type/size/amount heads + encoder).
+        """
+        if self.bc_states is None:
+            logger.warning("No BC dataset loaded for pretraining")
+            return
+
+        self._init_agent(input_dim=self.bc_states.shape[1])
+        self.agent.train()
+        optimizer = optim.Adam(self.agent.policy_net.parameters(), lr=lr)
+        ce = nn.CrossEntropyLoss()
+        n = self.bc_states.shape[0]
+        bs = min(128, n)
+
+        # Validation split for BC pretraining
+        val_frac = getattr(self.config.training, 'bc_val_frac', 0.1)
+        val_n = max(1, int(n * val_frac)) if n > 1 else 0
+        perm0 = np.random.permutation(n)
+        val_idx = perm0[:val_n] if val_n > 0 else np.array([], dtype=np.int64)
+        train_idx_all = perm0[val_n:]
+
+        for ep in range(epochs):
+            perm = np.random.permutation(train_idx_all)
+            losses = []
+            for start in range(0, len(perm), bs):
+                end = min(start + bs, len(perm))
+                idx = perm[start:end]
+                batch_states = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                batch_type = torch.from_numpy(self.bc_type_labels[idx]).long().to(self.device)
+                batch_size_lbl = torch.from_numpy(self.bc_size_labels[idx]).long().to(self.device)
+                batch_amount = torch.from_numpy(self.bc_amount_labels[idx]).long().to(self.device)
+
+                optimizer.zero_grad()
+                encoded = self.agent.policy_net.encoder(batch_states)
+                type_logits = self.agent.policy_net.type_head(encoded)
+                type_embed = self.agent.policy_net.type_embedding(batch_type)
+                size_input = torch.cat([encoded, type_embed], dim=-1)
+                size_logits = self.agent.policy_net.size_head(size_input)
+                amount_input = torch.cat([encoded, type_embed], dim=-1)
+                amount_logits = self.agent.policy_net.amount_head(amount_input)
+
+                loss_type = ce(type_logits, batch_type)
+                loss_size = ce(size_logits, batch_size_lbl)
+                loss_amount = ce(amount_logits, batch_amount)
+                loss = loss_type + loss_size + loss_amount
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.agent.policy_net.parameters(), 1.0)
+                optimizer.step()
+                losses.append(float(loss.item()))
+
+            train_loss = float(np.mean(losses)) if losses else 0.0
+
+            # Validation evaluation
+            val_loss = 0.0
+            if val_n > 0:
+                self.agent.eval()
+                with torch.no_grad():
+                    val_losses = []
+                    for start in range(0, len(val_idx), bs):
+                        end = min(start + bs, len(val_idx))
+                        idx = val_idx[start:end]
+                        batch_states = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                        batch_type = torch.from_numpy(self.bc_type_labels[idx]).long().to(self.device)
+                        batch_size_lbl = torch.from_numpy(self.bc_size_labels[idx]).long().to(self.device)
+                        batch_amount = torch.from_numpy(self.bc_amount_labels[idx]).long().to(self.device)
+
+                        encoded = self.agent.policy_net.encoder(batch_states)
+                        type_logits = self.agent.policy_net.type_head(encoded)
+                        type_embed = self.agent.policy_net.type_embedding(batch_type)
+                        size_input = torch.cat([encoded, type_embed], dim=-1)
+                        size_logits = self.agent.policy_net.size_head(size_input)
+                        amount_input = torch.cat([encoded, type_embed], dim=-1)
+                        amount_logits = self.agent.policy_net.amount_head(amount_input)
+
+                        v_loss = float(ce(type_logits, batch_type).item() + ce(size_logits, batch_size_lbl).item() + ce(amount_logits, batch_amount).item())
+                        val_losses.append(v_loss)
+                    val_loss = float(np.mean(val_losses)) if val_losses else 0.0
+                self.agent.train()
+
+            logger.info(f"BC pretrain epoch {ep+1}/{epochs} train_loss={train_loss:.4f} val_loss={val_loss:.4f}")
+            if self.training_logger is not None:
+                self.training_logger.log_scalar("bc/train_loss", train_loss, ep+1)
+                self.training_logger.log_scalar("bc/val_loss", val_loss, ep+1)
+        # Optional: pretrain binary good/bad classifier on BC labels
+        if self.bc_good_bad_labels is not None:
+            if self.agent is None:
+                self._init_agent(input_dim=self.bc_states.shape[1])
+            if self.agent.auxiliary_module is not None and getattr(self.agent.auxiliary_module, 'good_bad_classifier', None) is not None:
+                logger.info("Starting BC pretrain for good/bad classifier")
+                gb_optimizer = optim.Adam(self.agent.auxiliary_module.good_bad_classifier.parameters(), lr=lr)
+                bce = nn.BCEWithLogitsLoss()
+                n = self.bc_states.shape[0]
+                bs = min(128, n)
+                for ep in range(epochs):
+                    perm = np.random.permutation(n)
+                    losses_gb = []
+                    for start in range(0, n, bs):
+                        end = min(start + bs, n)
+                        idx = perm[start:end]
+                        batch_states = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                        batch_gb = torch.from_numpy(self.bc_good_bad_labels[idx]).float().to(self.device)
+                        gb_optimizer.zero_grad()
+                        with torch.no_grad():
+                            encoded = self.agent.policy_net.encoder(batch_states)
+                        preds = self.agent.auxiliary_module.good_bad_classifier(encoded)
+                        preds = preds.squeeze(-1)
+                        loss_gb = bce(preds, batch_gb)
+                        loss_gb.backward()
+                        torch.nn.utils.clip_grad_norm_(self.agent.auxiliary_module.good_bad_classifier.parameters(), 1.0)
+                        gb_optimizer.step()
+                        losses_gb.append(float(loss_gb.item()))
+                    logger.info(f"BC classifier pretrain epoch {ep+1}/{epochs} loss={np.mean(losses_gb):.4f}")
+            else:
+                logger.info("No auxiliary good/bad classifier available for BC pretrain")
+
 
 def train(
     config: Config,
@@ -938,6 +1192,12 @@ def train(
     n_envs: int = 4,
     steps_per_epoch: int = 2048,
     checkpoint_path: Optional[str] = None,
+    bc_pretrain_npz: Optional[str] = None,
+    bc_pretrain_epochs: int = 0,
+    bc_pretrain_lr: float = 1e-4,
+    bc_mixed_npz: Optional[str] = None,
+    bc_mixed_weight: float = 0.0,
+    bc_mixed_batch: int = 64,
     use_subprocess: bool = False,
     learned_reward_model: Optional[Any] = None,
 ):
@@ -1007,6 +1267,20 @@ def train(
     if checkpoint_path and Path(checkpoint_path).exists():
         trainer.load_checkpoint(checkpoint_path)
         logger.info(f"Resumed from checkpoint: {checkpoint_path}")
+
+    # Load BC datasets if provided
+    if bc_mixed_npz:
+        trainer.load_bc_dataset(bc_mixed_npz, weight=bc_mixed_weight, batch_size=bc_mixed_batch)
+        logger.info(f"Loaded mixed BC dataset: {bc_mixed_npz} (weight={bc_mixed_weight})")
+
+    # Run BC pretraining if requested (warm-start policy)
+    if bc_pretrain_npz and bc_pretrain_epochs > 0:
+        if Path(bc_pretrain_npz).exists():
+            trainer.load_bc_dataset(bc_pretrain_npz)
+            trainer.bc_pretrain(epochs=bc_pretrain_epochs, lr=bc_pretrain_lr)
+            logger.info(f"Completed BC pretraining from {bc_pretrain_npz} for {bc_pretrain_epochs} epochs")
+        else:
+            logger.warning(f"BC pretrain file not found: {bc_pretrain_npz}")
     
     # Training loop
     save_dir = Path(config.training.save_dir)
@@ -1021,8 +1295,8 @@ def train(
         initial_short_beats = 500
         final_short_beats = 2000
         initial_short_prob = 1.0  # 100% short at start
-        final_short_prob = 0.25   # 25% short at end
-        curriculum_steps = 20000  # Number of epochs to anneal over
+        final_short_prob = 0.5   # 50% short at end
+        curriculum_steps = 10000  # Number of epochs to anneal over
         
         progress = min(epoch / curriculum_steps, 1.0)
         short_prob = initial_short_prob * (1 - progress) + final_short_prob * progress
@@ -1076,6 +1350,18 @@ def train(
                 raw_audio=raw_data.get("audio"),
                 sample_rate=raw_data.get("sample_rate", 22050),
             )
+            # Attach pair id and target mel from paired dataset when available
+            if isinstance(sample, dict):
+                pair_id = sample.get("pair_id")
+                if pair_id:
+                    audio_state.pair_id = pair_id
+                edited = sample.get("edited")
+                if edited and "mel" in edited:
+                    mel = edited["mel"]
+                    # Convert to numpy if tensor
+                    if hasattr(mel, 'numpy'):
+                        mel = mel.numpy()
+                    audio_state.target_mel = mel
             audio_states.append(audio_state)
         data_time = time.time() - data_start
         
@@ -1148,6 +1434,12 @@ def main():
     parser.add_argument("--subprocess", action="store_true", help="Use subprocess parallelism")
     parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model (RLHF)")
     parser.add_argument("--no_lr_decay", action="store_true", help="Disable learning rate decay")
+    parser.add_argument("--bc_pretrain_npz", type=str, default=None, help="NPZ file for BC pretraining (states+labels)")
+    parser.add_argument("--bc_pretrain_epochs", type=int, default=0, help="Epochs for BC pretraining")
+    parser.add_argument("--bc_pretrain_lr", type=float, default=1e-4, help="LR for BC pretraining")
+    parser.add_argument("--bc_mixed_npz", type=str, default=None, help="NPZ file for mixed BC supervised loss during PPO")
+    parser.add_argument("--bc_mixed_weight", type=float, default=0.0, help="Weight for mixed BC loss added to PPO updates")
+    parser.add_argument("--bc_mixed_batch", type=int, default=64, help="Batch size for mixed BC sampling during PPO updates")
     
     args = parser.parse_args()
     
@@ -1172,6 +1464,12 @@ def main():
         n_envs=args.n_envs,
         steps_per_epoch=args.steps,
         checkpoint_path=args.checkpoint,
+        bc_pretrain_npz=args.bc_pretrain_npz,
+        bc_pretrain_epochs=args.bc_pretrain_epochs,
+        bc_pretrain_lr=args.bc_pretrain_lr,
+        bc_mixed_npz=args.bc_mixed_npz,
+        bc_mixed_weight=args.bc_mixed_weight,
+        bc_mixed_batch=args.bc_mixed_batch,
         use_subprocess=args.subprocess,
     )
 

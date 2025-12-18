@@ -16,6 +16,8 @@ import torch
 import librosa
 import soundfile as sf
 from collections import Counter
+import random
+import shutil
 
 from rl_editor.config import get_default_config, Config
 from rl_editor.agent import Agent
@@ -231,6 +233,7 @@ def run_inference(
     audio_state: AudioState,
     deterministic: bool = True,
     verbose: bool = True,
+    collect_aux: bool = False,
 ) -> Tuple[List[FactoredAction], List[str]]:
     """Run inference on audio state with factored action space.
     
@@ -251,8 +254,10 @@ def run_inference(
     done = False
     actions = []
     action_names = []
+    aux_preds = []
     step = 0
     
+    total_reward = 0.0
     while not done:
         state_tensor = torch.from_numpy(obs).float().to(agent.device).unsqueeze(0)
         
@@ -284,6 +289,7 @@ def run_inference(
         )
         
         obs, reward, terminated, truncated, info = env.step(action_tuple)
+        total_reward += float(reward)
         
         # Record action
         actions.append(factored_action)
@@ -291,6 +297,16 @@ def run_inference(
         if factored_action.action_type in [ActionType.GAIN, ActionType.EQ_LOW, ActionType.EQ_HIGH]:
             action_name += f"_{factored_action.action_amount.name}"
         action_names.append(action_name)
+
+        # collect auxiliary predictions if requested and available
+        if collect_aux and hasattr(agent, "auxiliary_module") and agent.auxiliary_module is not None:
+            try:
+                preds = agent.get_auxiliary_predictions(state_tensor)
+                # convert tensors to numpy for portability
+                preds_cpu = {k: (v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v) for k, v in preds.items()}
+            except Exception:
+                preds_cpu = {}
+            aux_preds.append({"beat": info.get("current_beat", step), "preds": preds_cpu})  # Keep aux_preds for later use
         
         if verbose:
             logger.debug(f"Step {step}: {action_name} at beat {factored_action.beat_index}")
@@ -298,7 +314,7 @@ def run_inference(
         done = terminated or truncated
         step += 1
     
-    return actions, action_names
+    return actions, action_names, total_reward, aux_preds
 
 
 def apply_crossfade(seg1: np.ndarray, seg2: np.ndarray, crossfade_samples: int) -> np.ndarray:
@@ -655,8 +671,14 @@ def main():
                        help="Model checkpoint path")
     parser.add_argument("--deterministic", action="store_true", default=False,
                        help="Use deterministic policy (default: stochastic)")
+    parser.add_argument("--seed", type=int, default=None, help="Base RNG seed for stochastic inference")
+    parser.add_argument("--n-samples", type=int, default=1, help="Number of stochastic samples to run and pick best by reward")
     parser.add_argument("--max-beats", type=int, default=500, help="Maximum beats to process")
     parser.add_argument("--crossfade-ms", type=float, default=50.0, help="Crossfade duration in ms at edit boundaries")
+    parser.add_argument("--use-auxiliary", action="store_true", default=False,
+                       help="Load and run auxiliary task module during inference (mel recon, good/bad)")
+    parser.add_argument("--save-aux-preds", type=str, default=None,
+                       help="Path to save per-beat auxiliary predictions (npz). Saved for chosen best sample.")
     
     args = parser.parse_args()
     
@@ -686,7 +708,7 @@ def main():
         config,
         input_dim=input_dim,
         beat_feature_dim=audio_state.beat_features.shape[1],
-        use_auxiliary_tasks=False,  # No aux tasks for inference
+        use_auxiliary_tasks=bool(args.use_auxiliary),
     )
     
     # Load checkpoint
@@ -700,35 +722,107 @@ def main():
     
     # Run inference
     logger.info("Running inference with factored action space...")
-    actions, action_names = run_inference(
-        agent, config, audio_state,
-        deterministic=args.deterministic,
-    )
-    
+
+    def set_seeds(s: int):
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(s)
+
+    n_samples = max(1, int(args.n_samples))
+    best_score = float("-inf")
+    best_audio = None
+    best_actions = None
+    best_action_names = None
+    chosen_sample_idx = 0
+
+    for i in range(n_samples):
+        # choose seed for this sample
+        if args.seed is not None:
+            seed_i = args.seed + i
+            set_seeds(seed_i)
+            logger.info(f"Using seed={seed_i} for sample {i}")
+        else:
+            # randomize torch/np/random using python random
+            seed_i = random.randrange(0, 2**31 - 1)
+            set_seeds(seed_i)
+
+        actions, action_names, total_reward, aux_preds = run_inference(
+            agent, config, audio_state,
+            deterministic=args.deterministic,
+            collect_aux=bool(args.use_auxiliary),
+        )
+
+        logger.info(f"Sample {i}: cumulative reward={total_reward:.4f}")
+
+        # Create edited audio for this sample
+        edited_audio = create_edited_audio(
+            audio, sr,
+            audio_state.beat_times,
+            actions,
+            crossfade_ms=args.crossfade_ms,
+        )
+
+        # Save each sample temporarily
+        input_path = Path(args.input)
+        sample_out = None
+        if args.output is None:
+            sample_out = input_path.parent / f"{input_path.stem}_edited_sample{i}{input_path.suffix}"
+        else:
+            out_p = Path(args.output)
+            sample_out = out_p.parent / f"{out_p.stem}_sample{i}{out_p.suffix}"
+
+        sample_out.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(sample_out), edited_audio, sr)
+        logger.info(f"Saved sample {i} to: {sample_out}")
+
+        # choose best by cumulative reward
+        if total_reward > best_score:
+            best_score = total_reward
+            best_audio = edited_audio
+            best_actions = actions
+            best_action_names = action_names
+            chosen_sample_idx = i
+
+    # After sampling, determine final output path and save chosen sample
+    input_path = Path(args.input)
+    if args.output is None:
+        final_out = input_path.parent / f"{input_path.stem}_edited{input_path.suffix}"
+    else:
+        final_out = Path(args.output)
+
+    # Safety: avoid writing directly over the input file
+    try:
+        if final_out.resolve() == input_path.resolve():
+            alt = input_path.parent / f"{input_path.stem}_edited{input_path.suffix}"
+            counter = 1
+            while alt.exists() and alt.resolve() == input_path.resolve():
+                alt = input_path.parent / f"{input_path.stem}_edited{counter}{input_path.suffix}"
+                counter += 1
+            logger.warning(f"Requested output path is the same as input. Writing to {alt} instead to avoid overwriting input.")
+            final_out = alt
+    except Exception:
+        if str(final_out) == str(input_path):
+            final_out = input_path.parent / f"{input_path.stem}_edited{input_path.suffix}"
+            logger.warning(f"Requested output path equals input; using {final_out} instead.")
+
+    if best_audio is not None:
+        final_out.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(final_out), best_audio, sr)
+        logger.info(f"Saved chosen best sample {chosen_sample_idx} (score={best_score:.4f}) to: {final_out}")
+    else:
+        logger.error("No samples produced - nothing saved")
+
+    # expose the chosen actions distribution in logs
+    actions = best_actions or []
+    action_names = best_action_names or []
+
     # Analyze actions
     type_counter = Counter([a.action_type.name for a in actions])
     size_counter = Counter([a.action_size.name for a in actions])
     logger.info(f"Action type distribution: {dict(type_counter)}")
     logger.info(f"Action size distribution: {dict(size_counter)}")
-    
-    # Create edited audio
-    edited_audio = create_edited_audio(
-        audio, sr,
-        audio_state.beat_times,
-        actions,
-        crossfade_ms=args.crossfade_ms,
-    )
-    
-    # Save output
-    if args.output is None:
-        input_path = Path(args.input)
-        output_path = input_path.parent / f"{input_path.stem}_edited{input_path.suffix}"
-    else:
-        output_path = Path(args.output)
-    
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output_path), edited_audio, sr)
-    logger.info(f"Saved edited audio to: {output_path}")
 
 
 if __name__ == "__main__":

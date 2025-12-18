@@ -64,6 +64,10 @@ class RewardConfig:
     transition_quality_weight: float = 0.9
     keep_ratio_weight: float = 1.0  # Weight for hitting target keep ratio
     transition_smoothness_weight: float = 1.5  # Weight for smooth transitions (no clicks)
+    # Reconstruction reward (mel L1) weight for episode-end reconstruction bonus
+    reconstruction_weight: float = 0.1
+    # Optionally compute PESQ/STOI (disabled by default because PESQ may require external deps)
+    use_pesq_stoi: bool = False
     
     # === PURE AUDIO QUALITY REWARDS ===
     # NO ground truth labels - model learns what sounds good
@@ -115,16 +119,18 @@ class PPOConfig:
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2  # PPO clipping ratio - tighter for stability
     target_kl: float = 0.02  # Tighter KL target to prevent collapse
-    entropy_coeff: float = 0.3  # High entropy for exploration (decay to 0.05)
+    # Tuned defaults for stable fine-tuning
+    learning_rate: float = 5e-5  # Slightly higher LR for fine-tuning from BC pretrain
+    entropy_coeff: float = 0.1  # Reduce entropy to encourage exploitation
     entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.05  # Higher floor to maintain exploration
-    value_loss_coeff: float = 0.5  # Standard value coeff (targets are normalized now)
-    max_grad_norm: float = 0.5  # Standard grad clipping
-    n_epochs: int = 6  # More PPO epochs for stable updates
-    batch_size: int = 2048  # Larger batch for better GPU utilization (was 128)
+    entropy_coeff_min: float = 0.01  # Lower floor for final convergence
+    value_loss_coeff: float = 1.0  # Stronger value loss to stabilize value updates
+    max_grad_norm: float = 0.3  # Tighter gradient clipping to avoid large updates
+    n_epochs: int = 6  # PPO epochs per update
+    batch_size: int = 512  # Balanced batch size for GPU utilization and stability
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 2  # Reduced since batch is larger
-    use_mixed_precision: bool = True  # Enabled with proper inf grad handling
+    gradient_accumulation_steps: int = 2
+    use_mixed_precision: bool = False  # Disable FP16 to avoid overflow on large value losses
 
 
 @dataclass

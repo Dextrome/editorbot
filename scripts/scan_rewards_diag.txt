@@ -1,0 +1,23 @@
+﻿Found 60 runs
+Run: rl_audio_editor_20251215_180253 -> 11 reward tags (file: events.out.tfevents.1765818176.DESKTOP-AEKA6F4.15284.0)
+  reward/creative: min=-148.3333 at step=104457216
+  reward/total: min=-119.8137 at step=104457216
+  reward/smart_effects: min=-12.3333 at step=104457216
+  reward/keep_ratio: min=-2.7857 at step=104457216
+  reward/learned: min=0.0000 at step=104457216
+  reward/alignment: min=1.8068 at step=104457216
+  reward/action_density: min=3.3051 at step=104457216
+  reward/size_diversity: min=5.0000 at step=104457216
+  reward/diversity: min=10.0000 at step=104457216
+  reward/efficiency: min=10.0000 at step=104457216
+Run: rl_audio_editor_20251215_182121 -> 13 reward tags (file: events.out.tfevents.1765819284.DESKTOP-AEKA6F4.17192.0)
+  reward/creative: min=-18.6667 at step=104459264
+  reward/smart_effects: min=-7.3333 at step=104459264
+  reward/keep_ratio: min=-4.3024 at step=104459264
+  reward/learned: min=0.0000 at step=104457216
+  reward/alignment: min=1.4263 at step=104458240
+  reward/size_diversity: min=5.0000 at step=104457216
+  reward/action_density: min=5.0000 at step=104457216
+  reward/efficiency: min=10.0000 at step=104457216
+  reward/diversity: min=10.0000 at step=104457216
+  reward/coherence: min=13.3244 at step=104459264

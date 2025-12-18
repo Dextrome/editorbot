@@ -13,6 +13,7 @@ import librosa
 
 from .config import Config, RewardConfig
 from .utils import estimate_tempo, get_energy_contour
+from .utils import compute_mel_spectrogram as utils_compute_mel
 
 
 @dataclass
@@ -237,6 +238,58 @@ class RewardCalculator:
             components.total_reward = 0.0
 
         return components
+
+    def compute_reconstruction_reward(
+        self,
+        audio_state,
+        edited_mel: Optional[np.ndarray] = None,
+        per_beat: bool = True,
+    ) -> float:
+        """Compute a small reconstruction reward based on mel distance.
+
+        If `edited_mel` is provided, compute L1 between `edited_mel` and
+        `audio_state.target_mel` (if available). For per-beat vectors, match
+        by beat index; otherwise compute global mel and compare.
+        Returns a scalar in roughly [-1, 1] scaled by config.reconstruction_weight.
+        """
+        try:
+            cfg = self.reward_config
+            # Prefer passed edited_mel, otherwise try audio_state.target_mel
+            target = edited_mel if edited_mel is not None else getattr(audio_state, "target_mel", None)
+            if target is None:
+                return 0.0
+
+            # If target is per-beat and audio_state has per-beat mel, compute mean L1
+            if per_beat and hasattr(audio_state, "target_mel") and audio_state.target_mel is not None:
+                # audio_state.target_mel expected shape (n_beats, mel_dim)
+                pred = np.array(audio_state.target_mel)
+                tgt = np.array(target)
+                # Align shapes
+                n = min(pred.shape[0], tgt.shape[0])
+                if n == 0:
+                    return 0.0
+                l1 = np.mean(np.abs(pred[:n] - tgt[:n]))
+            else:
+                # Fallback: compute mel for audio_state.raw_audio and compare
+                raw = getattr(audio_state, "raw_audio", None)
+                sr = getattr(audio_state, "sample_rate", 22050)
+                if raw is None:
+                    return 0.0
+                mel = utils_compute_mel(raw, sr=sr, n_mels=self.audio_config.n_mels,
+                                       n_fft=self.audio_config.n_fft, hop_length=self.audio_config.hop_length)
+                mel = np.array(mel)
+                tgt = np.array(target)
+                # Reduce to comparable summaries
+                mel_mean = mel.mean()
+                tgt_mean = tgt.mean()
+                l1 = abs(mel_mean - tgt_mean)
+
+            # Convert to a reward: smaller L1 -> higher reward
+            # Use a soft scaling to keep reward small
+            reward = max(-1.0, min(1.0, -l1 / (l1 + 1e-6)))
+            return float(reward * getattr(cfg, 'reconstruction_weight', 0.1))
+        except Exception:
+            return 0.0
 
     def compute_edit_efficiency_penalty(
         self, n_actions_taken: int, total_duration: float

@@ -286,43 +286,57 @@ class FactoredActionSpace:
         if n_processed > 0 and n_loops / max(1, n_processed // 4) > 0.15:
             mask[ActionType.LOOP] = False
         
-        # Disable excessive reordering
+        # Disable excessive reordering (allow up to 1 reorder per 2 processed beats)
         n_reordered = len(edit_history.reordered_sections)
-        if n_processed > 0 and n_reordered / max(1, n_processed // 4) > 0.25:
+        if n_processed > 0 and n_reordered / max(1, n_processed // 4) > 2:
             mask[ActionType.REORDER] = False
         
         # Disable excessive effects (use counters from history)
-        if len(edit_history.fade_markers) >= 4:
+        if len(edit_history.fade_markers) >= 8:
             mask[ActionType.FADE_IN] = False
             mask[ActionType.FADE_OUT] = False
         
-        if len(edit_history.time_changes) >= 3:
-            mask[ActionType.SPEED_UP] = False
-            mask[ActionType.SPEED_DOWN] = False
+        #if len(edit_history.time_changes) >= 32:
+        #    mask[ActionType.SPEED_UP] = False
+        #    mask[ActionType.SPEED_DOWN] = False
         
-        if len(edit_history.pitch_changes) >= 3:
-            mask[ActionType.PITCH_UP] = False
-            mask[ActionType.PITCH_DOWN] = False
+        #if len(edit_history.pitch_changes) >= 32:
+        #    mask[ActionType.PITCH_UP] = False
+        #    mask[ActionType.PITCH_DOWN] = False
         
-        if len(edit_history.reversed_sections) >= 3:
-            mask[ActionType.REVERSE] = False
+        #if len(edit_history.reversed_sections) >= 32:
+        #    mask[ActionType.REVERSE] = False
         
-        if len(edit_history.gain_changes) >= 6:
-            mask[ActionType.GAIN] = False
+        #if len(edit_history.gain_changes) >= 64:
+        #    mask[ActionType.GAIN] = False
         
-        if len(edit_history.eq_changes) >= 4:
-            mask[ActionType.EQ_LOW] = False
-            mask[ActionType.EQ_HIGH] = False
+        #if len(edit_history.eq_changes) >= 64:
+        #    mask[ActionType.EQ_LOW] = False
+        #    mask[ActionType.EQ_HIGH] = False
         
-        if len(edit_history.audio_effects) >= 3:
-            mask[ActionType.DISTORTION] = False
-            mask[ActionType.REVERB] = False
+        #if len(edit_history.audio_effects) >= 64:
+        #    mask[ActionType.DISTORTION] = False
+        #    mask[ActionType.REVERB] = False
         
-        if len(edit_history.repeated_sections) >= 4:
+        #if len(edit_history.repeated_sections) >= 8:
+        #    mask[ActionType.REPEAT_PREV] = False
+        
+        #if len(edit_history.swapped_sections) >= 32:
+        #    mask[ActionType.SWAP_NEXT] = False
+
+        # Mask KEEP if projected keep ratio would exceed 0.95
+        keep_ratio = edit_history.get_keep_ratio()
+        if keep_ratio > 0.95:
+            mask[ActionType.KEEP] = False
+            mask[ActionType.LOOP] = False
             mask[ActionType.REPEAT_PREV] = False
-        
-        if len(edit_history.swapped_sections) >= 3:
-            mask[ActionType.SWAP_NEXT] = False
+            mask[ActionType.SKIP] = False                
+            mask[ActionType.SPEED_DOWN] = False
+        elif keep_ratio > 0.85:
+            mask[ActionType.LOOP] = False
+            mask[ActionType.REPEAT_PREV] = False
+            mask[ActionType.SKIP] = False                
+            mask[ActionType.SPEED_DOWN] = False
         
         return mask
     

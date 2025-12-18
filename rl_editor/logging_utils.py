@@ -183,9 +183,33 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
+        # Special handling: if a metric value is a dict, expand it
         for tag, value in metrics.items():
-            self.log_scalar(tag, value, step)
+            # Route counters separately
+            if tag in ("n_actions", "n_creative"):
+                out_tag = f"counters/{tag}"
+                try:
+                    self.log_scalar(out_tag, float(value), step)
+                except Exception:
+                    self.log_scalar(out_tag, value, step)
+                continue
+
+            # If the value is a mapping of reward components, expand under a main tag
+            if isinstance(value, dict):
+                for subk, subv in value.items():
+                    out_tag = f"{tag}/{subk}"
+                    try:
+                        self.log_scalar(out_tag, float(subv), step)
+                    except Exception:
+                        self.log_scalar(out_tag, subv, step)
+                continue
+
+            # Default: log scalar as provided
+            try:
+                self.log_scalar(tag, float(value), step)
+            except Exception:
+                self.log_scalar(tag, value, step)
 
     def log_training_step(
         self,

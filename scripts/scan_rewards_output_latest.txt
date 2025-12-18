@@ -1,0 +1,23 @@
+﻿Found 57 runs
+Run: rl_audio_editor_20251213_005756 -> 36 reward tags (file: events.out.tfevents.1765583881.DESKTOP-AEKA6F4.22108.0)
+  reward/total_penalty: min=-25.7012 at step=8192
+  reward/no_keep_actions: min=-9.8750 at step=40960
+  reward/total: min=-8.8014 at step=8192
+  reward/bunched_cuts: min=-8.0000 at step=8192
+  reward/excess_duration: min=-7.1250 at step=8192
+  reward/min_cut_beats: min=-0.5075 at step=24576
+  reward/cut_deficit: min=-0.4832 at step=24576
+  reward/section_imbalance: min=-0.4500 at step=16384
+  reward/excess_loops: min=-0.2439 at step=114688
+  reward/effective_keep_excess: min=-0.0780 at step=114688
+Run: rl_audio_editor_20251215_180253 -> 11 reward tags (file: events.out.tfevents.1765818176.DESKTOP-AEKA6F4.15284.0)
+  reward/creative: min=-148.3333 at step=104457216
+  reward/total: min=-119.8137 at step=104457216
+  reward/smart_effects: min=-12.3333 at step=104457216
+  reward/keep_ratio: min=-2.7857 at step=104457216
+  reward/learned: min=0.0000 at step=104457216
+  reward/alignment: min=1.8068 at step=104457216
+  reward/action_density: min=3.3051 at step=104457216
+  reward/size_diversity: min=5.0000 at step=104457216
+  reward/diversity: min=10.0000 at step=104457216
+  reward/efficiency: min=10.0000 at step=104457216

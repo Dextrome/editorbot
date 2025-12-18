@@ -26,6 +26,9 @@ class AudioState:
     target_labels: Optional[np.ndarray] = None  # Shape: (n_beats,) - Ground truth KEEP=1/CUT=0 from human edits
     raw_audio: Optional[np.ndarray] = None  # Shape: (n_samples,) - Raw audio for trajectory reward
     sample_rate: int = 22050  # Audio sample rate
+    # Optional: pair identifier and target mel-spectrogram for supervised reconstruction
+    pair_id: Optional[str] = None
+    target_mel: Optional[np.ndarray] = None  # Per-beat mel vectors (n_beats, mel_dim) or full mel
 
 
 @dataclass

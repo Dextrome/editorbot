@@ -240,7 +240,25 @@ class AudioEditingEnvFactored(gym.Env):
             "n_section_decisions": len([a for a in self.episode_actions 
                                         if a.n_beats > 1]),
         }
-        
+
+        # Attach episode reward breakdown to info when episode ends so trainer can log it
+        if terminated or truncated:
+            info["reward_breakdown"] = self.episode_reward_breakdown.copy()
+            # Log top negative components for quick diagnostics
+            try:
+                # Sort breakdown items by value (ascending) and pick most negative
+                items = sorted(self.episode_reward_breakdown.items(), key=lambda kv: kv[1])
+                negative = [(k, v) for k, v in items if isinstance(v, (int, float)) and v < 0]
+                top_neg = negative[:3]
+                #if top_neg:
+                #    logger.warning(
+                #        "Episode ended (beat=%d) negative breakdown top: %s",
+                #        self.current_beat,
+                #        ", ".join([f"{k}:{v:.3f}" for k, v in top_neg])
+                #    )
+            except Exception:
+                logger.exception("Failed to log episode reward breakdown")
+
         return obs, total_reward, terminated, truncated, info
 
     def _get_observation(self) -> np.ndarray:
@@ -328,20 +346,246 @@ class AudioEditingEnvFactored(gym.Env):
         Most reward comes from episode end, but small signals help learning.
         """
         reward = 0.0
+        keep_ratio = self.edit_history.get_keep_ratio()
         
         # Progress signal
         progress = self.current_beat / max(1, len(self.audio_state.beat_times))
         
         # Small penalty if keeping too much early in episode
-        if progress < 0.3:
-            keep_ratio = self.edit_history.get_keep_ratio()
-            if keep_ratio > 0.9:
+        if progress > 0.1 and progress < 0.3:
+            if keep_ratio > 0.95:
                 reward -= 0.1
+            elif keep_ratio > 0.90:
+                reward -= 0.05
+
+        # Small penalty if keeping too little late in episode
+        if progress > 0.7:
+            if keep_ratio < 0.2:
+                reward -= 0.05
+            elif keep_ratio < 0.3:
+                reward -= 0.02
+        elif progress > 0.8:
+            if keep_ratio < 0.2:
+                reward -= 0.09
+            elif keep_ratio < 0.3:
+                reward -= 0.05
+
+        if keep_ratio > 0.35 and keep_ratio < 0.65:
+            reward += 0.05  # Bonus for being in good range
+
+        if keep_ratio == keep_ratio < 0.6 and action.action_type == ActionType.KEEP:
+            reward += 0.09  # Small bonus for keeping when keep ratio is high
+        elif keep_ratio < 0.3 and action.action_type == ActionType.CUT:
+            reward -= 0.03  # Small penalty for cutting when keep ratio is low
+        elif keep_ratio > 0.75 and action.action_type == ActionType.CUT:
+            reward += 0.03  # Small bonus for cutting when keep ratio is high
+
+        # Reward for moving keep ratio closer to 50% duration
+        target_keep = 0.5
+        prev_keep_ratio = self.edit_history.get_keep_ratio()
+        # Estimate new keep ratio if this action is applied
+        if action.action_type != ActionType.CUT:
+            beats_to_add = action.n_beats
+            new_keep = len(self.edit_history.kept_beats) + beats_to_add
+            new_total = len(self.edit_history.kept_beats) + len(self.edit_history.cut_beats) + beats_to_add
+            new_keep_ratio = new_keep / new_total if new_total > 0 else 1.0
+        else:
+            new_keep_ratio = prev_keep_ratio
+
+        if keep_ratio < 0.4 or keep_ratio > 0.6:
+            if abs(new_keep_ratio - target_keep) < abs(prev_keep_ratio - target_keep):
+                reward += 0.09  # Bonus for moving closer to target
+            elif new_keep_ratio > target_keep + 0.05:
+                reward -= 0.06  # Penalty for moving further away
+        else:
+            if abs(new_keep_ratio - target_keep) < abs(prev_keep_ratio - target_keep):
+                reward += 0.05  # Smaller bonus for being close to target
+            elif abs(new_keep_ratio - target_keep) > abs(prev_keep_ratio - target_keep):
+                reward -= 0.03  # Smaller penalty for moving away
         
         # Small bonus for section-level decisions (more efficient)
         if action.n_beats >= 4:
             reward += 0.05
+
+        # Small bonus for action diversity (not repeating same type)
+        recent_types = set(a.action_type for a in self.episode_actions[-8:])
+        if action.action_type not in recent_types:
+            reward += 0.02    
+
+        # Bonus for cutting or keeping at a phrase boundary
+        phrase_size = self.action_space_factored.phrase_size if self.action_space_factored else 8
+        if (action.action_type in (ActionType.CUT, ActionType.KEEP)) and (action.beat_index % phrase_size == 0):
+            reward += 0.06
+
+        # Small bonus for using creative actions
+        creative_types = {
+            ActionType.FADE_IN, ActionType.FADE_OUT,
+            ActionType.SPEED_UP, ActionType.SPEED_DOWN,
+            ActionType.REVERSE, ActionType.GAIN,
+            ActionType.PITCH_UP, ActionType.PITCH_DOWN,
+            ActionType.EQ_LOW, ActionType.EQ_HIGH,
+            ActionType.DISTORTION, ActionType.REVERB,
+            ActionType.REPEAT_PREV, ActionType.SWAP_NEXT,
+        }
+        rare_types = {ActionType.REVERSE, ActionType.SWAP_NEXT}
+
+        if action.action_type in creative_types and not action.action_type in recent_types:
+            reward += 0.02  # Bonus for new creative action
+        elif action.action_type in rare_types and not action.action_type in recent_types:
+            reward += 0.04 # Bonus for rare creative actions
+        elif action.action_type in rare_types:
+            reward -= 0.01  # Smaller bonus for recently used rare actions
+        elif action.action_type in creative_types:
+            reward += 0.005  # Smaller bonus if recently used
         
+
+        reward += self._compute_step_smart_effect_reward(action)
+
+        # --- Step-level reward: bonus for keeping a good section (consecutive kept beats) ---
+        # Only applies to KEEP actions
+        if action.action_type == ActionType.KEEP and self.edit_history is not None:
+            # Check if the last N beats are all kept (N = phrase_size or bar)
+            N = self.action_space_factored.phrase_size if self.action_space_factored else 8
+            last_kept = [b for b in range(action.beat_index, action.beat_index + action.n_beats)]
+            # Check if all these beats are in kept_beats
+            if all(b in self.edit_history.kept_beats for b in last_kept):
+                # Optionally, only reward if this is a new contiguous section (not overlapping previous)
+                # Reward for keeping a full phrase or bar
+                if action.n_beats >= 4:
+                    reward += 0.03  # Bar
+                if action.n_beats >= N:
+                    reward += 0.05  # Phrase
+
+        # --- Step-level continuity reward: bonus if pitch, gain, energy, and EQ match previous beat ---
+        if self.audio_state is not None and self.audio_state.beat_features is not None:
+            beat_features = self.audio_state.beat_features
+            n_beats = len(self.audio_state.beat_times)
+            idx = action.beat_index
+            prev_idx = max(0, idx - 1)
+            # Only reward for KEEP or similar actions (not CUT)
+            if action.action_type in (ActionType.KEEP, ActionType.GAIN, ActionType.FADE_IN, ActionType.FADE_OUT, ActionType.SPEED_UP, ActionType.SPEED_DOWN, ActionType.PITCH_UP, ActionType.PITCH_DOWN, ActionType.EQ_LOW, ActionType.EQ_HIGH):
+                # Pitch continuity (chroma cosine similarity)
+                if beat_features.shape[1] >= 52:
+                    chroma_now = beat_features[idx, 40:52]
+                    chroma_prev = beat_features[prev_idx, 40:52]
+                    norm_now = np.linalg.norm(chroma_now)
+                    norm_prev = np.linalg.norm(chroma_prev)
+                    if norm_now > 1e-6 and norm_prev > 1e-6:
+                        chroma_sim = float(np.dot(chroma_now, chroma_prev) / (norm_now * norm_prev))
+                        if chroma_sim > 0.95:
+                            reward += 0.03  # Strong pitch continuity
+                        elif chroma_sim > 0.85:
+                            reward += 0.01  # Moderate pitch continuity
+                # Gain/energy continuity (RMS)
+                rms_now = float(beat_features[idx, 1])
+                rms_prev = float(beat_features[prev_idx, 1])
+                if rms_prev > 1e-6:
+                    rms_ratio = rms_now / rms_prev
+                    if 0.95 < rms_ratio < 1.05:
+                        reward += 0.02  # Good gain/energy continuity
+                    elif 0.90 < rms_ratio < 1.10:
+                        reward += 0.01  # Acceptable continuity
+
+                # EQ continuity/improvement reward for EQ actions
+                ROLLOFF_IDX = 4
+                BANDWIDTH_IDX = 5
+                FLATNESS_IDX = 6
+                if action.action_type in (ActionType.EQ_LOW, ActionType.EQ_HIGH):
+                    rolloff_now = float(beat_features[idx, ROLLOFF_IDX])
+                    rolloff_prev = float(beat_features[prev_idx, ROLLOFF_IDX])
+                    bandwidth_now = float(beat_features[idx, BANDWIDTH_IDX])
+                    bandwidth_prev = float(beat_features[prev_idx, BANDWIDTH_IDX])
+                    flatness_now = float(beat_features[idx, FLATNESS_IDX])
+                    flatness_prev = float(beat_features[prev_idx, FLATNESS_IDX])
+
+                    # Reward for smooth transitions (continuity)
+                    rolloff_diff = abs(rolloff_now - rolloff_prev)
+                    bandwidth_diff = abs(bandwidth_now - bandwidth_prev)
+                    flatness_diff = abs(flatness_now - flatness_prev)
+
+                    # Reward for small changes (continuity)
+                    if rolloff_diff < 0.05:
+                        reward += 0.01
+                    if bandwidth_diff < 0.05:
+                        reward += 0.01
+                    if flatness_diff < 0.05:
+                        reward += 0.01
+
+                    # Reward for appropriate direction (optional, e.g. boosting highs should increase rolloff)
+                    if action.action_type == ActionType.EQ_HIGH:
+                        if rolloff_now > rolloff_prev:
+                            reward += 0.01
+                        if bandwidth_now > bandwidth_prev:
+                            reward += 0.005
+                        if flatness_now > flatness_prev:
+                            reward += 0.005
+                    elif action.action_type == ActionType.EQ_LOW:
+                        if rolloff_now < rolloff_prev:
+                            reward += 0.01
+                        if bandwidth_now < bandwidth_prev:
+                            reward += 0.005
+                        if flatness_now < flatness_prev:
+                            reward += 0.005
+
+        return reward
+    
+    def _compute_step_smart_effect_reward(self, action: FactoredAction) -> float:
+        """Step-level reward for appropriate use of pitch/gain/speed effects."""
+        if self.audio_state is None or self.audio_state.beat_features is None:
+            return 0.0
+
+        beat_features = self.audio_state.beat_features
+        n_beats = len(self.audio_state.beat_times)
+        beat_idx = action.beat_index
+        next_beat_idx = min(beat_idx + action.n_beats, n_beats - 1)
+        prev_beat_idx = max(beat_idx - 1, 0)
+        reward = 0.0
+
+        # === PITCH_UP / PITCH_DOWN ===
+        if action.action_type in (ActionType.PITCH_UP, ActionType.PITCH_DOWN):
+            current_chroma = _get_chroma_from_beat(beat_features, beat_idx)
+            next_chroma = _get_chroma_from_beat(beat_features, next_beat_idx)
+            if current_chroma is not None and next_chroma is not None:
+                if action.action_type == ActionType.PITCH_UP:
+                    semitones = AMOUNT_TO_PITCH_UP[action.action_amount]
+                else:
+                    semitones = AMOUNT_TO_PITCH_DOWN[action.action_amount]
+                original_sim = _chroma_similarity(current_chroma, next_chroma)
+                shifted_chroma = _shift_chroma(current_chroma, semitones)
+                shifted_sim = _chroma_similarity(shifted_chroma, next_chroma)
+                improvement = shifted_sim - original_sim
+                if improvement > 0.1:
+                    reward += 0.15  # Good pitch shift
+                elif improvement > 0:
+                    reward += 0.05  # Slight improvement
+                elif improvement < -0.2:
+                    reward -= 0.10  # Made it worse
+
+        # === GAIN ===
+        elif action.action_type == ActionType.GAIN:
+            current_rms = _get_rms_from_beat(beat_features, beat_idx)
+            prev_rms = _get_rms_from_beat(beat_features, prev_beat_idx)
+            next_rms = _get_rms_from_beat(beat_features, next_beat_idx)
+            if current_rms is not None and prev_rms is not None and next_rms is not None:
+                db_change = AMOUNT_TO_DB[action.action_amount]
+                gain_factor = 10 ** (db_change / 20)
+                adjusted_rms = current_rms * gain_factor
+                target_rms = (prev_rms + next_rms) / 2
+                original_error = abs(current_rms - target_rms)
+                adjusted_error = abs(adjusted_rms - target_rms)
+                if adjusted_error < original_error * 0.7:
+                    reward += 0.10  # Good gain adjustment
+                elif adjusted_error < original_error:
+                    reward += 0.03  # Slight improvement
+                elif adjusted_error > original_error * 1.3:
+                    reward -= 0.07  # Made transition worse
+
+        # === SPEED_UP / SPEED_DOWN ===
+        elif action.action_type in (ActionType.SPEED_UP, ActionType.SPEED_DOWN):
+            # Small bonus for using varied amounts (not always default)
+            if action.action_amount != ActionAmount.NEUTRAL:
+                reward += 0.02
+
         return reward
 
     def _compute_episode_reward(self) -> float:
@@ -362,12 +606,13 @@ class AudioEditingEnvFactored(gym.Env):
         if keep_ratio > 0.65:
             keep_ratio_reward = -30 * (keep_ratio - 0.65)
         elif keep_ratio < 0.30:
-            keep_ratio_reward = -20 * (0.30 - keep_ratio)
+            keep_ratio_reward = -30 * (0.30 - keep_ratio)
         else:
             # Bonus for hitting target range
             keep_ratio_reward = 10 * (1 - abs(keep_ratio - target_keep) / 0.2)
         reward += keep_ratio_reward
-        self.episode_reward_breakdown['keep_ratio'] = keep_ratio_reward
+        self.episode_reward_breakdown['keep_ratio'] = keep_ratio_reward        
+        self.episode_reward_breakdown['n_keep_ratio'] = keep_ratio
         
         # === 2. Section coherence ===
         # Reward for keeping consecutive sections
@@ -402,13 +647,34 @@ class AudioEditingEnvFactored(gym.Env):
         action_types_used = set(a.action_type for a in self.episode_actions)
         diversity_reward = 0.0
         if len(action_types_used) >= 3:
-            diversity_reward += 5
-        if len(action_types_used) >= 5:
+            diversity_reward += 2
+        elif len(action_types_used) >= 5:
             diversity_reward += 5
         reward += diversity_reward
         self.episode_reward_breakdown['diversity'] = diversity_reward
         
-        # === 5. Creative action bonus ===
+        # === 5. Size diversity ===
+        sizes_used = set(a.action_size for a in self.episode_actions)
+        size_diversity_reward = 0.0
+        if len(sizes_used) >= 3:
+            size_diversity_reward = 5
+        reward += size_diversity_reward
+        
+
+        # === 6. Efficiency bonus ===
+        # Fewer actions = more efficient editing
+        n_actions = len(self.episode_actions)
+        expected_actions = n_beats / 4  # Ideal: ~bar-level decisions
+        efficiency_reward = 0.0
+        if n_actions < expected_actions * 0.8:
+            efficiency_reward = 10  # Very efficient (will be scaled down)
+        elif n_actions < expected_actions * 1.2:
+            efficiency_reward = 5   # Reasonably efficient (will be scaled down)
+        # Scale down to make episode-level counts less dominant
+        efficiency_reward = float(np.clip(efficiency_reward * 0.2, -3.0, 3.0))
+        reward += efficiency_reward
+
+        # === 7. Creative action bonus ===
         creative_types = {
             ActionType.FADE_IN, ActionType.FADE_OUT,
             ActionType.SPEED_UP, ActionType.SPEED_DOWN,
@@ -419,38 +685,48 @@ class AudioEditingEnvFactored(gym.Env):
             ActionType.REPEAT_PREV, ActionType.SWAP_NEXT,
         }
         n_creative = sum(1 for a in self.episode_actions if a.action_type in creative_types)
-        creative_reward = 0.0
-        if 1 <= n_creative <= 8:
-            creative_reward = 5 * min(n_creative, 5)  # Up to 25 bonus
-        elif n_creative > 8:
-            creative_reward = -5 * (n_creative - 8)  # Penalty for overuse
+        creative_ratio = n_creative / max(1, len(self.episode_actions))
+        # Compute creative reward as a normalized per-action signal, then clip
+        # Encourage moderate creativity (~0.45) and penalize extreme over-use
+        raw_creative_score = (0.45 - creative_ratio) * 8.0  # centered near 0.45
+        creative_reward = float(np.clip(raw_creative_score, -2.0, 2.0))
         reward += creative_reward
-        self.episode_reward_breakdown['creative'] = creative_reward
         
-        # === 6. Size diversity ===
-        sizes_used = set(a.action_size for a in self.episode_actions)
-        size_diversity_reward = 0.0
-        if len(sizes_used) >= 3:
-            size_diversity_reward = 5
-        reward += size_diversity_reward
-        self.episode_reward_breakdown['size_diversity'] = size_diversity_reward
-        
-        # === 7. Efficiency bonus ===
-        # Fewer actions = more efficient editing
-        n_actions = len(self.episode_actions)
-        expected_actions = n_beats / 4  # Ideal: ~bar-level decisions
-        efficiency_reward = 0.0
-        if n_actions < expected_actions * 0.8:
-            efficiency_reward = 10  # Very efficient
-        elif n_actions < expected_actions * 1.2:
-            efficiency_reward = 5   # Reasonably efficient
-        reward += efficiency_reward
         self.episode_reward_breakdown['efficiency'] = efficiency_reward
+        self.episode_reward_breakdown['size_diversity'] = size_diversity_reward
+        self.episode_reward_breakdown['creative'] = creative_reward
+        self.episode_reward_breakdown['n_creative'] = n_creative
+        self.episode_reward_breakdown['n_actions'] = n_actions
+
+        # === 7b. Action density per 8 beats ===
+        # Penalize or reward based on number of actions per 8 beats (action density)
+        actions_per_8 = [0] * ((n_beats + 7) // 8)
+        for a in self.episode_actions:
+            bin_idx = a.beat_index // 8
+            if bin_idx < len(actions_per_8):
+                actions_per_8[bin_idx] += 1
+        avg_actions_per_8 = np.mean(actions_per_8) if actions_per_8 else 0.0
+        # Ideal: 1-3 actions per 8 beats (encourages section-level editing, not micro-edits)
+        action_density_reward = 0.0
+        if avg_actions_per_8 < 1.0:
+            action_density_reward = -5.0 * (1.0 - avg_actions_per_8)  # Too sparse
+        elif avg_actions_per_8 > 3.0:
+            action_density_reward = -5.0 * (avg_actions_per_8 - 3.0)  # Too dense
+        else:
+            action_density_reward = 5.0  # In the sweet spot
+        # Clip density reward to avoid large-magnitude effects from skewed counts
+        action_density_reward = float(np.clip(action_density_reward, -3.0, 3.0))
+        reward += action_density_reward
+        self.episode_reward_breakdown['action_density'] = action_density_reward
         
         # === 8. Smart effect rewards (pitch/gain appropriateness) ===
         smart_effect_reward = self._compute_smart_effect_reward()
-        reward += smart_effect_reward
+        # Scale and clip smart_effect_reward to avoid large spikes from many effects
+        smart_effect_contrib = float(np.clip(smart_effect_reward / 10.0, -3.0, 3.0))
+        reward += smart_effect_contrib
+        # Store both raw and applied values for diagnostics
         self.episode_reward_breakdown['smart_effects'] = smart_effect_reward
+        self.episode_reward_breakdown['smart_effects_applied'] = smart_effect_contrib
         
         # === 9. Learned reward model (RLHF) ===
         learned_reward = 0.0
@@ -483,6 +759,100 @@ class AudioEditingEnvFactored(gym.Env):
         reward += learned_reward
         self.episode_reward_breakdown['learned'] = learned_reward
         
+        # === 10. Reconstruction reward (compare produced per-beat mel to target if available) ===
+        try:
+            from .reward import RewardCalculator
+
+            recon_reward = 0.0
+            # Build simple predicted per-beat mel by applying edit actions to original per-beat mel
+            pred_mel_list = []
+            mel_source = getattr(self.audio_state, 'mel_spectrogram', None)
+            # If per-beat mel cached available on audio_state.target_mel for original, try that first
+            orig_per_beat = None
+            if hasattr(self.audio_state, 'mel_spectrogram') and self.audio_state.mel_spectrogram is not None:
+                # Reduce mel_spectrogram into per-beat means using beat frames
+                mel_spec = self.audio_state.mel_spectrogram
+                n_beats = len(self.audio_state.beat_times)
+                if mel_spec.shape[1] >= n_beats:
+                    frames_per_beat = mel_spec.shape[1] // max(1, n_beats)
+                    per_beat = []
+                    for i in range(n_beats):
+                        fs = int(i * frames_per_beat)
+                        fe = int(min(mel_spec.shape[1], (i + 1) * frames_per_beat))
+                        if fe > fs:
+                            per_beat.append(np.mean(mel_spec[:, fs:fe], axis=1))
+                        else:
+                            per_beat.append(np.mean(mel_spec, axis=1))
+                    orig_per_beat = np.array(per_beat)
+            # Fallback: if dataset cached original per-beat mel exists in audio_state.target_mel_orig
+            if orig_per_beat is None and getattr(self.audio_state, 'target_mel', None) is not None:
+                # target_mel may be edited; assume raw original per-beat not available
+                orig_per_beat = None
+
+            if orig_per_beat is not None and len(self.episode_actions) > 0:
+                for a in self.episode_actions:
+                    start = a.beat_index
+                    n = a.n_beats
+                    seg = orig_per_beat[start:start + n]
+                    if a.action_type.name in ('CUT',) or a.action_type == a.action_type.CUT:
+                        # skip
+                        continue
+                    if a.action_type.name in ('KEEP',) or a.action_type == a.action_type.KEEP:
+                        pred_mel_list.extend(list(seg))
+                    elif a.action_type.name in ('LOOP',):
+                        pred_mel_list.extend(list(seg))
+                        pred_mel_list.extend(list(seg))
+                    elif a.action_type.name in ('REPEAT_PREV',):
+                        # repeat previous n if exists
+                        if len(pred_mel_list) >= n:
+                            pred_mel_list.extend(pred_mel_list[-n:])
+                        else:
+                            pred_mel_list.extend(list(seg))
+                    elif a.action_type.name in ('REORDER',):
+                        pred_mel_list.extend(list(seg))
+                    elif a.action_type.name in ('FADE_IN',):
+                        # apply linear ramp
+                        for j, row in enumerate(seg):
+                            w = (j + 1) / max(1, len(seg))
+                            pred_mel_list.append(row * w)
+                    elif a.action_type.name in ('FADE_OUT',):
+                        for j, row in enumerate(seg):
+                            w = 1.0 - (j / max(1, len(seg)))
+                            pred_mel_list.append(row * w)
+                    elif a.action_type.name in ('GAIN',):
+                        db = a.db_change
+                        factor = 10 ** (db / 20.0)
+                        for row in seg:
+                            pred_mel_list.append(row * factor)
+                    elif a.action_type.name in ('EQ_HIGH',):
+                        for row in seg:
+                            r = row.copy()
+                            k = max(1, r.shape[0] // 3)
+                            r[-k:] = r[-k:] * 1.15
+                            pred_mel_list.append(r)
+                    elif a.action_type.name in ('EQ_LOW',):
+                        for row in seg:
+                            r = row.copy()
+                            k = max(1, r.shape[0] // 3)
+                            r[:k] = r[:k] * 1.15
+                            pred_mel_list.append(r)
+                    else:
+                        # other actions — treat as keep
+                        pred_mel_list.extend(list(seg))
+
+                if len(pred_mel_list) > 0:
+                    pred_mel = np.stack(pred_mel_list)
+                    # Target per-beat mel (from paired edited target) if available
+                    target_per_beat = getattr(self.audio_state, 'target_mel', None)
+                    # RewardCalculator expects audio_state and edited_mel; use edited_mel=pred_mel, audio_state.target_mel as target
+                    rc = RewardCalculator(self.config)
+                    recon_reward = rc.compute_reconstruction_reward(self.audio_state, edited_mel=pred_mel, per_beat=True)
+                    reward += recon_reward
+                    self.episode_reward_breakdown['reconstruction'] = recon_reward
+        except Exception:
+            # If any failure, skip reconstruction reward
+            logger.exception("Reconstruction reward computation failed")
+
         # Store total
         self.episode_reward_breakdown['total'] = reward
         
