@@ -11,6 +11,9 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import logging
+import os
+import time
+from pathlib import Path
 
 from .config import Config
 from .state import AudioState, StateRepresentation
@@ -23,6 +26,7 @@ from .actions import (
 )
 
 logger = logging.getLogger(__name__)
+from .reward import RewardCalculator
 
 
 # Feature indices (based on default FeatureConfig order)
@@ -116,6 +120,11 @@ class AudioEditingEnvFactored(gym.Env):
         
         # Observation space will be set on first reset
         self.observation_space = None
+        # Reward calculator instance (keep cache across episodes to avoid recompute)
+        try:
+            self._reward_calculator = RewardCalculator(self.config)
+        except Exception:
+            self._reward_calculator = None
 
     def reset(
         self,
@@ -153,6 +162,9 @@ class AudioEditingEnvFactored(gym.Env):
         self.current_beat = 0
         self.episode_actions = []
         self.step_rewards = []
+        # Temporal smoothing diagnostics: count and total penalty applied this episode
+        self._temporal_penalty_count = 0
+        self._temporal_penalty_total = 0.0
         
         # Set observation space if not set
         if self.observation_space is None:
@@ -240,6 +252,30 @@ class AudioEditingEnvFactored(gym.Env):
             "n_section_decisions": len([a for a in self.episode_actions 
                                         if a.n_beats > 1]),
         }
+
+        # --- Temporal smoothing penalty ---
+        # Penalize actions if there was another action within the last N beats
+        try:
+            # Exclude current action (it was appended before this call)
+            prev_actions = self.episode_actions[:-1]
+            window_beats = 2  # look-back window in beats
+            recent_count = 0
+            for pa in prev_actions:
+                if pa.beat_index >= action.beat_index - window_beats:
+                    recent_count += 1
+            # Apply penalty for micro-edits (skip large section-level actions)
+            if recent_count > 0 and action.n_beats < 4:
+                temporal_penalty = -0.04 * min(3, recent_count)  # stronger if many recent actions
+                reward += temporal_penalty
+                # Track diagnostics for episode-level reporting
+                try:
+                    self._temporal_penalty_count += 1
+                    self._temporal_penalty_total += float(abs(temporal_penalty))
+                except Exception:
+                    pass
+        except Exception:
+            # If any failure, do not block reward computation
+            pass
 
         # Attach episode reward breakdown to info when episode ends so trainer can log it
         if terminated or truncated:
@@ -373,7 +409,7 @@ class AudioEditingEnvFactored(gym.Env):
         if keep_ratio > 0.35 and keep_ratio < 0.65:
             reward += 0.05  # Bonus for being in good range
 
-        if keep_ratio == keep_ratio < 0.6 and action.action_type == ActionType.KEEP:
+        if keep_ratio < 0.6 and action.action_type == ActionType.KEEP:
             reward += 0.09  # Small bonus for keeping when keep ratio is high
         elif keep_ratio < 0.3 and action.action_type == ActionType.CUT:
             reward -= 0.03  # Small penalty for cutting when keep ratio is low
@@ -415,7 +451,7 @@ class AudioEditingEnvFactored(gym.Env):
         # Bonus for cutting or keeping at a phrase boundary
         phrase_size = self.action_space_factored.phrase_size if self.action_space_factored else 8
         if (action.action_type in (ActionType.CUT, ActionType.KEEP)) and (action.beat_index % phrase_size == 0):
-            reward += 0.06
+            reward += 0.09
 
         # Small bonus for using creative actions
         creative_types = {
@@ -429,17 +465,13 @@ class AudioEditingEnvFactored(gym.Env):
         }
         rare_types = {ActionType.REVERSE, ActionType.SWAP_NEXT}
 
-        if action.action_type in creative_types and not action.action_type in recent_types:
-            reward += 0.02  # Bonus for new creative action
-        elif action.action_type in rare_types and not action.action_type in recent_types:
-            reward += 0.04 # Bonus for rare creative actions
-        elif action.action_type in rare_types:
-            reward -= 0.01  # Smaller bonus for recently used rare actions
+        if action.action_type in rare_types:
+            reward -= 0.005  # Smaller bonus for recently used rare actions
         elif action.action_type in creative_types:
-            reward += 0.005  # Smaller bonus if recently used
+            reward += 0.001  # Smaller bonus if recently used
         
 
-        reward += self._compute_step_smart_effect_reward(action)
+        reward += self._compute_step_smart_effect_reward(action) #max reward 0.15
 
         # --- Step-level reward: bonus for keeping a good section (consecutive kept beats) ---
         # Only applies to KEEP actions
@@ -452,9 +484,9 @@ class AudioEditingEnvFactored(gym.Env):
                 # Optionally, only reward if this is a new contiguous section (not overlapping previous)
                 # Reward for keeping a full phrase or bar
                 if action.n_beats >= 4:
-                    reward += 0.03  # Bar
+                    reward += 0.01  # Bar
                 if action.n_beats >= N:
-                    reward += 0.05  # Phrase
+                    reward += 0.02  # Phrase
 
         # --- Step-level continuity reward: bonus if pitch, gain, energy, and EQ match previous beat ---
         if self.audio_state is not None and self.audio_state.beat_features is not None:
@@ -527,7 +559,7 @@ class AudioEditingEnvFactored(gym.Env):
                         if flatness_now < flatness_prev:
                             reward += 0.005
 
-        return reward
+        return reward * 10.0  # Scale up step reward
     
     def _compute_step_smart_effect_reward(self, action: FactoredAction) -> float:
         """Step-level reward for appropriate use of pitch/gain/speed effects."""
@@ -593,6 +625,7 @@ class AudioEditingEnvFactored(gym.Env):
         
         Stores breakdown in self.episode_reward_breakdown.
         """
+        #logger.info("_compute_episode_reward: starting computation for pair_id=%s", getattr(self.audio_state, 'pair_id', 'noid'))
         self.episode_reward_breakdown = {}  # Reset breakdown
         reward = 0.0
         n_beats = len(self.audio_state.beat_times)
@@ -611,7 +644,7 @@ class AudioEditingEnvFactored(gym.Env):
             # Bonus for hitting target range
             keep_ratio_reward = 10 * (1 - abs(keep_ratio - target_keep) / 0.2)
         reward += keep_ratio_reward
-        self.episode_reward_breakdown['keep_ratio'] = keep_ratio_reward        
+        self.episode_reward_breakdown['duration'] = keep_ratio_reward        
         self.episode_reward_breakdown['n_keep_ratio'] = keep_ratio
         
         # === 2. Section coherence ===
@@ -656,9 +689,12 @@ class AudioEditingEnvFactored(gym.Env):
         # === 5. Size diversity ===
         sizes_used = set(a.action_size for a in self.episode_actions)
         size_diversity_reward = 0.0
-        if len(sizes_used) >= 3:
-            size_diversity_reward = 5
+        if len(sizes_used) >= 5:
+            size_diversity_reward = 4
+        elif len(sizes_used) >= 3:
+            size_diversity_reward = 2
         reward += size_diversity_reward
+        self.episode_reward_breakdown['size_diversity'] = size_diversity_reward
         
 
         # === 6. Efficiency bonus ===
@@ -673,6 +709,7 @@ class AudioEditingEnvFactored(gym.Env):
         # Scale down to make episode-level counts less dominant
         efficiency_reward = float(np.clip(efficiency_reward * 0.2, -3.0, 3.0))
         reward += efficiency_reward
+        self.episode_reward_breakdown['efficiency'] = efficiency_reward
 
         # === 7. Creative action bonus ===
         creative_types = {
@@ -692,8 +729,6 @@ class AudioEditingEnvFactored(gym.Env):
         creative_reward = float(np.clip(raw_creative_score, -2.0, 2.0))
         reward += creative_reward
         
-        self.episode_reward_breakdown['efficiency'] = efficiency_reward
-        self.episode_reward_breakdown['size_diversity'] = size_diversity_reward
         self.episode_reward_breakdown['creative'] = creative_reward
         self.episode_reward_breakdown['n_creative'] = n_creative
         self.episode_reward_breakdown['n_actions'] = n_actions
@@ -725,8 +760,7 @@ class AudioEditingEnvFactored(gym.Env):
         smart_effect_contrib = float(np.clip(smart_effect_reward / 10.0, -3.0, 3.0))
         reward += smart_effect_contrib
         # Store both raw and applied values for diagnostics
-        self.episode_reward_breakdown['smart_effects'] = smart_effect_reward
-        self.episode_reward_breakdown['smart_effects_applied'] = smart_effect_contrib
+        self.episode_reward_breakdown['smart_effects'] = smart_effect_contrib
         
         # === 9. Learned reward model (RLHF) ===
         learned_reward = 0.0
@@ -760,102 +794,189 @@ class AudioEditingEnvFactored(gym.Env):
         self.episode_reward_breakdown['learned'] = learned_reward
         
         # === 10. Reconstruction reward (compare produced per-beat mel to target if available) ===
+        # Ensure the reconstruction key is always present so logs show 0 when unavailable.
+        self.episode_reward_breakdown.setdefault('reconstruction', 0.0)
         try:
             from .reward import RewardCalculator
 
             recon_reward = 0.0
-            # Build simple predicted per-beat mel by applying edit actions to original per-beat mel
             pred_mel_list = []
             mel_source = getattr(self.audio_state, 'mel_spectrogram', None)
-            # If per-beat mel cached available on audio_state.target_mel for original, try that first
-            orig_per_beat = None
-            if hasattr(self.audio_state, 'mel_spectrogram') and self.audio_state.mel_spectrogram is not None:
-                # Reduce mel_spectrogram into per-beat means using beat frames
-                mel_spec = self.audio_state.mel_spectrogram
-                n_beats = len(self.audio_state.beat_times)
-                if mel_spec.shape[1] >= n_beats:
-                    frames_per_beat = mel_spec.shape[1] // max(1, n_beats)
-                    per_beat = []
-                    for i in range(n_beats):
-                        fs = int(i * frames_per_beat)
-                        fe = int(min(mel_spec.shape[1], (i + 1) * frames_per_beat))
-                        if fe > fs:
-                            per_beat.append(np.mean(mel_spec[:, fs:fe], axis=1))
-                        else:
-                            per_beat.append(np.mean(mel_spec, axis=1))
-                    orig_per_beat = np.array(per_beat)
-            # Fallback: if dataset cached original per-beat mel exists in audio_state.target_mel_orig
-            if orig_per_beat is None and getattr(self.audio_state, 'target_mel', None) is not None:
-                # target_mel may be edited; assume raw original per-beat not available
-                orig_per_beat = None
+            # Use RewardCalculator helper to build or fetch cached per-beat target mel
+            # Use persistent reward calculator (created in __init__) to leverage cache
+            rc_helper = getattr(self, '_reward_calculator', None)
+            if rc_helper is None:
+                from .reward import RewardCalculator
+                rc_helper = RewardCalculator(self.config)
+                self._reward_calculator = rc_helper
+            orig_per_beat = rc_helper.get_target_per_beat(self.audio_state)
+
+            # Record availability flag and dump minimal debug NPZ if missing
+            if orig_per_beat is None:
+                self.episode_reward_breakdown['reconstruction_available'] = 0
+                logger.debug(
+                    "_compute_episode_reward: reconstruction unavailable for pair_id=%s (raw_audio_len=%s, mel_spectrogram=%s, target_mel=%s)",
+                    getattr(self.audio_state, 'pair_id', 'noid'),
+                    0 if getattr(self.audio_state, 'raw_audio', None) is None else len(self.audio_state.raw_audio),
+                    None if getattr(self.audio_state, 'mel_spectrogram', None) is None else getattr(self.audio_state, 'mel_spectrogram').shape,
+                    None if getattr(self.audio_state, 'target_mel', None) is None else np.array(getattr(self.audio_state, 'target_mel')).shape,
+                )
+            else:
+                self.episode_reward_breakdown['reconstruction_available'] = 1
 
             if orig_per_beat is not None and len(self.episode_actions) > 0:
-                for a in self.episode_actions:
-                    start = a.beat_index
-                    n = a.n_beats
-                    seg = orig_per_beat[start:start + n]
-                    if a.action_type.name in ('CUT',) or a.action_type == a.action_type.CUT:
-                        # skip
-                        continue
-                    if a.action_type.name in ('KEEP',) or a.action_type == a.action_type.KEEP:
-                        pred_mel_list.extend(list(seg))
-                    elif a.action_type.name in ('LOOP',):
-                        pred_mel_list.extend(list(seg))
-                        pred_mel_list.extend(list(seg))
-                    elif a.action_type.name in ('REPEAT_PREV',):
-                        # repeat previous n if exists
-                        if len(pred_mel_list) >= n:
-                            pred_mel_list.extend(pred_mel_list[-n:])
-                        else:
-                            pred_mel_list.extend(list(seg))
-                    elif a.action_type.name in ('REORDER',):
-                        pred_mel_list.extend(list(seg))
-                    elif a.action_type.name in ('FADE_IN',):
-                        # apply linear ramp
-                        for j, row in enumerate(seg):
-                            w = (j + 1) / max(1, len(seg))
-                            pred_mel_list.append(row * w)
-                    elif a.action_type.name in ('FADE_OUT',):
-                        for j, row in enumerate(seg):
-                            w = 1.0 - (j / max(1, len(seg)))
-                            pred_mel_list.append(row * w)
-                    elif a.action_type.name in ('GAIN',):
-                        db = a.db_change
-                        factor = 10 ** (db / 20.0)
-                        for row in seg:
-                            pred_mel_list.append(row * factor)
-                    elif a.action_type.name in ('EQ_HIGH',):
-                        for row in seg:
-                            r = row.copy()
-                            k = max(1, r.shape[0] // 3)
-                            r[-k:] = r[-k:] * 1.15
-                            pred_mel_list.append(r)
-                    elif a.action_type.name in ('EQ_LOW',):
-                        for row in seg:
-                            r = row.copy()
-                            k = max(1, r.shape[0] // 3)
-                            r[:k] = r[:k] * 1.15
-                            pred_mel_list.append(r)
-                    else:
-                        # other actions — treat as keep
-                        pred_mel_list.extend(list(seg))
+                # Light debug: log action counts at DEBUG level
+                try:
+                    action_counts = {}
+                    for a in self.episode_actions:
+                        action_counts[a.action_type.name] = action_counts.get(a.action_type.name, 0) + 1
+                    logger.debug(
+                        "_compute_episode_reward: assembling pred_mel_list: n_actions=%d action_counts=%s orig_per_beat_shape=%s",
+                        len(self.episode_actions), action_counts, None if orig_per_beat is None else orig_per_beat.shape,
+                    )
+                except Exception:
+                    logger.debug("Failed to stringify action summary for reconstruction")
 
-                if len(pred_mel_list) > 0:
-                    pred_mel = np.stack(pred_mel_list)
-                    # Target per-beat mel (from paired edited target) if available
-                    target_per_beat = getattr(self.audio_state, 'target_mel', None)
-                    # RewardCalculator expects audio_state and edited_mel; use edited_mel=pred_mel, audio_state.target_mel as target
-                    rc = RewardCalculator(self.config)
+                # Vectorized assembly: compute total predicted segments, preallocate array, fill sequentially
+                n_mels = orig_per_beat.shape[1]
+                # First pass: compute total predicted segments
+                total_pred = 0
+                for a in self.episode_actions:
+                    n = a.n_beats
+                    if a.action_type == a.action_type.CUT:
+                        continue
+                    name = a.action_type.name
+                    if name == 'LOOP':
+                        total_pred += n * 2
+                    else:
+                        total_pred += n
+
+                if total_pred > 0:
+                    pred_mel = np.zeros((total_pred, n_mels), dtype=orig_per_beat.dtype)
+                    write_idx = 0
+                    # track last written slice for REPEAT_PREV
+                    last_slice_start = 0
+                    last_slice_len = 0
+                    for a in self.episode_actions:
+                        start = a.beat_index
+                        n = a.n_beats
+                        seg = orig_per_beat[start:start + n]
+                        if a.action_type == a.action_type.CUT:
+                            continue
+                        name = a.action_type.name
+                        if name == 'KEEP' or name == 'SWAP_NEXT' or name == 'REORDER' or name == 'REVERSE' or name == 'SPEED_UP' or name == 'SPEED_DOWN' or name == 'DISTORTION' or name == 'REVERB' or name == 'PITCH_UP' or name == 'PITCH_DOWN' or name == 'REPEAT_PREV':
+                            # default: copy segment
+                            if name == 'REPEAT_PREV':
+                                if last_slice_len >= n:
+                                    src_start = last_slice_start + last_slice_len - n
+                                    pred_mel[write_idx:write_idx + n] = pred_mel[src_start:src_start + n]
+                                else:
+                                    pred_mel[write_idx:write_idx + seg.shape[0]] = seg
+                            else:
+                                pred_mel[write_idx:write_idx + seg.shape[0]] = seg
+                            last_slice_start = write_idx
+                            last_slice_len = seg.shape[0]
+                            write_idx += seg.shape[0]
+                        elif name == 'LOOP':
+                            # write seg twice
+                            pred_mel[write_idx:write_idx + seg.shape[0]] = seg
+                            pred_mel[write_idx + seg.shape[0]:write_idx + 2 * seg.shape[0]] = seg
+                            last_slice_start = write_idx
+                            last_slice_len = seg.shape[0] * 2
+                            write_idx += seg.shape[0] * 2
+                        elif name == 'FADE_IN':
+                            L = seg.shape[0]
+                            if L > 0:
+                                weights = (np.arange(L) + 1) / float(max(1, L))
+                                pred_mel[write_idx:write_idx + L] = seg * weights[:, None]
+                                last_slice_start = write_idx
+                                last_slice_len = L
+                                write_idx += L
+                        elif name == 'FADE_OUT':
+                            L = seg.shape[0]
+                            if L > 0:
+                                weights = 1.0 - (np.arange(L) / float(max(1, L)))
+                                pred_mel[write_idx:write_idx + L] = seg * weights[:, None]
+                                last_slice_start = write_idx
+                                last_slice_len = L
+                                write_idx += L
+                        elif name == 'GAIN':
+                            db = getattr(a, 'db_change', 0.0)
+                            factor = 10 ** (db / 20.0)
+                            pred_mel[write_idx:write_idx + seg.shape[0]] = seg * factor
+                            last_slice_start = write_idx
+                            last_slice_len = seg.shape[0]
+                            write_idx += seg.shape[0]
+                        elif name in ('EQ_HIGH', 'EQ_LOW'):
+                            k = max(1, n_mels // 3)
+                            if name == 'EQ_HIGH':
+                                modified = seg.copy()
+                                modified[:, -k:] = modified[:, -k:] * 1.15
+                            else:
+                                modified = seg.copy()
+                                modified[:, :k] = modified[:, :k] * 1.15
+                            pred_mel[write_idx:write_idx + seg.shape[0]] = modified
+                            last_slice_start = write_idx
+                            last_slice_len = seg.shape[0]
+                            write_idx += seg.shape[0]
+                        else:
+                            # fallback copy
+                            pred_mel[write_idx:write_idx + seg.shape[0]] = seg
+                            last_slice_start = write_idx
+                            last_slice_len = seg.shape[0]
+                            write_idx += seg.shape[0]
+
+                    # Trim to actual written length if any mismatch
+                    if write_idx < total_pred:
+                        pred_mel = pred_mel[:write_idx]
+                else:
+                    pred_mel = np.zeros((0, n_mels), dtype=orig_per_beat.dtype)
+
+                # Record diagnostic counts so subprocesses can communicate diagnostics
+                self.episode_reward_breakdown['n_episode_actions'] = float(len(self.episode_actions))
+                # pred_mel is the preallocated/filled array of predicted segments
+                self.episode_reward_breakdown['n_pred_mel_segments'] = float(pred_mel.shape[0])
+                if orig_per_beat is not None:
+                    self.episode_reward_breakdown['orig_per_beat_n'] = float(orig_per_beat.shape[0])
+                    self.episode_reward_breakdown['orig_per_beat_dim'] = float(orig_per_beat.shape[1])
+
+                if pred_mel.shape[0] > 0:
+                    # Use persistent reward calculator helper when available
+                    rc = rc_helper if rc_helper is not None else RewardCalculator(self.config)
                     recon_reward = rc.compute_reconstruction_reward(self.audio_state, edited_mel=pred_mel, per_beat=True)
                     reward += recon_reward
-                    self.episode_reward_breakdown['reconstruction'] = recon_reward
+                    self.episode_reward_breakdown['reconstruction'] = float(recon_reward)
+                    # Also record pred_mel shape
+                    self.episode_reward_breakdown['pred_mel_n'] = float(pred_mel.shape[0])
+                    self.episode_reward_breakdown['pred_mel_dim'] = float(pred_mel.shape[1])
+                    # Record calculator diagnostics if available
+                    try:
+                        if hasattr(rc, '_last_l1') and rc._last_l1 is not None:
+                            self.episode_reward_breakdown['recon_l1'] = float(rc._last_l1)
+                        if hasattr(rc, '_last_score') and rc._last_score is not None:
+                            self.episode_reward_breakdown['recon_score'] = float(rc._last_score)
+                        if hasattr(rc, '_last_reward') and rc._last_reward is not None:
+                            self.episode_reward_breakdown['recon_reward_raw'] = float(rc._last_reward)
+                    except Exception:
+                        logger.exception("Failed to attach recon diagnostics to breakdown")
+                    logger.debug("_compute_episode_reward: pred_mel_n=%d pred_mel_shape=%s recon_reward=%.6f",
+                                 pred_mel.shape[0], pred_mel.shape, float(recon_reward))
+                else:
+                    logger.info("_compute_episode_reward: pred_mel is empty after assembling from actions")
         except Exception:
-            # If any failure, skip reconstruction reward
+            # If any failure, skip reconstruction reward but keep the key (0)
             logger.exception("Reconstruction reward computation failed")
-
-        # Store total
+        # Attach temporal smoothing diagnostics recorded during the episode
+        try:
+            self.episode_reward_breakdown['temporal_penalty_count'] = float(getattr(self, '_temporal_penalty_count', 0))
+            self.episode_reward_breakdown['temporal_penalty_total'] = float(getattr(self, '_temporal_penalty_total', 0.0))
+        except Exception:
+            pass
+        # Store total and log breakdown for debugging
         self.episode_reward_breakdown['total'] = reward
-        
+        #logger.info("_compute_episode_reward: finished pair_id=%s total=%.6f breakdown=%s",
+        #         getattr(self.audio_state, 'pair_id', 'noid'), float(reward), {k: float(v) for k, v in self.episode_reward_breakdown.items()})
+
         return reward
 
     def _compute_smart_effect_reward(self) -> float:
@@ -960,7 +1081,7 @@ class AudioEditingEnvFactored(gym.Env):
             total_reward += min(gain_reward, 13.0)    # Cap at 13
         if n_speed_actions > 0:
             total_reward += min(speed_reward, 9.0)   # Cap at 9
-        
+
         return total_reward
 
     def set_learned_reward_model(self, model: Any) -> None:

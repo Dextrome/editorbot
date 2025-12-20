@@ -42,12 +42,16 @@ class AuxiliaryConfig:
     tempo_loss_weight: float = 0.02      # Was 0.15
     energy_loss_weight: float = 0.02     # Was 0.15
     phrase_loss_weight: float = 0.03     # Was 0.2
-    reconstruction_loss_weight: float = 0.001  # Was 0.1 - MSE can be huge!
+    reconstruction_loss_weight: float = 0.002  # Was 0.1 - MSE can be huge!
     similarity_loss_weight: float = 0.02
     # Mel-spectrogram reconstruction (per-beat) from training pairs
     use_mel_reconstruction: bool = True
     mel_reconstruction_weight: float = 0.01
     mel_dim: int = 128
+    # Chroma-based continuity loss (maps mel vectors to 12 chroma bins)
+    use_chroma_continuity: bool = False
+    chroma_loss_weight: float = 0.008
+    mel_sample_rate: int = 22050
     
     # Binary good/bad edit classifier
     use_good_bad_classifier: bool = True
@@ -644,6 +648,38 @@ class AuxiliaryTaskModule(nn.Module):
         self.mel_reconstructor = MelReconstructor(hidden_dim, self.config.mel_dim) if self.config.use_mel_reconstruction else None
         self.good_bad_classifier = GoodBadClassifier(hidden_dim) if self.config.use_good_bad_classifier else None
         self.similarity_predictor = SectionSimilarityPredictor(hidden_dim) if self.config.use_section_similarity else None
+        # Build mel->chroma mapping matrix (mel_dim x 12) and register as buffer
+        self.register_buffer_name = None
+        try:
+            import librosa
+            n_mels = self.config.mel_dim
+            sr = getattr(self.config, "mel_sample_rate", 22050)
+            # Compute mel center frequencies
+            mel_freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=0.0, fmax=sr / 2.0)
+            # Build mapping: for each mel bin, map to nearest MIDI pitch class (chroma)
+            M = np.zeros((n_mels, 12), dtype=np.float32)
+            for i, f in enumerate(mel_freqs):
+                if f <= 0:
+                    continue
+                midi = 69 + 12.0 * np.log2(f / 440.0)
+                chroma_idx = int(np.round(midi)) % 12
+                M[i, chroma_idx] = 1.0
+            mel_to_chroma = torch.from_numpy(M)
+            self.register_buffer_name = 'mel_to_chroma'
+            self.register_buffer('mel_to_chroma', mel_to_chroma)
+        except Exception:
+            # Fallback: simple evenly-distributed mapping if librosa unavailable
+            try:
+                n_mels = self.config.mel_dim
+                M = np.zeros((n_mels, 12), dtype=np.float32)
+                for i in range(n_mels):
+                    M[i, i % 12] = 1.0
+                mel_to_chroma = torch.from_numpy(M)
+                self.register_buffer_name = 'mel_to_chroma'
+                self.register_buffer('mel_to_chroma', mel_to_chroma)
+            except Exception:
+                # Last resort: don't register buffer
+                self.mel_to_chroma = None
 
     def forward(self, encoded: torch.Tensor, encoded2: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         preds: Dict[str, torch.Tensor] = {}
@@ -720,6 +756,32 @@ class AuxiliaryTaskModule(nn.Module):
             w = self.config.mel_reconstruction_weight * warmup_factor
             total_loss = total_loss + w * mel_loss
             losses["mel_reconstruction_loss"] = float(mel_loss.item())
+
+        # Chroma continuity loss derived from mel vectors (differentiable linear mapping)
+        if self.config.use_chroma_continuity and hasattr(self, 'mel_to_chroma') and self.mel_to_chroma is not None:
+            if "mel_reconstruction" in predictions and "mel_reconstruction" in targets:
+                try:
+                    pred = predictions["mel_reconstruction"]
+                    tgt = targets["mel_reconstruction"].to(device)
+                    # Map mel -> chroma (B, 12)
+                    M = self.mel_to_chroma.to(device)
+                    pred_chroma = torch.matmul(pred, M)
+                    tgt_chroma = torch.matmul(tgt, M)
+
+                    # Normalize and compute MSE
+                    p_mean = pred_chroma.mean(); p_std = pred_chroma.std() + 1e-8
+                    t_mean = tgt_chroma.mean(); t_std = tgt_chroma.std() + 1e-8
+                    pred_c_n = (pred_chroma - p_mean) / p_std
+                    tgt_c_n = (tgt_chroma - t_mean) / t_std
+                    chroma_loss = F.mse_loss(pred_c_n, tgt_c_n, reduction='none')
+                    chroma_loss = chroma_loss.mean(dim=-1).mean()
+                    chroma_loss = torch.clamp(chroma_loss, 0.0, 10.0)
+                    w = self.config.chroma_loss_weight * warmup_factor
+                    total_loss = total_loss + w * chroma_loss
+                    losses["chroma_loss"] = float(chroma_loss.item())
+                except Exception:
+                    # If anything fails, skip chroma loss silently
+                    pass
 
         if "good_bad" in predictions and "good_bad" in targets:
             gb_pred = predictions["good_bad"].squeeze(-1)
@@ -801,28 +863,50 @@ class AuxiliaryTargetComputer:
                     targets["mel_reconstruction"] = edited_mel[safe_indices]
                     targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
                 else:
-                    # Fallback: compute simple per-beat mel summary by averaging frames
-                    # edited_mel shape (n_mels, n_frames) or (n_frames, n_mels)
+                    # Fallback: compute per-beat mel vectors from full spectrogram efficiently.
+                    # Support shapes: (n_mels, n_frames) or (n_frames, n_mels)
                     mel = np.array(edited_mel)
                     if mel.ndim == 2:
+                        # Normalize shape to (n_mels, n_frames)
                         if mel.shape[0] == self.config.mel_dim:
-                            # (n_mels, n_frames) -> compute mean per beat across frames
-                            frames = mel.shape[1]
-                            per_beat = np.zeros((n_beats, mel.shape[0]), dtype=np.float32)
-                            frames_per_beat = max(1, frames // max(1, n_beats))
-                            for i in range(n_beats):
-                                s = i * frames_per_beat
-                                e = min(frames, (i + 1) * frames_per_beat)
-                                per_beat[i] = mel[:, s:e].mean(axis=1)
-                            safe_indices = np.clip(beat_indices, 0, n_beats - 1)
-                            targets["mel_reconstruction"] = per_beat[safe_indices]
-                            targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
+                            # already (n_mels, n_frames)
+                            pass
+                        elif mel.shape[1] == self.config.mel_dim:
+                            mel = mel.T
+                        else:
+                            # Unknown layout/dimensions - skip
+                            mel = None
+
+                    if mel is not None and mel.ndim == 2:
+                        # Use cached per-beat mel if available
+                        cached_per_beat = self._cache[audio_id].get("mel_reconstruction_full")
+                        if cached_per_beat is None:
+                            n_mels, n_frames = mel.shape
+                            frames_per_beat = int(np.ceil(n_frames / max(1, n_beats)))
+                            target_len = frames_per_beat * n_beats
+                            if target_len != n_frames:
+                                pad = target_len - n_frames
+                                mel = np.pad(mel, ((0, 0), (0, pad)), mode='constant', constant_values=0.0)
+                                n_frames = mel.shape[1]
+
+                            mel_reshaped = mel.reshape(n_mels, n_beats, frames_per_beat)
+                            per_beat = mel_reshaped.mean(axis=2).T.astype(np.float32)
+                            try:
+                                self._cache[audio_id]["mel_reconstruction_full"] = per_beat
+                            except Exception:
+                                pass
+                        else:
+                            per_beat = cached_per_beat
+
+                        safe_indices = np.clip(beat_indices, 0, n_beats - 1)
+                        targets["mel_reconstruction"] = per_beat[safe_indices]
+                        targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
             except Exception:
                 # If anything fails, skip mel targets
                 pass
-        
+
         return targets
-    
+
     def _compute_full_targets(
         self,
         beat_times: np.ndarray,
@@ -830,25 +914,25 @@ class AuxiliaryTargetComputer:
     ) -> Dict[str, np.ndarray]:
         """Compute targets for all beats in a track (for caching)."""
         n_beats = len(beat_times)
-        targets = {}
-        
+        targets: Dict[str, np.ndarray] = {}
+
         if self.config.use_tempo_prediction:
             targets["tempo"] = TempoPredictor.compute_targets(
                 beat_times, self.config.tempo_min, self.config.tempo_max, self.config.tempo_bins
             )
-        
+
         if self.config.use_energy_prediction:
             targets["energy"] = EnergyPredictor.compute_targets(
                 beat_features, self.config.energy_bins
             )
-        
+
         if self.config.use_phrase_boundary:
             targets["phrase"] = PhraseBoundaryDetector.compute_targets(
                 n_beats, self.config.phrase_length
             )
-        
+
         return targets
-    
+
     def clear_cache(self):
         """Clear the target cache."""
         self._cache.clear()

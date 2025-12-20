@@ -673,7 +673,7 @@ def main():
                        help="Use deterministic policy (default: stochastic)")
     parser.add_argument("--seed", type=int, default=None, help="Base RNG seed for stochastic inference")
     parser.add_argument("--n-samples", type=int, default=1, help="Number of stochastic samples to run and pick best by reward")
-    parser.add_argument("--max-beats", type=int, default=500, help="Maximum beats to process")
+    parser.add_argument("--max-beats", type=int, default=0, help="Maximum beats to process (0 = no truncation)")
     parser.add_argument("--crossfade-ms", type=float, default=50.0, help="Crossfade duration in ms at edit boundaries")
     parser.add_argument("--use-auxiliary", action="store_true", default=False,
                        help="Load and run auxiliary task module during inference (mel recon, good/bad)")

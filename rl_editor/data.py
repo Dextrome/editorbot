@@ -788,18 +788,73 @@ class PairedAudioDataset(Dataset):
                 
                 # Estimate duration from beat_times without loading audio
                 duration = float(beat_times[-1]) + 0.5 if len(beat_times) > 0 else 0.0
-                
-                # Skip audio/mel loading - training only needs beat_features, beat_times, tempo
-                # Placeholder tensors for interface compatibility (not used in training)
+
+                # Try to load cached mel and full processed data if available so
+                # reconstruction and other consumers have access to real audio/mel.
+                mel_tensor = None
+                audio_tensor = None
+                sample_rate = self.config.audio.sample_rate
+
+                try:
+                    mel_arr = None
+                    if self.feature_cache:
+                        mel_arr = self.feature_cache.load_mel(file_path)
+                    if mel_arr is not None:
+                        mel_tensor = torch.from_numpy(mel_arr).float()
+                    else:
+                        # If beat features are cached but mel is missing, try computing mel
+                        # from the original audio file so downstream code can use it.
+                        try:
+                            y_try, sr_try = load_audio(str(file_path), sr=self.config.audio.sample_rate)
+                            mel_try = compute_mel_spectrogram(
+                                y_try,
+                                sr=sr_try,
+                                n_mels=self.config.audio.n_mels,
+                                n_fft=self.config.audio.n_fft,
+                                hop_length=self.config.audio.hop_length,
+                            )
+                            mel_tensor = torch.from_numpy(mel_try).float()
+                            # Save computed mel to cache for future runs
+                            try:
+                                if self.feature_cache:
+                                    self.feature_cache.save_mel(file_path, mel_try)
+                            except Exception:
+                                pass
+                        except Exception:
+                            mel_tensor = None
+                except Exception:
+                    mel_tensor = None
+
+                try:
+                    full = None
+                    if self.feature_cache:
+                        full = self.feature_cache.load_full(file_path)
+                    if full is not None:
+                        # full may contain 'audio' (raw waveform) or other arrays
+                        if 'audio' in full:
+                            audio_arr = np.asarray(full['audio'])
+                            audio_tensor = torch.from_numpy(audio_arr).float()
+                        # sample_rate may be stored
+                        if 'sample_rate' in full:
+                            sample_rate = int(full['sample_rate'])
+                except Exception:
+                    audio_tensor = None
+
+                # Fall back to placeholders only if real data isn't available
+                if audio_tensor is None:
+                    audio_tensor = torch.zeros(1)
+                if mel_tensor is None:
+                    mel_tensor = torch.zeros(1, 1)
+
                 return {
-                    "audio": torch.zeros(1),  # Placeholder - not used in training
-                    "mel": torch.zeros(1, 1),  # Placeholder - not used in training
+                    "audio": audio_tensor,
+                    "mel": mel_tensor,
                     "beats": torch.from_numpy(beats).long(),
                     "beat_times": torch.from_numpy(beat_times).float(),
                     "beat_features": torch.from_numpy(beat_features).float(),
                     "tempo": torch.tensor(tempo).float(),
                     "duration": torch.tensor(duration).float(),
-                    "sample_rate": self.config.audio.sample_rate,
+                    "sample_rate": sample_rate,
                 }
         
         # Not cached or augmenting - compute from scratch

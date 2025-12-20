@@ -10,10 +10,13 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 import numpy as np
 import librosa
+import logging
 
 from .config import Config, RewardConfig
 from .utils import estimate_tempo, get_energy_contour
 from .utils import compute_mel_spectrogram as utils_compute_mel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,6 +58,90 @@ class RewardCalculator:
         self.config = config
         self.reward_config: RewardConfig = config.reward
         self.audio_config = config.audio
+        # Simple cache for per-audio computed per-beat mel targets
+        # Keyed by pair_id when available, else by (raw_len, n_beats)
+        self._cache = {}
+
+    def get_target_per_beat(self, audio_state) -> Optional[np.ndarray]:
+        """Return per-beat mel targets for an audio_state, using cache.
+
+        Tries in order: audio_state.target_mel, audio_state.mel_spectrogram,
+        and finally computes mel from raw audio. Returns array shape (n_beats, n_mels)
+        or None if unavailable.
+        """
+        n_beats = len(getattr(audio_state, 'beat_times', []))
+        if n_beats <= 0:
+            return None
+
+        pair_id = getattr(audio_state, 'pair_id', None)
+        raw_len = 0 if getattr(audio_state, 'raw_audio', None) is None else len(audio_state.raw_audio)
+        cache_key = ("pair", pair_id, n_beats) if pair_id else ("raw", raw_len, n_beats)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        def _aggregate_spec_to_beats(spec: np.ndarray, n_beats: int) -> Optional[np.ndarray]:
+            if spec is None or spec.ndim != 2:
+                return None
+            n_mels, n_frames = spec.shape
+            if n_frames < n_beats:
+                return None
+            frames_per_beat = n_frames // n_beats
+            if frames_per_beat <= 0:
+                return None
+            trim = frames_per_beat * n_beats
+            spec_trim = spec[:, :trim]
+            spec_rs = spec_trim.reshape(n_mels, n_beats, frames_per_beat)
+            perbeat = spec_rs.mean(axis=2).T
+            return perbeat
+
+        # 1) target_mel
+        try:
+            tm = getattr(audio_state, 'target_mel', None)
+            if tm is not None:
+                tm = np.array(tm)
+                if tm.ndim == 2 and tm.shape[0] == n_beats:
+                    self._cache[cache_key] = tm
+                    return tm
+                if tm.ndim == 2 and tm.shape[1] == n_beats:
+                    out = tm.T
+                    self._cache[cache_key] = out
+                    return out
+                if tm.ndim == 2 and tm.shape[1] >= n_beats:
+                    out = _aggregate_spec_to_beats(tm, n_beats)
+                    if out is not None:
+                        self._cache[cache_key] = out
+                        return out
+        except Exception:
+            pass
+
+        # 2) mel_spectrogram
+        try:
+            mel_spec = getattr(audio_state, 'mel_spectrogram', None)
+            if mel_spec is not None:
+                mel_spec = np.array(mel_spec)
+                out = _aggregate_spec_to_beats(mel_spec, n_beats)
+                if out is not None:
+                    self._cache[cache_key] = out
+                    return out
+        except Exception:
+            pass
+
+        # 3) raw audio compute mel
+        try:
+            raw = getattr(audio_state, 'raw_audio', None)
+            sr = getattr(audio_state, 'sample_rate', 22050)
+            if raw is not None:
+                mel_spec = utils_compute_mel(raw, sr=sr, n_mels=self.audio_config.n_mels,
+                                            n_fft=self.audio_config.n_fft, hop_length=self.audio_config.hop_length)
+                mel_spec = np.array(mel_spec)
+                out = _aggregate_spec_to_beats(mel_spec, n_beats)
+                if out is not None:
+                    self._cache[cache_key] = out
+                    return out
+        except Exception:
+            pass
+
+        return None
 
     def compute_dense_reward(
         self,
@@ -254,84 +341,165 @@ class RewardCalculator:
         """
         try:
             cfg = self.reward_config
-            # Prefer passed edited_mel, otherwise try audio_state.target_mel
-            target = edited_mel if edited_mel is not None else getattr(audio_state, "target_mel", None)
-            if target is None:
+            # Diagnostic: log what fields are present on audio_state
+            # Quiet debug: record shapes at debug level only
+            try:
+                target_shape = None
+                if getattr(audio_state, 'target_mel', None) is not None:
+                    target_shape = np.array(audio_state.target_mel).shape
+                mel_spec_shape = None
+                if getattr(audio_state, 'mel_spectrogram', None) is not None:
+                    mel_spec_shape = np.array(audio_state.mel_spectrogram).shape
+                raw_len = 0 if getattr(audio_state, 'raw_audio', None) is None else len(audio_state.raw_audio)
+                edited_shape = None
+                if edited_mel is not None:
+                    edited_shape = np.array(edited_mel).shape
+                logger.debug(
+                    "compute_reconstruction_reward: audio_state fields: target_mel=%s mel_spectrogram=%s raw_audio_len=%s edited_mel=%s",
+                    str(target_shape), str(mel_spec_shape), int(raw_len), str(edited_shape),
+                )
+            except Exception:
+                logger.debug("compute_reconstruction_reward: failed to stringify audio_state fields")
+            # Prefer passed edited_mel; ensure we can build a per-beat target when requested
+            if edited_mel is None and getattr(audio_state, 'target_mel', None) is None and getattr(audio_state, 'mel_spectrogram', None) is None and getattr(audio_state, 'raw_audio', None) is None:
+                logger.info("compute_reconstruction_reward: no edited or target mel/raw audio available, returning 0")
                 return 0.0
 
-            # If target is per-beat and audio_state has per-beat mel, compute mean L1
-            if per_beat and hasattr(audio_state, "target_mel") and audio_state.target_mel is not None:
-                # audio_state.target_mel expected shape (n_beats, mel_dim)
-                pred = np.array(audio_state.target_mel)
-                tgt = np.array(target)
-                # Align shapes
-                n = min(pred.shape[0], tgt.shape[0])
+            # Per-beat handling: build `target_per_beat` from available audio_state fields
+            if per_beat:
+                target_per_beat = None
+                n_beats = len(getattr(audio_state, 'beat_times', []))
+
+                # Determine cache key
+                pair_id = getattr(audio_state, 'pair_id', None)
+                raw_len = 0 if getattr(audio_state, 'raw_audio', None) is None else len(audio_state.raw_audio)
+                cache_key = None
+                if pair_id:
+                    cache_key = ("pair", pair_id, n_beats)
+                else:
+                    cache_key = ("raw", raw_len, n_beats)
+
+                # Try cache
+                if cache_key in self._cache:
+                    target_per_beat = self._cache[cache_key]
+
+                # Helper to aggregate full spectrogram to per-beat in a vectorized way
+                def _aggregate_spec_to_beats(spec: np.ndarray, n_beats: int) -> Optional[np.ndarray]:
+                    # spec expected shape (n_mels, n_frames)
+                    if spec.ndim != 2 or n_beats <= 0 or spec.shape[1] < 1:
+                        return None
+                    n_mels, n_frames = spec.shape
+                    # frames per beat (floor); if fewer frames than beats, return None
+                    if n_frames < n_beats:
+                        return None
+                    frames_per_beat = n_frames // n_beats
+                    if frames_per_beat <= 0:
+                        return None
+                    # Trim to an exact multiple
+                    trim = frames_per_beat * n_beats
+                    spec_trim = spec[:, :trim]
+                    # reshape -> (n_mels, n_beats, frames_per_beat)
+                    spec_rs = spec_trim.reshape(n_mels, n_beats, frames_per_beat)
+                    # mean over frames_per_beat -> (n_mels, n_beats), transpose -> (n_beats, n_mels)
+                    perbeat = spec_rs.mean(axis=2).T
+                    return perbeat
+
+                # 1) If audio_state.target_mel looks like per-beat (n_beats rows), accept it
+                if target_per_beat is None and getattr(audio_state, 'target_mel', None) is not None:
+                    try:
+                        tm = np.array(audio_state.target_mel)
+                        if tm.ndim == 2 and tm.shape[0] == n_beats:
+                            target_per_beat = tm
+                        elif tm.ndim == 2 and tm.shape[1] == n_beats:
+                            target_per_beat = tm.T
+                        elif tm.ndim == 2 and tm.shape[1] >= n_beats:
+                            target_per_beat = _aggregate_spec_to_beats(tm, n_beats)
+                    except Exception:
+                        target_per_beat = None
+
+                # 2) Aggregate mel_spectrogram per-beat
+                if target_per_beat is None and getattr(audio_state, 'mel_spectrogram', None) is not None:
+                    try:
+                        mel_spec = np.array(audio_state.mel_spectrogram)
+                        target_per_beat = _aggregate_spec_to_beats(mel_spec, n_beats)
+                    except Exception:
+                        target_per_beat = None
+
+                # 3) Fallback: compute mel from raw audio and aggregate per-beat (cache result)
+                if target_per_beat is None:
+                    raw = getattr(audio_state, 'raw_audio', None)
+                    sr = getattr(audio_state, 'sample_rate', 22050)
+                    if raw is not None and n_beats > 0:
+                        try:
+                            mel_spec = utils_compute_mel(raw, sr=sr, n_mels=self.audio_config.n_mels,
+                                                        n_fft=self.audio_config.n_fft, hop_length=self.audio_config.hop_length)
+                            mel_spec = np.array(mel_spec)
+                            target_per_beat = _aggregate_spec_to_beats(mel_spec, n_beats)
+                        except Exception:
+                            target_per_beat = None
+
+                # Cache if we have targets
+                if target_per_beat is not None and cache_key is not None:
+                    try:
+                        self._cache[cache_key] = target_per_beat
+                    except Exception:
+                        pass
+
+                if target_per_beat is None:
+                    logger.info("compute_reconstruction_reward: no target per-beat mel available (n_beats=%s), returning 0", n_beats)
+                    return 0.0
+
+                # Require edited_mel to compare
+                if edited_mel is None:
+                    logger.info("compute_reconstruction_reward: edited_mel missing for per-beat comparison, returning 0")
+                    return 0.0
+
+                edited = np.array(edited_mel)
+
+                # Align lengths and mel-dim
+                n = min(target_per_beat.shape[0], edited.shape[0])
                 if n == 0:
                     return 0.0
-                l1 = np.mean(np.abs(pred[:n] - tgt[:n]))
-            else:
-                # Fallback: compute mel for audio_state.raw_audio and compare
-                raw = getattr(audio_state, "raw_audio", None)
-                sr = getattr(audio_state, "sample_rate", 22050)
-                if raw is None:
-                    return 0.0
-                mel = utils_compute_mel(raw, sr=sr, n_mels=self.audio_config.n_mels,
-                                       n_fft=self.audio_config.n_fft, hop_length=self.audio_config.hop_length)
-                mel = np.array(mel)
-                tgt = np.array(target)
-                # Reduce to comparable summaries
-                mel_mean = mel.mean()
-                tgt_mean = tgt.mean()
-                l1 = abs(mel_mean - tgt_mean)
 
-            # Convert to a reward: smaller L1 -> higher reward
-            # Use a soft scaling to keep reward small
-            reward = max(-1.0, min(1.0, -l1 / (l1 + 1e-6)))
-            return float(reward * getattr(cfg, 'reconstruction_weight', 0.1))
+                # If mel-dim mismatch, trim/pad target to match edited
+                if target_per_beat.shape[1] != edited.shape[1]:
+                    if target_per_beat.shape[1] > edited.shape[1]:
+                        target_per_beat = target_per_beat[:, : edited.shape[1]]
+                    else:
+                        pad_width = edited.shape[1] - target_per_beat.shape[1]
+                        if pad_width > 0:
+                            target_per_beat = np.pad(target_per_beat, ((0,0),(0,pad_width)), mode='constant')
+
+                l1 = np.mean(np.abs(target_per_beat[:n] - edited[:n]))
+
+                score = 1.0 / (1.0 + float(l1))
+                # Map score in (0,1] to [-1, 1] then scale to configured max reward
+                max_r = float(getattr(cfg, 'reconstruction_max_reward', 10.0))
+                weight = float(getattr(cfg, 'reconstruction_weight', 1.0))
+                norm = float(score * 2.0 - 1.0)
+                reward = float(norm * max_r * weight)
+                # Store diagnostics on the calculator instance for callers to inspect
+                try:
+                    self._last_l1 = float(l1)
+                    self._last_score = float(score)
+                    self._last_reward = float(reward)
+                except Exception:
+                    self._last_l1 = None
+                    self._last_score = None
+                    self._last_reward = float(reward)
+                #logger.info(
+                #    "compute_reconstruction_reward: used_target='per_beat' n=%d l1=%.6f score=%.6f norm=%.6f reward=%.6f (weight=%.6f max=%.6f)",
+                #    n, float(l1), score, norm, reward, weight, max_r,
+                #)
+                return reward
         except Exception:
-            return 0.0
-
-    def compute_edit_efficiency_penalty(
-        self, n_actions_taken: int, total_duration: float
-    ) -> float:
-        """Compute penalty for inefficient editing (too many actions).
-
-        Args:
-            n_actions_taken: Number of edit actions taken
-            total_duration: Total track duration in seconds
-
-        Returns:
-            Efficiency penalty (0 to -1)
-        """
-        # Heuristic: expect ~1 action per 10 seconds of audio
-        expected_actions = total_duration / 10.0
-        action_ratio = n_actions_taken / (expected_actions + 1e-6)
-
-        # Penalty for excessive actions
-        if action_ratio > 2.0:
-            return -0.5 * (action_ratio - 2.0)
-        return 0.0
-
-    def compute_edit_completeness_bonus(
-        self, n_beats_edited: int, total_beats: int
-    ) -> float:
-        """Compute bonus for editing sufficient portion of track.
-
-        Args:
-            n_beats_edited: Number of beats edited
-            total_beats: Total number of beats
-
-        Returns:
-            Completeness bonus (0 to +0.5)
-        """
-        target_ratio = self.reward_config.target_keep_ratio
-        actual_ratio = n_beats_edited / (total_beats + 1e-6)
-
-        if actual_ratio >= target_ratio:
-            return 0.5
-        elif actual_ratio > 0.2 * target_ratio:
-            return 0.25 * (actual_ratio / target_ratio)
-        else:
+            logger.exception("compute_reconstruction_reward failed")
+            try:
+                self._last_l1 = None
+                self._last_score = None
+                self._last_reward = 0.0
+            except Exception:
+                pass
             return 0.0
 
 

@@ -51,13 +51,7 @@ class RewardConfig:
     use_trajectory_rewards: bool = True  # End-of-episode audio quality reward
     trajectory_reward_scale: float = 100.0  # Scale factor for trajectory rewards
     step_reward_scale: float = 0.05  # ZERO step rewards in Monte Carlo mode
-    target_keep_ratio: float = 0.45  # Target ratio of beats to keep (~35%)
-    target_max_duration_s: float = 600.0  # 10 minutes max output duration
-    duration_penalty_weight: float = 0.1  # Penalty multiplier for exceeding target (reduced from 0.5)
-    max_loop_ratio: float = 0.12  # Max fraction of beats that should be looped (12%, reduced from 15%)
-    loop_penalty_weight: float = 0.5  # Penalty for exceeding max loop ratio
-    loop_repetition_penalty: float = 0.2  # Penalty for looping beats near other looped beats
-    loop_proximity_window: int = 8  # Beats within this window count as "nearby" loops
+    target_keep_ratio: float = 0.45  # Target ratio of beats to keep (~45%)
     tempo_consistency_weight: float = 1.0
     energy_flow_weight: float = 1.0
     phrase_completeness_weight: float = 0.8
@@ -65,7 +59,10 @@ class RewardConfig:
     keep_ratio_weight: float = 1.0  # Weight for hitting target keep ratio
     transition_smoothness_weight: float = 1.5  # Weight for smooth transitions (no clicks)
     # Reconstruction reward (mel L1) weight for episode-end reconstruction bonus
-    reconstruction_weight: float = 0.1
+    # `reconstruction_weight` scales the effect; `reconstruction_max_reward` defines
+    # the maximum magnitude (signed) available from reconstruction (e.g., 10.0)
+    reconstruction_weight: float = 1.0
+    reconstruction_max_reward: float = 10.0
     # Optionally compute PESQ/STOI (disabled by default because PESQ may require external deps)
     use_pesq_stoi: bool = False
     
@@ -117,10 +114,10 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.2  # PPO clipping ratio - tighter for stability
+    clip_ratio: float = 0.1  # PPO clipping ratio - tighter for stability
     target_kl: float = 0.02  # Tighter KL target to prevent collapse
     # Tuned defaults for stable fine-tuning
-    learning_rate: float = 5e-5  # Slightly higher LR for fine-tuning from BC pretrain
+    learning_rate: float = 2e-5  # Slightly higher LR for fine-tuning from BC pretrain
     entropy_coeff: float = 0.1  # Reduce entropy to encourage exploitation
     entropy_coeff_decay: bool = True  # Decay entropy over training
     entropy_coeff_min: float = 0.01  # Lower floor for final convergence

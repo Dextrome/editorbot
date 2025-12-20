@@ -297,7 +297,7 @@ class ValueNetwork(nn.Module):
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         encoded = self.encoder(state)
-        value = self.head(encoded).squeeze(-1)
+        value = self.head(encoded)
         return value
 
 
@@ -611,11 +611,18 @@ class Agent:
 
     def compute_value_batch(self, states: torch.Tensor) -> torch.Tensor:
         """Compute values for batch of states."""
+        # Ensure states has a batch dimension
+        if states.dim() == 1:
+            states = states.unsqueeze(0)
         values = self.value_net(states)
         values = values.float()
         values = torch.nan_to_num(values, nan=0.0, posinf=100.0, neginf=-100.0)
         values = torch.clamp(values, -100.0, 100.0)
-        return values.squeeze(-1)
+        out = values.squeeze(-1)
+        # Defensive logging for unexpected shapes
+        if out.dim() == 0:
+            logger.warning(f"compute_value_batch produced scalar output; states.shape={states.shape}, values.shape={values.shape}, out.shape={out.shape}")
+        return out
 
     def compute_value(self, state: torch.Tensor) -> float:
         """Compute value of single state."""
@@ -623,6 +630,8 @@ class Agent:
             if state.dim() == 1:
                 state = state.unsqueeze(0)
             value = self.value_net(state)
+            # Ensure shape is (B,) after squeezing trailing dim
+            value = value.squeeze(-1)
             return float(value[0].item())
 
     def evaluate_actions(

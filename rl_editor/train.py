@@ -628,6 +628,17 @@ class PPOTrainer:
         values_arr = np.array(self.buffer.values)
         returns_arr = np.array(returns)
         log_probs_arr = np.array(self.buffer.log_probs)
+
+        # Debug: report collected auxiliary targets summary
+        try:
+            aux_summary = self.buffer.get_auxiliary_targets_batch()
+            if aux_summary:
+                shapes = {k: v.shape for k, v in aux_summary.items()}
+                #logger.info("Collected auxiliary targets summary: %s", shapes)
+            else:
+                logger.info("No auxiliary targets collected in buffer for this rollout")
+        except Exception:
+            logger.exception("Failed to summarize auxiliary targets in buffer")
         
         # Handle NaN
         states_arr = np.nan_to_num(states_arr, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -811,6 +822,12 @@ class PPOTrainer:
                             if k not in aux_loss_breakdown:
                                 aux_loss_breakdown[k] = []
                             aux_loss_breakdown[k].append(v)
+                        # Debug: log presence and sizes of batch_aux_targets
+                        try:
+                            sizes = {k: getattr(v, 'shape', None) for k, v in batch_aux_targets.items()}
+                            logger.debug("Aux targets present for batch: %s", sizes)
+                        except Exception:
+                            logger.debug("Aux targets present (could not stringify shapes)")
                 
                 # Total loss
                 loss = (
@@ -888,8 +905,8 @@ class PPOTrainer:
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
-                if aux_loss.item() > 0:
-                    auxiliary_losses.append(aux_loss.item())
+                # Always record auxiliary loss value (may be zero)
+                auxiliary_losses.append(aux_loss.item())
             
             # Early stop check
             if epoch_kl_divs:
@@ -951,6 +968,28 @@ class PPOTrainer:
             )
             self.training_logger.log_scalar("approx_kl", metrics["approx_kl"], self.global_step)
             self.training_logger.log_scalar("section_decisions_per_ep", metrics["section_decisions_per_ep"], self.global_step)
+            # Log auxiliary loss scalar
+            try:
+                self.training_logger.log_scalar("train/auxiliary_loss", metrics.get("auxiliary_loss", 0.0), self.global_step)
+            except Exception:
+                logger.exception("Failed to log auxiliary_loss to training logger")
+
+            # If we collected auxiliary loss breakdowns per-batch, log their means under auxiliary/breakdown/
+            try:
+                if aux_loss_breakdown:
+                    aux_break_means = {k: float(np.mean(v)) for k, v in aux_loss_breakdown.items() if v}
+                    if aux_break_means:
+                        self.training_logger.log_scalars("auxiliary/breakdown", aux_break_means, self.global_step)
+                    # Also log an aggregate unweighted auxiliary loss (sum of per-task losses)
+                    try:
+                        per_task_keys = [k for k in aux_break_means.keys() if k.endswith("_loss") and k != "total_auxiliary_loss"]
+                        if per_task_keys:
+                            aux_unweighted = float(sum(aux_break_means[k] for k in per_task_keys))
+                            self.training_logger.log_scalar("train/auxiliary_unweighted", aux_unweighted, self.global_step)
+                    except Exception:
+                        logger.exception("Failed to compute auxiliary_unweighted")
+            except Exception:
+                logger.exception("Failed to log auxiliary breakdowns")
             
             # Log reward breakdowns and counters
             for k in all_keys:
@@ -1031,8 +1070,32 @@ class PPOTrainer:
             self.agent.value_net.load_state_dict(checkpoint["value_state_dict"])
             logger.info("Loaded value network")
         if self.agent.auxiliary_module and checkpoint.get("auxiliary_state_dict"):
-            self.agent.auxiliary_module.load_state_dict(checkpoint["auxiliary_state_dict"])
-            logger.info("Loaded auxiliary module")
+            try:
+                res = self.agent.auxiliary_module.load_state_dict(checkpoint["auxiliary_state_dict"], strict=False)
+                # `load_state_dict` returns a NamedTuple with missing_keys/unexpected_keys when strict=False
+                try:
+                    missing = getattr(res, 'missing_keys', None)
+                    unexpected = getattr(res, 'unexpected_keys', None)
+                    logger.info("Loaded auxiliary module (strict=False). missing=%s unexpected=%s", missing, unexpected)
+                except Exception:
+                    logger.info("Loaded auxiliary module (strict=False)")
+            except TypeError:
+                # Older torch versions may not accept strict kwarg in same way; fall back to permissive load
+                try:
+                    self.agent.auxiliary_module.load_state_dict(checkpoint["auxiliary_state_dict"])
+                    logger.info("Loaded auxiliary module")
+                except RuntimeError as e:
+                    logger.warning("Auxiliary module load_state_dict failed; attempting non-strict load: %s", e)
+                    # Try a non-strict manual load by iterating keys
+                    state = checkpoint["auxiliary_state_dict"]
+                    own_state = self.agent.auxiliary_module.state_dict()
+                    for name, param in state.items():
+                        if name in own_state:
+                            try:
+                                own_state[name].copy_(param)
+                            except Exception:
+                                logger.debug("Failed to copy param %s into auxiliary module", name)
+                    logger.info("Partially loaded auxiliary module (manual copy)")
         if self.optimizer and checkpoint.get("optimizer"):
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             logger.info("Loaded optimizer")
@@ -1295,8 +1358,8 @@ def train(
         initial_short_beats = 500
         final_short_beats = 2000
         initial_short_prob = 1.0  # 100% short at start
-        final_short_prob = 0.5   # 50% short at end
-        curriculum_steps = 10000  # Number of epochs to anneal over
+        final_short_prob = 0.2   # 20% short at end
+        curriculum_steps = 20000  # Number of epochs to anneal over
         
         progress = min(epoch / curriculum_steps, 1.0)
         short_prob = initial_short_prob * (1 - progress) + final_short_prob * progress
@@ -1379,6 +1442,12 @@ def train(
         trainer.step_scheduler()
         
         epoch_time = time.time() - epoch_start
+
+        # Diagnostic: always emit a minimal per-epoch line to ensure visibility
+        try:
+            logger.info(f"Epoch {epoch:5d} | Reward: {metrics.get('episode_reward', 0.0):7.2f} | Time: {epoch_time:.1f}s (D:{data_time:.2f}s R:{rollout_time:.1f}s U:{update_time:.1f}s)")
+        except Exception:
+            logger.exception("Failed to emit epoch diagnostic log")
         
         # Log
         if epoch % 10 == 0:
@@ -1396,11 +1465,17 @@ def train(
             # Log reward breakdown
             breakdown_keys = [k for k in metrics.keys() if k.startswith("breakdown_")]
             if breakdown_keys:
-                breakdown = [f"{k[10:]}: {metrics[k]:.2f}" for k in breakdown_keys]
-                logger.info("  Reward breakdown: " + " | ".join(breakdown))
+                exclude_suffixes = ("n_actions", "n_creative", "n_keep_ratio", "learned")
+                breakdown = [
+                    f"{k[10:]}: {metrics[k]:.2f}"
+                    for k in breakdown_keys
+                    if not any(k.endswith(s) for s in exclude_suffixes)
+                ]
+                if breakdown:
+                    logger.info("  Reward breakdown: " + " | ".join(breakdown))
         
         # Save checkpoints
-        checkpoint_interval = getattr(config.training, 'checkpoint_interval', 100)
+        checkpoint_interval = getattr(config.training, 'checkpoint_interval', 50)
         if epoch % checkpoint_interval == 0 and epoch > 0:
             ckpt_path = save_dir / f"checkpoint_epoch_{epoch}.pt"
             trainer.save_checkpoint(str(ckpt_path))
