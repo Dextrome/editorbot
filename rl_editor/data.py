@@ -272,7 +272,7 @@ class PairedAudioDataset(Dataset):
         config: Config,
         cache_dir: Optional[str] = None,
         transform: Optional[callable] = None,
-        include_reference: bool = True,
+        include_reference: bool = False,
         use_augmentation: bool = False,
     ):
         """Initialize paired dataset.

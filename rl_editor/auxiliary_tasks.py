@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 import logging
@@ -40,18 +41,20 @@ class AuxiliaryConfig:
     # These are scaled down because cross-entropy can be ~2-4 naturally
     # and reconstruction MSE can explode if features aren't normalized
     tempo_loss_weight: float = 0.02      # Was 0.15
-    energy_loss_weight: float = 0.02     # Was 0.15
+    energy_loss_weight: float = 0.01     # Was 0.15
     phrase_loss_weight: float = 0.03     # Was 0.2
     reconstruction_loss_weight: float = 0.002  # Was 0.1 - MSE can be huge!
     similarity_loss_weight: float = 0.02
     # Mel-spectrogram reconstruction (per-beat) from training pairs
     use_mel_reconstruction: bool = True
-    mel_reconstruction_weight: float = 0.01
+    mel_reconstruction_weight: float = 0.02
     mel_dim: int = 128
     # Chroma-based continuity loss (maps mel vectors to 12 chroma bins)
-    use_chroma_continuity: bool = False
+    use_chroma_continuity: bool = True
     chroma_loss_weight: float = 0.008
     mel_sample_rate: int = 22050
+    # Disk cache directory for per-track mel/chroma npy files (relative to repo root or absolute)
+    mel_chroma_cache: str = "feature_cache/chroma"
     
     # Binary good/bad edit classifier
     use_good_bad_classifier: bool = True
@@ -852,58 +855,101 @@ class AuxiliaryTargetComputer:
             targets["reconstruction"] = recon_targets
             targets["reconstruction_mask"] = recon_mask
 
-        # Handle mel reconstruction targets (if provided)
-        if self.config.use_mel_reconstruction and edited_mel is not None:
-            # Expect edited_mel as (n_beats, mel_dim) or (n_frames, n_mels)
-            try:
-                n_beats = len(beat_times)
-                if edited_mel.shape[0] == n_beats:
-                    # Per-beat mel vectors available
-                    safe_indices = np.clip(beat_indices, 0, n_beats - 1)
-                    targets["mel_reconstruction"] = edited_mel[safe_indices]
-                    targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
-                else:
-                    # Fallback: compute per-beat mel vectors from full spectrogram efficiently.
-                    # Support shapes: (n_mels, n_frames) or (n_frames, n_mels)
-                    mel = np.array(edited_mel)
-                    if mel.ndim == 2:
-                        # Normalize shape to (n_mels, n_frames)
-                        if mel.shape[0] == self.config.mel_dim:
-                            # already (n_mels, n_frames)
-                            pass
-                        elif mel.shape[1] == self.config.mel_dim:
-                            mel = mel.T
-                        else:
-                            # Unknown layout/dimensions - skip
-                            mel = None
+        # Handle mel reconstruction targets (if provided) or load from disk cache
+        if self.config.use_mel_reconstruction:
+            pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            cache_cfg = getattr(self.config, 'mel_chroma_cache', None)
+            cache_dir = cache_cfg if (cache_cfg and os.path.isabs(cache_cfg)) else os.path.join(pkg_root, cache_cfg or 'training_data/feature_cache/chroma')
 
-                    if mel is not None and mel.ndim == 2:
-                        # Use cached per-beat mel if available
-                        cached_per_beat = self._cache[audio_id].get("mel_reconstruction_full")
-                        if cached_per_beat is None:
-                            n_mels, n_frames = mel.shape
-                            frames_per_beat = int(np.ceil(n_frames / max(1, n_beats)))
-                            target_len = frames_per_beat * n_beats
-                            if target_len != n_frames:
-                                pad = target_len - n_frames
-                                mel = np.pad(mel, ((0, 0), (0, pad)), mode='constant', constant_values=0.0)
-                                n_frames = mel.shape[1]
-
-                            mel_reshaped = mel.reshape(n_mels, n_beats, frames_per_beat)
-                            per_beat = mel_reshaped.mean(axis=2).T.astype(np.float32)
-                            try:
-                                self._cache[audio_id]["mel_reconstruction_full"] = per_beat
-                            except Exception:
-                                pass
-                        else:
-                            per_beat = cached_per_beat
-
+            # If edited_mel not provided, try loading per-beat mel from disk cache
+            if edited_mel is None:
+                try:
+                    mel_path = os.path.join(cache_dir, f"{audio_id}_mel.npy")
+                    chroma_path = os.path.join(cache_dir, f"{audio_id}_chroma.npy")
+                    if os.path.exists(mel_path):
+                        per_beat = np.load(mel_path)
+                        n_beats = len(beat_times)
                         safe_indices = np.clip(beat_indices, 0, n_beats - 1)
                         targets["mel_reconstruction"] = per_beat[safe_indices]
                         targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
-            except Exception:
-                # If anything fails, skip mel targets
-                pass
+                        if os.path.exists(chroma_path):
+                            try:
+                                chroma_per_beat = np.load(chroma_path).astype(np.float32)
+                                self._cache.setdefault(audio_id, {})["chroma_reconstruction_full"] = chroma_per_beat
+                            except Exception:
+                                pass
+                        edited_mel = per_beat
+                except Exception:
+                    pass
+
+            # If we have edited_mel data (either passed in or loaded), compute per-beat targets
+            if edited_mel is not None:
+                try:
+                    n_beats = len(beat_times)
+                    # If edited_mel already aligned per-beat
+                    if isinstance(edited_mel, np.ndarray) and edited_mel.shape[0] == n_beats:
+                        safe_indices = np.clip(beat_indices, 0, n_beats - 1)
+                        targets["mel_reconstruction"] = edited_mel[safe_indices]
+                        targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
+                    else:
+                        mel = np.array(edited_mel)
+                        if mel.ndim == 2:
+                            # Normalize shape to (n_mels, n_frames)
+                            if mel.shape[0] == self.config.mel_dim:
+                                pass
+                            elif mel.shape[1] == self.config.mel_dim:
+                                mel = mel.T
+                            else:
+                                mel = None
+
+                            if mel is not None:
+                                cached_per_beat = self._cache.get(audio_id, {}).get("mel_reconstruction_full")
+                                if cached_per_beat is None:
+                                    n_mels, n_frames = mel.shape
+                                    frames_per_beat = int(np.ceil(n_frames / max(1, n_beats)))
+                                    target_len = frames_per_beat * n_beats
+                                    if target_len != n_frames:
+                                        pad = target_len - n_frames
+                                        mel = np.pad(mel, ((0, 0), (0, pad)), mode='constant', constant_values=0.0)
+                                        n_frames = mel.shape[1]
+
+                                    mel_reshaped = mel.reshape(n_mels, n_beats, frames_per_beat)
+                                    per_beat = mel_reshaped.mean(axis=2).T.astype(np.float32)
+                                    try:
+                                        self._cache.setdefault(audio_id, {})["mel_reconstruction_full"] = per_beat
+                                    except Exception:
+                                        pass
+                                else:
+                                    per_beat = cached_per_beat
+
+                                safe_indices = np.clip(beat_indices, 0, n_beats - 1)
+                                targets["mel_reconstruction"] = per_beat[safe_indices]
+                                targets["mel_reconstruction_mask"] = np.ones((len(safe_indices),), dtype=np.float32)
+
+                                # Precompute chroma per beat if enabled and not already cached
+                                if self.config.use_chroma_continuity and self._cache.get(audio_id, {}).get("chroma_reconstruction_full") is None:
+                                    try:
+                                        import librosa
+                                        mel_freqs = librosa.mel_frequencies(n_mels=self.config.mel_dim, fmin=0.0, fmax=getattr(self.config, 'mel_sample_rate', 22050) / 2.0)
+                                        M = np.zeros((self.config.mel_dim, 12), dtype=np.float32)
+                                        for i, f in enumerate(mel_freqs):
+                                            if f <= 0:
+                                                continue
+                                            midi = 69 + 12.0 * np.log2(f / 440.0)
+                                            chroma_idx = int(np.round(midi)) % 12
+                                            M[i, chroma_idx] = 1.0
+                                    except Exception:
+                                        M = np.zeros((self.config.mel_dim, 12), dtype=np.float32)
+                                        for i in range(self.config.mel_dim):
+                                            M[i, i % 12] = 1.0
+
+                                    chroma_per_beat = np.dot(per_beat, M).astype(np.float32)
+                                    try:
+                                        self._cache.setdefault(audio_id, {})["chroma_reconstruction_full"] = chroma_per_beat
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
 
         return targets
 
@@ -936,3 +982,26 @@ class AuxiliaryTargetComputer:
     def clear_cache(self):
         """Clear the target cache."""
         self._cache.clear()
+
+    def update_config(self, new_config: Optional[AuxiliaryConfig] = None):
+        """Update internal config and clear caches if settings that affect targets changed.
+
+        Clears cached per-track mel/chroma targets when `mel_dim` or
+        `use_chroma_continuity` changes to avoid stale cached arrays.
+        """
+        if new_config is None:
+            return
+
+        # If mel_dim or chroma setting changed, clear cache to force recompute
+        try:
+            prev_mel_dim = getattr(self.config, 'mel_dim', None)
+            prev_chroma = getattr(self.config, 'use_chroma_continuity', None)
+            new_mel_dim = getattr(new_config, 'mel_dim', None)
+            new_chroma = getattr(new_config, 'use_chroma_continuity', None)
+            if prev_mel_dim != new_mel_dim or prev_chroma != new_chroma:
+                self.clear_cache()
+        except Exception:
+            # On unexpected failures, be conservative and clear cache
+            self.clear_cache()
+
+        self.config = new_config

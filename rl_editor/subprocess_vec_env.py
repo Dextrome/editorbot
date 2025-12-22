@@ -65,19 +65,33 @@ def _worker(
                             beat_indices=np.array([beat_idx]),
                         )
                         for k, v in aux_targets.items():
+                            # Skip masks for IPC
                             if k == "reconstruction_mask":
                                 continue
-                            if k == "reconstruction":
-                                if len(v) > 0:
-                                    aux_dict[k] = v[0].tolist() if hasattr(v[0], 'tolist') else list(v[0])
+                            # If the auxiliary target is array-like (per-beat vectors), serialize to list
+                            try:
+                                if isinstance(v, (list, tuple, np.ndarray)):
+                                    if len(v) > 0:
+                                        first = v[0]
+                                        if hasattr(first, 'tolist'):
+                                            aux_dict[k] = first.tolist()
+                                        else:
+                                            aux_dict[k] = list(first)
+                                    else:
+                                        aux_dict[k] = []
                                 else:
-                                    aux_dict[k] = []
-                            else:
-                                if len(v) > 0:
-                                    val = v[0]
-                                    aux_dict[k] = float(val) if np.isscalar(val) else float(val.item())
-                                else:
-                                    aux_dict[k] = 0.0
+                                    # Scalar value
+                                    if len(v) > 0:
+                                        val = v[0]
+                                        aux_dict[k] = float(val) if np.isscalar(val) else float(val.item())
+                                    else:
+                                        aux_dict[k] = 0.0
+                            except Exception:
+                                # Fallback: convert to string to avoid IPC failures
+                                try:
+                                    aux_dict[k] = str(v)
+                                except Exception:
+                                    aux_dict[k] = None
                     info["aux_targets"] = aux_dict
                     
                     # Get factored action masks for next step
@@ -124,19 +138,27 @@ def _worker(
                     for k, v in aux_targets.items():
                         if k == "reconstruction_mask":
                             continue  # Skip mask
-                        if k == "reconstruction":
-                            # Reconstruction is a feature array - convert to list
-                            if len(v) > 0:
-                                aux_dict[k] = v[0].tolist() if hasattr(v[0], 'tolist') else list(v[0])
+                        try:
+                            if isinstance(v, (list, tuple, np.ndarray)):
+                                if len(v) > 0:
+                                    first = v[0]
+                                    if hasattr(first, 'tolist'):
+                                        aux_dict[k] = first.tolist()
+                                    else:
+                                        aux_dict[k] = list(first)
+                                else:
+                                    aux_dict[k] = []
                             else:
-                                aux_dict[k] = []
-                        else:
-                            # Scalar values (tempo bin, energy bin, phrase boundary)
-                            if len(v) > 0:
-                                val = v[0]
-                                aux_dict[k] = float(val) if np.isscalar(val) else float(val.item())
-                            else:
-                                aux_dict[k] = 0.0
+                                if len(v) > 0:
+                                    val = v[0]
+                                    aux_dict[k] = float(val) if np.isscalar(val) else float(val.item())
+                                else:
+                                    aux_dict[k] = 0.0
+                        except Exception:
+                            try:
+                                aux_dict[k] = str(v)
+                            except Exception:
+                                aux_dict[k] = None
                     info["aux_targets"] = aux_dict
                 
                 remote.send((obs, reward, terminated, truncated, info))

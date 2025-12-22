@@ -38,46 +38,15 @@ class StateConfig:
 
 @dataclass
 class RewardConfig:
-    """Reward signal configuration."""
-
-    # === MONTE CARLO MODE ===
-    # When True: Zero step rewards, episode-only rewards, mean-baseline advantages
-    # This forces true multi-step credit assignment
-    use_monte_carlo: bool = True  # NEW: Pure Monte Carlo learning
-    
+    """Reward signal configuration."""    
     use_sparse_rewards: bool = True
     use_dense_rewards: bool = True
     use_learned_rewards: bool = False  # Disabled - needs real audio features to be useful
-    use_trajectory_rewards: bool = True  # End-of-episode audio quality reward
-    trajectory_reward_scale: float = 100.0  # Scale factor for trajectory rewards
-    step_reward_scale: float = 0.05  # ZERO step rewards in Monte Carlo mode
     target_keep_ratio: float = 0.45  # Target ratio of beats to keep (~45%)
     tempo_consistency_weight: float = 1.0
     energy_flow_weight: float = 1.0
     phrase_completeness_weight: float = 0.8
     transition_quality_weight: float = 0.9
-    keep_ratio_weight: float = 1.0  # Weight for hitting target keep ratio
-    transition_smoothness_weight: float = 1.5  # Weight for smooth transitions (no clicks)
-    # Reconstruction reward (mel L1) weight for episode-end reconstruction bonus
-    # `reconstruction_weight` scales the effect; `reconstruction_max_reward` defines
-    # the maximum magnitude (signed) available from reconstruction (e.g., 10.0)
-    reconstruction_weight: float = 1.0
-    reconstruction_max_reward: float = 10.0
-    # Optionally compute PESQ/STOI (disabled by default because PESQ may require external deps)
-    use_pesq_stoi: bool = False
-    
-    # === PURE AUDIO QUALITY REWARDS ===
-    # NO ground truth labels - model learns what sounds good
-    spectral_continuity_weight: float = 1.2  # Penalize spectral discontinuities at edit points
-    beat_alignment_quality_weight: float = 1.0  # Reward for clean beat-aligned cuts
-    section_coherence_weight: float = 1.0  # Reward for keeping consecutive beats together
-    flow_continuity_weight: float = 1.0  # Beat-to-beat transition flow
-    ground_truth_weight: float = 0.0  # DISABLED - force learning from audio quality, not copying labels
-    
-    # Step rewards (only used if use_monte_carlo=False)
-    step_phrase_boundary_bonus: float = 0.3  # Bonus for cutting at phrase boundaries
-    step_coherence_bonus: float = 0.2  # Bonus for keeping beats adjacent to other kept beats
-    step_energy_continuity_weight: float = 0.15  # Penalty for sudden energy jumps
 
 
 @dataclass
@@ -114,15 +83,14 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.1  # PPO clipping ratio - tighter for stability
+    clip_ratio: float = 0.2  # PPO clipping ratio - tighter for stability
     target_kl: float = 0.02  # Tighter KL target to prevent collapse
     # Tuned defaults for stable fine-tuning
-    learning_rate: float = 2e-5  # Slightly higher LR for fine-tuning from BC pretrain
-    entropy_coeff: float = 0.1  # Reduce entropy to encourage exploitation
+    entropy_coeff: float = 0.2  # Reduce entropy to encourage exploitation
     entropy_coeff_decay: bool = True  # Decay entropy over training
     entropy_coeff_min: float = 0.01  # Lower floor for final convergence
-    value_loss_coeff: float = 1.0  # Stronger value loss to stabilize value updates
-    max_grad_norm: float = 0.3  # Tighter gradient clipping to avoid large updates
+    value_loss_coeff: float = 0.5  # Stronger value loss to stabilize value updates
+    max_grad_norm: float = 1.0  # Tighter gradient clipping to avoid large updates
     n_epochs: int = 6  # PPO epochs per update
     batch_size: int = 512  # Balanced batch size for GPU utilization and stability
     use_gradient_accumulation: bool = True
@@ -140,6 +108,9 @@ class TrainingConfig:
     use_tensorboard: bool = True
     use_wandb: bool = False
     wandb_project: str = "rl-audio-editor"
+    # Evaluation truncation: 0 = full track, >0 = truncate to this many beats for eval
+    # Increase default to a large snippet (2500 beats) for near-full-track eval during HPO
+    eval_max_beats: int = 2500
 
 
 @dataclass

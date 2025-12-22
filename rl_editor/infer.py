@@ -313,8 +313,15 @@ def run_inference(
         
         done = terminated or truncated
         step += 1
-    
-    return actions, action_names, total_reward, aux_preds
+
+    # Final per-beat keep ratio from environment edit history
+    try:
+        final_keep_ratio = float(env.edit_history.get_keep_ratio())
+    except Exception:
+        final_keep_ratio = float(0.0)
+
+    return actions, action_names, total_reward, aux_preds, final_keep_ratio
+
 
 
 def apply_crossfade(seg1: np.ndarray, seg2: np.ndarray, crossfade_samples: int) -> np.ndarray:
@@ -748,13 +755,13 @@ def main():
             seed_i = random.randrange(0, 2**31 - 1)
             set_seeds(seed_i)
 
-        actions, action_names, total_reward, aux_preds = run_inference(
+        actions, action_names, total_reward, aux_preds, final_keep_ratio = run_inference(
             agent, config, audio_state,
             deterministic=args.deterministic,
             collect_aux=bool(args.use_auxiliary),
         )
 
-        logger.info(f"Sample {i}: cumulative reward={total_reward:.4f}")
+        logger.info(f"Sample {i}: cumulative reward={total_reward:.4f} per-beat-keep_ratio={final_keep_ratio:.3f}")
 
         # Create edited audio for this sample
         edited_audio = create_edited_audio(
@@ -783,6 +790,7 @@ def main():
             best_audio = edited_audio
             best_actions = actions
             best_action_names = action_names
+            best_keep_ratio = final_keep_ratio
             chosen_sample_idx = i
 
     # After sampling, determine final output path and save chosen sample
@@ -810,7 +818,11 @@ def main():
     if best_audio is not None:
         final_out.parent.mkdir(parents=True, exist_ok=True)
         sf.write(str(final_out), best_audio, sr)
-        logger.info(f"Saved chosen best sample {chosen_sample_idx} (score={best_score:.4f}) to: {final_out}")
+        try:
+            keep_ratio_msg = f" per-beat-keep_ratio={best_keep_ratio:.3f}"
+        except Exception:
+            keep_ratio_msg = ""
+        logger.info(f"Saved chosen best sample {chosen_sample_idx} (score={best_score:.4f}){keep_ratio_msg} to: {final_out}")
     else:
         logger.error("No samples produced - nothing saved")
 

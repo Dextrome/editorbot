@@ -41,21 +41,27 @@ try:
 except ImportError:
     logger.info("NATTEN not installed. Using sliding window attention fallback.")
 
+# Explicitly log which attention implementation will be used at module import time.
+if NATTEN_AVAILABLE:
+    logger.info("Using natten neighborhood-attention implementation for HybridNATTENEncoder.")
+else:
+    logger.info("Using sliding-window attention fallback (pure PyTorch) for HybridNATTENEncoder.")
+
 
 class NATTENLayer(nn.Module):
     """Single NATTEN layer with neighborhood attention.
-    
+
     Performs local self-attention within a sliding window (kernel_size),
     which is O(n*k) instead of O(n²) for standard attention.
     """
-    
+
     def __init__(
-        self, 
-        dim: int, 
-        n_heads: int = 4, 
+        self,
+        dim: int,
+        n_heads: int = 4,
         kernel_size: int = 31,
         dilation: int = 1,
-        dropout: float = 0.1
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -63,15 +69,15 @@ class NATTENLayer(nn.Module):
         self.head_dim = dim // n_heads
         self.kernel_size = kernel_size
         self.dilation = dilation
-        
+
         assert dim % n_heads == 0, f"dim ({dim}) must be divisible by n_heads ({n_heads})"
-        
+
         # Q, K, V projections
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(dim)
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with neighborhood attention.
         

@@ -224,17 +224,39 @@ class AudioEditingEnvFactored(gym.Env):
         
         # Compute step reward (minimal, most reward at episode end)
         step_reward = self._compute_step_reward(factored_action)
+
+        # --- Temporal smoothing penalty (apply before episode-end computation) ---
+        temporal_penalty = 0.0
+        try:
+            prev_actions = self.episode_actions[:-1]
+            window_beats = 2
+            recent_count = 0
+            for pa in prev_actions:
+                if pa.beat_index >= factored_action.beat_index - window_beats:
+                    recent_count += 1
+            if recent_count > 0 and factored_action.n_beats < 4:
+                temporal_penalty = -0.04 * min(3, recent_count)
+                try:
+                    self._temporal_penalty_count += 1
+                    self._temporal_penalty_total += float(abs(temporal_penalty))
+                except Exception:
+                    pass
+        except Exception:
+            temporal_penalty = 0.0
+
+        # Apply penalty to step reward and store
+        step_reward = float(step_reward) + float(temporal_penalty)
         self.step_rewards.append(step_reward)
-        
+
         # Check termination
         terminated = self.current_beat >= n_beats
         truncated = len(self.episode_actions) >= self.max_steps
-        
+
         # Episode reward at termination or truncation
         episode_reward = 0.0
         if terminated or truncated:
             episode_reward = self._compute_episode_reward()
-        
+
         total_reward = step_reward + episode_reward
         
         # Get observation
@@ -248,34 +270,13 @@ class AudioEditingEnvFactored(gym.Env):
             "action_amount": action_amount,
             "step_reward": step_reward,
             "episode_reward": episode_reward if terminated else 0.0,
+            "temporal_penalty": float(temporal_penalty),
             "keep_ratio": self.edit_history.get_keep_ratio(),
             "n_section_decisions": len([a for a in self.episode_actions 
                                         if a.n_beats > 1]),
         }
 
-        # --- Temporal smoothing penalty ---
-        # Penalize actions if there was another action within the last N beats
-        try:
-            # Exclude current action (it was appended before this call)
-            prev_actions = self.episode_actions[:-1]
-            window_beats = 2  # look-back window in beats
-            recent_count = 0
-            for pa in prev_actions:
-                if pa.beat_index >= action.beat_index - window_beats:
-                    recent_count += 1
-            # Apply penalty for micro-edits (skip large section-level actions)
-            if recent_count > 0 and action.n_beats < 4:
-                temporal_penalty = -0.04 * min(3, recent_count)  # stronger if many recent actions
-                reward += temporal_penalty
-                # Track diagnostics for episode-level reporting
-                try:
-                    self._temporal_penalty_count += 1
-                    self._temporal_penalty_total += float(abs(temporal_penalty))
-                except Exception:
-                    pass
-        except Exception:
-            # If any failure, do not block reward computation
-            pass
+        
 
         # Attach episode reward breakdown to info when episode ends so trainer can log it
         if terminated or truncated:
@@ -618,7 +619,7 @@ class AudioEditingEnvFactored(gym.Env):
             if action.action_amount != ActionAmount.NEUTRAL:
                 reward += 0.02
 
-        return reward
+        return reward * 0.1
 
     def _compute_episode_reward(self) -> float:
         """Compute episode-end reward based on edit quality.

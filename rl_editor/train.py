@@ -54,6 +54,7 @@ from .reward import compute_trajectory_return
 from .logging_utils import TrainingLogger, create_logger
 from .learned_reward_integration import LearnedRewardIntegration
 from .auxiliary_tasks import AuxiliaryConfig, AuxiliaryTargetComputer, compute_auxiliary_targets
+from .infer import load_and_process_audio, run_inference, create_edited_audio
 
 logger = logging.getLogger(__name__)
 
@@ -359,17 +360,38 @@ class PPOTrainer:
         self.aux_config = AuxiliaryConfig()
         self.aux_target_computer = AuxiliaryTargetComputer(self.aux_config)
         self.auxiliary_optimizer: Optional[optim.Adam] = None
-        
-        # Logger
+        # Training logger (may be created later)
         self.training_logger: Optional[TrainingLogger] = None
-        if config.training.use_tensorboard or config.training.use_wandb:
-            self.training_logger = create_logger(config)
+
+    def set_auxiliary_config(self, new_config: AuxiliaryConfig) -> None:
+        """Update auxiliary task configuration and clear/recompute any cached targets.
+
+        Call this when `mel_dim` or `use_chroma_continuity` (or other aux settings) change.
+        """
+        try:
+            self.aux_target_computer.update_config(new_config)
+            self.aux_config = new_config
+            logger.info("Auxiliary config updated and cache invalidated where needed")
+            # Reinitialize auxiliary optimizer if agent has auxiliary module
+            if getattr(self, 'agent', None) is not None and getattr(self.agent, 'auxiliary_module', None) is not None:
+                self.auxiliary_optimizer = optim.Adam(
+                    self.agent.auxiliary_module.parameters(),
+                    lr=self.config.ppo.learning_rate * 2.0,
+                )
+                logger.info("Auxiliary optimizer reinitialized after aux config change")
+        except Exception:
+            logger.exception("Failed to update auxiliary config; clearing aux cache as fallback")
+            try:
+                self.aux_target_computer.clear_cache()
+            except Exception:
+                pass
         
-        # Directories
-        Path(config.training.save_dir).mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Initialized PPOTrainer with {n_envs} envs on {self.device}")
-        logger.info(f"Factored action space: {N_ACTION_TYPES} types × {N_ACTION_SIZES} sizes × {N_ACTION_AMOUNTS} amounts")
+        # Ensure save directory exists
+        try:
+            Path(self.config.training.save_dir).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.exception("Failed to ensure save_dir exists")
+        logger.info("Auxiliary config updated and aux cache handled")
     
     def _init_agent(self, input_dim: int, beat_feature_dim: int = 121):
         """Initialize agent and optimizer."""
@@ -441,6 +463,9 @@ class PPOTrainer:
         n_steps: int,
     ) -> Dict[str, np.ndarray]:
         """Collect rollouts with factored actions."""
+        # Track episode count before this rollout so we can report per-epoch deltas
+        prev_episode_count = len(self.episode_rewards)
+
         # Clear auxiliary target cache
         self.aux_target_computer._cache.clear()
         
@@ -458,6 +483,7 @@ class PPOTrainer:
         episode_rewards = [0.0] * len(obs_list)
         episode_lengths = [0] * len(obs_list)
         section_decisions = [0] * len(obs_list)
+        temporal_penalty_values: List[float] = []
         
         # Exploration rate
         exploration_rate = max(0.15, 0.5 - self.global_step / 2000000)
@@ -535,9 +561,18 @@ class PPOTrainer:
                     beat_idx = info.get("beat", 0)
                     beat_indices.append(beat_idx)
                     aux_targets = info.get("aux_targets")
-                    if aux_targets is not None and "reconstruction" in aux_targets:
-                        if isinstance(aux_targets["reconstruction"], list):
-                            aux_targets["reconstruction"] = np.array(aux_targets["reconstruction"])
+                    # Convert any list-like aux targets (serialized arrays) back to numpy
+                    if aux_targets is not None:
+                        for k, v in list(aux_targets.items()):
+                            # skip None or scalar
+                            if v is None:
+                                continue
+                            if isinstance(v, list):
+                                try:
+                                    aux_targets[k] = np.asarray(v, dtype=np.float32)
+                                except Exception:
+                                    # leave as-is if conversion fails
+                                    pass
                     aux_targets_list.append(aux_targets)
             else:
                 # Threading mode - access env data directly
@@ -589,6 +624,13 @@ class PPOTrainer:
                 )
                 episode_rewards[i] += rewards[i]
                 episode_lengths[i] += 1
+                # Collect per-step temporal penalty if present in info
+                info = infos[i] if infos[i] else {}
+                try:
+                    tp = float(info.get('temporal_penalty', 0.0))
+                except Exception:
+                    tp = 0.0
+                temporal_penalty_values.append(tp)
             
             # Handle episode ends
             for i, (terminated, truncated) in enumerate(zip(terminateds, truncateds)):
@@ -678,6 +720,11 @@ class PPOTrainer:
             "amount_masks": self.buffer.amount_masks,
             "dones": np.array(self.buffer.dones),
             "episode_reward_breakdowns": self._episode_reward_breakdowns,
+            # Per-rollout new episodes (useful for per-epoch diagnostics)
+            "episode_rewards_epoch": np.array(self.episode_rewards[prev_episode_count:]) if len(self.episode_rewards) > prev_episode_count else np.array([]),
+            # Per-rollout temporal penalty summary (per-step values aggregated)
+            "temporal_penalty_mean_rollout": float(np.mean(temporal_penalty_values)) if temporal_penalty_values else 0.0,
+            "temporal_penalty_max_rollout": float(np.max(temporal_penalty_values)) if temporal_penalty_values else 0.0,
         }
     
     def update(self, rollout_data: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -692,6 +739,18 @@ class PPOTrainer:
         
         # Get auxiliary targets from buffer
         aux_targets_np = self.buffer.get_auxiliary_targets_batch()
+        # Diagnostic: log which auxiliary target keys are present in the buffer
+        try:
+            aux_keys = list(aux_targets_np.keys())
+            logger.debug("Auxiliary targets in buffer: %s", aux_keys)
+            if self.training_logger is not None:
+                # log count of aux target keys (helps detect empty aux batches)
+                try:
+                    self.training_logger.log_scalar("train/aux_targets_count", len(aux_keys), self.global_step)
+                except Exception:
+                    logger.debug("Failed to log aux_targets_count to training logger")
+        except Exception:
+            logger.exception("Failed to inspect auxiliary targets in buffer")
         aux_targets = {}
         for key, arr in aux_targets_np.items():
             if len(arr) > 0:
@@ -980,16 +1039,60 @@ class PPOTrainer:
                     aux_break_means = {k: float(np.mean(v)) for k, v in aux_loss_breakdown.items() if v}
                     if aux_break_means:
                         self.training_logger.log_scalars("auxiliary/breakdown", aux_break_means, self.global_step)
-                    # Also log an aggregate unweighted auxiliary loss (sum of per-task losses)
+                        # Also log selected auxiliary losses as top-level scalars for easy viewing
+                        try:
+                            for key in ("chroma_loss", "mel_reconstruction_loss", "reconstruction_loss", "good_bad_loss", "similarity_loss", "energy_loss", "phrase_loss"):
+                                if key in aux_break_means:
+                                    try:
+                                        self.training_logger.log_scalar(f"train/{key}", aux_break_means[key], self.global_step)
+                                    except Exception:
+                                        logger.debug("Failed to log auxiliary scalar %s", key)
+                        except Exception:
+                            logger.exception("Failed to log top-level auxiliary scalars")
+                        # Also log an aggregate unweighted auxiliary loss (sum of per-task losses)
+                        try:
+                            per_task_keys = [k for k in aux_break_means.keys() if k.endswith("_loss") and k != "total_auxiliary_loss"]
+                            if per_task_keys:
+                                aux_unweighted = float(sum(aux_break_means[k] for k in per_task_keys))
+                                self.training_logger.log_scalar("train/auxiliary_unweighted", aux_unweighted, self.global_step)
+                        except Exception:
+                            logger.exception("Failed to compute auxiliary_unweighted")
+                else:
+                    # No breakdowns collected this update — helpful diagnostic for debugging missing aux logs
+                    logger.debug("No auxiliary loss breakdowns collected in this update")
                     try:
-                        per_task_keys = [k for k in aux_break_means.keys() if k.endswith("_loss") and k != "total_auxiliary_loss"]
-                        if per_task_keys:
-                            aux_unweighted = float(sum(aux_break_means[k] for k in per_task_keys))
-                            self.training_logger.log_scalar("train/auxiliary_unweighted", aux_unweighted, self.global_step)
+                        if self.training_logger is not None:
+                            self.training_logger.log_scalar("train/aux_loss_breakdown_present", 0.0, self.global_step)
                     except Exception:
-                        logger.exception("Failed to compute auxiliary_unweighted")
+                        logger.debug("Failed to log aux_loss_breakdown_present scalar")
             except Exception:
                 logger.exception("Failed to log auxiliary breakdowns")
+
+            # Per-epoch episode reward diagnostics (from collect_rollouts)
+            try:
+                ep_rewards_epoch = rollout_data.get("episode_rewards_epoch")
+                if ep_rewards_epoch is not None:
+                    n_ep = int(len(ep_rewards_epoch))
+                    mean_ep = float(ep_rewards_epoch.mean()) if n_ep > 0 else 0.0
+                    std_ep = float(ep_rewards_epoch.std()) if n_ep > 0 else 0.0
+                    # Log counts and statistics to TensorBoard for debugging
+                    try:
+                        self.training_logger.log_scalar("train/episodes_this_rollout", n_ep, self.global_step)
+                        self.training_logger.log_scalar("train/episode_reward_epoch_mean", mean_ep, self.global_step)
+                        self.training_logger.log_scalar("train/episode_reward_epoch_std", std_ep, self.global_step)
+                    except Exception:
+                        logger.debug("Failed to log per-epoch episode reward diagnostics to training logger")
+                    logger.info(f"Epoch diagnostic: new_episodes={n_ep} mean_ep_reward={mean_ep:.2f} std={std_ep:.2f}")
+                    # Also log per-rollout temporal penalty summaries if present
+                    try:
+                        tp_mean = float(rollout_data.get('temporal_penalty_mean_rollout', 0.0))
+                        tp_max = float(rollout_data.get('temporal_penalty_max_rollout', 0.0))
+                        self.training_logger.log_scalar("train/temporal_penalty_mean_rollout", tp_mean, self.global_step)
+                        self.training_logger.log_scalar("train/temporal_penalty_max_rollout", tp_max, self.global_step)
+                    except Exception:
+                        logger.debug("Failed to log temporal penalty rollout summaries")
+            except Exception:
+                logger.exception("Failed to compute per-epoch episode reward diagnostics")
             
             # Log reward breakdowns and counters
             for k in all_keys:
@@ -1002,6 +1105,23 @@ class PPOTrainer:
                 else:
                     # Log all other reward/penalty components under rewards/
                     self.training_logger.log_scalar(f"rewards/{k}", val, self.global_step)
+
+            # Temporal penalty specific logging: total per-episode, events per-episode, and per-event avg
+            try:
+                if breakdowns:
+                    tp_totals = [bd.get('temporal_penalty_total') for bd in breakdowns if 'temporal_penalty_total' in bd]
+                    tp_counts = [bd.get('temporal_penalty_count') for bd in breakdowns if 'temporal_penalty_count' in bd]
+                    if tp_totals:
+                        self.training_logger.log_scalar("rewards/temporal_penalty_total", float(np.mean(tp_totals)), self.global_step)
+                    if tp_counts:
+                        self.training_logger.log_scalar("train/temporal_penalty_events_per_ep", float(np.mean(tp_counts)), self.global_step)
+                        # Compute per-event average across episodes that had events
+                        per_event = [ (bd.get('temporal_penalty_total', 0.0) / bd.get('temporal_penalty_count'))
+                                      for bd in breakdowns if bd.get('temporal_penalty_count', 0) > 0 ]
+                        if per_event:
+                            self.training_logger.log_scalar("rewards/temporal_penalty_per_event", float(np.mean(per_event)), self.global_step)
+            except Exception:
+                logger.exception("Failed to log temporal penalty metrics")
         
         return metrics
     
@@ -1263,6 +1383,8 @@ def train(
     bc_mixed_batch: int = 64,
     use_subprocess: bool = False,
     learned_reward_model: Optional[Any] = None,
+    max_beats: Optional[int] = None,
+    val_audio: Optional[str] = None,
 ):
     """Main training function.
     
@@ -1282,8 +1404,8 @@ def train(
         datefmt="%H:%M:%S",
     )
     
-    logger.info("=" * 60)
-    logger.info("RL AUDIO EDITOR TRAINING")
+    mb_display = max_beats if max_beats is not None else "unlimited"
+    logger.info(f"Max beats per sample: {mb_display}")
     logger.info("=" * 60)
     logger.info(f"Device: {config.training.device}")
     logger.info(f"Epochs: {n_epochs}, Envs: {n_envs}, Steps/epoch: {steps_per_epoch}")
@@ -1326,6 +1448,13 @@ def train(
         use_subprocess=use_subprocess,
         learned_reward_model=learned_reward_model,
     )
+
+    # Attach a TrainingLogger so TensorBoard/W&B outputs are created under config.training.log_dir
+    try:
+        trainer.training_logger = create_logger(config)
+        logger.info(f"Training logger initialized at: {trainer.training_logger.run_dir}")
+    except Exception:
+        logger.exception("Failed to initialize TrainingLogger; continuing without it")
     
     if checkpoint_path and Path(checkpoint_path).exists():
         trainer.load_checkpoint(checkpoint_path)
@@ -1347,8 +1476,13 @@ def train(
     
     # Training loop
     save_dir = Path(config.training.save_dir)
-    MAXBEATS = 5000  # Limit beats for tractable action space
-    logger.info(f"Max beats per sample: {MAXBEATS}")
+    # Default maximum beats used when CLI/config does not set `max_beats`.
+    # Set to None to allow unlimited when user omits the CLI flag.
+    DEFAULT_MAXBEATS = None
+    # `max_beats` is an optional train() parameter; if provided it overrides the default.
+    effective_global_max = max_beats if max_beats is not None else DEFAULT_MAXBEATS
+    effective_display = effective_global_max if effective_global_max is not None else "unlimited"
+    logger.info(f"Max beats per sample: {effective_display}")
     
     for epoch in range(trainer.current_epoch, n_epochs):
         epoch_start = time.time()
@@ -1376,10 +1510,11 @@ def train(
         idxs = np.random.randint(0, len(dataset), size=n_envs)
         
         for idx in idxs:
+            # Determine per-sample max beats based on curriculum and any global override
             if random.random() < short_prob:
-                max_beats = min(MAXBEATS, short_max_beats)
+                per_sample_max = min(effective_global_max, short_max_beats) if effective_global_max is not None else short_max_beats
             else:
-                max_beats = MAXBEATS
+                per_sample_max = effective_global_max
             
             sample = dataset[idx]
             raw_data = sample.get('raw', sample)
@@ -1393,10 +1528,10 @@ def train(
             if hasattr(beat_features, 'numpy'):
                 beat_features = beat_features.numpy()
             
-            # Limit to max_beats
-            if len(beat_times) > max_beats:
-                start_idx = np.random.randint(0, len(beat_times) - max_beats)
-                end_idx = start_idx + max_beats
+            # Limit to per-sample max beats (if set)
+            if per_sample_max is not None and len(beat_times) > per_sample_max:
+                start_idx = np.random.randint(0, len(beat_times) - per_sample_max)
+                end_idx = start_idx + per_sample_max
                 beat_times = beat_times[start_idx:end_idx]
                 beat_features = beat_features[start_idx:end_idx]
                 beat_times = beat_times - beat_times[0]  # Reset to 0
@@ -1426,6 +1561,16 @@ def train(
                         mel = mel.numpy()
                     audio_state.target_mel = mel
             audio_states.append(audio_state)
+        # Diagnostics: log sampled beat counts for this epoch (helps detect curriculum / max_beats effects)
+        try:
+            beats_counts = [len(s.beat_times) for s in audio_states]
+            if trainer.training_logger is not None:
+                trainer.training_logger.log_scalar("train/avg_sample_beats", float(np.mean(beats_counts)), trainer.global_step)
+                trainer.training_logger.log_scalar("train/min_sample_beats", float(np.min(beats_counts)), trainer.global_step)
+                trainer.training_logger.log_scalar("train/max_sample_beats", float(np.max(beats_counts)), trainer.global_step)
+        except Exception:
+            logger.exception("Failed to log sampled beat counts")
+
         data_time = time.time() - data_start
         
         # Collect rollouts
@@ -1479,6 +1624,28 @@ def train(
         if epoch % checkpoint_interval == 0 and epoch > 0:
             ckpt_path = save_dir / f"checkpoint_epoch_{epoch}.pt"
             trainer.save_checkpoint(str(ckpt_path))
+            # Deterministic evaluation on provided validation audio (cheap diagnostic)
+            if val_audio:
+                try:
+                    audio, sr, audio_state = load_and_process_audio(
+                        val_audio,
+                        config=config,
+                        max_beats=getattr(config.training, 'eval_max_beats', 0),
+                        cache_dir=config.data.cache_dir,
+                    )
+                    actions, action_names, total_reward, aux_preds, final_keep_ratio = run_inference(
+                        trainer.agent, config, audio_state, deterministic=True, verbose=False
+                    )
+                    edited = create_edited_audio(audio, sr, audio_state.beat_times, actions)
+                    orig_dur = len(audio) / sr
+                    edited_dur = len(edited) / sr
+                    edited_pct = 100.0 * edited_dur / orig_dur if orig_dur > 0 else 0.0
+                    logger.info(f"Eval deterministic: reward={total_reward:.4f} per-beat-keep_ratio={final_keep_ratio:.3f} edited_pct={edited_pct:.1f}%")
+                    if trainer.training_logger is not None:
+                        trainer.training_logger.log_scalar("eval/edited_pct", float(edited_pct), trainer.global_step)
+                        trainer.training_logger.log_scalar("eval/per-beat-keep_ratio", float(final_keep_ratio), trainer.global_step)
+                except Exception:
+                    logger.exception("Deterministic eval after checkpoint failed")
         
         # Best model
         if metrics["episode_reward"] > trainer.best_reward:
@@ -1486,6 +1653,28 @@ def train(
             best_path = save_dir / "best.pt"
             trainer.save_checkpoint(str(best_path))
             logger.info(f"New best reward: {trainer.best_reward:.2f}")
+            # Run deterministic eval on best model if validation audio provided
+            if val_audio:
+                try:
+                    audio, sr, audio_state = load_and_process_audio(
+                        val_audio,
+                        config=config,
+                        max_beats=getattr(config.training, 'eval_max_beats', 0),
+                        cache_dir=config.data.cache_dir,
+                    )
+                    actions, action_names, total_reward, aux_preds, final_keep_ratio = run_inference(
+                        trainer.agent, config, audio_state, deterministic=True, verbose=False
+                    )
+                    edited = create_edited_audio(audio, sr, audio_state.beat_times, actions)
+                    orig_dur = len(audio) / sr
+                    edited_dur = len(edited) / sr
+                    edited_pct = 100.0 * edited_dur / orig_dur if orig_dur > 0 else 0.0
+                    logger.info(f"Eval deterministic (best): reward={total_reward:.4f} per-beat-keep_ratio={final_keep_ratio:.3f} edited_pct={edited_pct:.1f}%")
+                    if trainer.training_logger is not None:
+                        trainer.training_logger.log_scalar("eval/edited_pct", float(edited_pct), trainer.global_step)
+                        trainer.training_logger.log_scalar("eval/per-beat-keep_ratio", float(final_keep_ratio), trainer.global_step)
+                except Exception:
+                    logger.exception("Deterministic eval after best checkpoint failed")
     
     # Final save
     final_path = save_dir / "final.pt"
@@ -1503,6 +1692,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=10000, help="Number of epochs")
     parser.add_argument("--n_envs", type=int, default=16, help="Parallel environments")
     parser.add_argument("--steps", type=int, default=512, help="Steps per epoch")
+    parser.add_argument("--max_beats", type=int, default=None, help="Optional max beats per sample (omit for unlimited)")
     parser.add_argument("--lr", type=float, default=4e-5, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from checkpoint")
@@ -1546,6 +1736,7 @@ def main():
         bc_mixed_weight=args.bc_mixed_weight,
         bc_mixed_batch=args.bc_mixed_batch,
         use_subprocess=args.subprocess,
+        max_beats=args.max_beats,
     )
 
 
