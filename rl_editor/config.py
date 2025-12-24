@@ -73,24 +73,23 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 1e-5  # Halved LR for stability
+    learning_rate: float = 4e-5  # Higher LR for fresh training (decay to 2e-5)
     lr_decay: bool = True  # Enable learning rate decay by default
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
-    lr_min_ratio: float = 0.5  # Decay from 2e-5 to 1e-5
+    lr_min_ratio: float = 0.5  # Decay to 50% of initial LR
     lr_warmup_epochs: int = 10  # Warmup epochs before decay starts
     lr_decay_epochs: int = 500  # Total epochs for decay (for step/exponential)
     lr_step_factor: float = 0.5  # Factor for step decay
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.1  # PPO clipping ratio - tighter for stability
-    target_kl: float = 0.02  # Tighter KL target to prevent collapse
-    # Tuned defaults for stable fine-tuning
-    # More conservative entropy scheduling for resumed training
-    entropy_coeff: float = 0.25  # Lower starting entropy to stabilise updates
+    clip_ratio: float = 0.2  # Standard PPO clipping - allows exploration
+    target_kl: float = 0.04  # Looser KL for early training exploration
+    # Exploration-friendly defaults for fresh training
+    entropy_coeff: float = 0.65  # High entropy to encourage action diversity
     entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.05  # Lower floor for later exploitation
-    value_loss_coeff: float = 0.08  # Value loss weight (tunable)
+    entropy_coeff_min: float = 0.15  # Maintain some exploration late
+    value_loss_coeff: float = 0.1  # Standard PPO balance
     # Clip returns (helps prevent FP16 overflow and huge losses)
     # Widen return clipping to effectively disable aggressive clipping during recovery
     return_clip_min: float = -1e6

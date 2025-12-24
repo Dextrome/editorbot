@@ -6,6 +6,7 @@ Implements three complementary signals:
 3. Learned rewards - Human preference model
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import numpy as np
@@ -58,9 +59,18 @@ class RewardCalculator:
         self.config = config
         self.reward_config: RewardConfig = config.reward
         self.audio_config = config.audio
-        # Simple cache for per-audio computed per-beat mel targets
+        # LRU cache for per-audio computed per-beat mel targets
         # Keyed by pair_id when available, else by (raw_len, n_beats)
-        self._cache = {}
+        self._cache: OrderedDict = OrderedDict()
+        self._cache_max_size = 500  # Limit cache to prevent OOM
+
+    def _cache_put(self, key, value):
+        """Add item to cache with LRU eviction."""
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        # Evict oldest entries if over limit
+        while len(self._cache) > self._cache_max_size:
+            self._cache.popitem(last=False)
 
     def get_target_per_beat(self, audio_state) -> Optional[np.ndarray]:
         """Return per-beat mel targets for an audio_state, using cache.
@@ -77,6 +87,8 @@ class RewardCalculator:
         raw_len = 0 if getattr(audio_state, 'raw_audio', None) is None else len(audio_state.raw_audio)
         cache_key = ("pair", pair_id, n_beats) if pair_id else ("raw", raw_len, n_beats)
         if cache_key in self._cache:
+            # Move to end for LRU
+            self._cache.move_to_end(cache_key)
             return self._cache[cache_key]
 
         def _aggregate_spec_to_beats(spec: np.ndarray, n_beats: int) -> Optional[np.ndarray]:
@@ -100,16 +112,16 @@ class RewardCalculator:
             if tm is not None:
                 tm = np.array(tm)
                 if tm.ndim == 2 and tm.shape[0] == n_beats:
-                    self._cache[cache_key] = tm
+                    self._cache_put(cache_key, tm)
                     return tm
                 if tm.ndim == 2 and tm.shape[1] == n_beats:
                     out = tm.T
-                    self._cache[cache_key] = out
+                    self._cache_put(cache_key, out)
                     return out
                 if tm.ndim == 2 and tm.shape[1] >= n_beats:
                     out = _aggregate_spec_to_beats(tm, n_beats)
                     if out is not None:
-                        self._cache[cache_key] = out
+                        self._cache_put(cache_key, out)
                         return out
         except Exception:
             pass
@@ -121,7 +133,7 @@ class RewardCalculator:
                 mel_spec = np.array(mel_spec)
                 out = _aggregate_spec_to_beats(mel_spec, n_beats)
                 if out is not None:
-                    self._cache[cache_key] = out
+                    self._cache_put(cache_key, out)
                     return out
         except Exception:
             pass
@@ -136,7 +148,7 @@ class RewardCalculator:
                 mel_spec = np.array(mel_spec)
                 out = _aggregate_spec_to_beats(mel_spec, n_beats)
                 if out is not None:
-                    self._cache[cache_key] = out
+                    self._cache_put(cache_key, out)
                     return out
         except Exception:
             pass
@@ -379,8 +391,9 @@ class RewardCalculator:
                 else:
                     cache_key = ("raw", raw_len, n_beats)
 
-                # Try cache
+                # Try cache (move to end for LRU)
                 if cache_key in self._cache:
+                    self._cache.move_to_end(cache_key)
                     target_per_beat = self._cache[cache_key]
 
                 # Helper to aggregate full spectrogram to per-beat in a vectorized way
@@ -438,10 +451,10 @@ class RewardCalculator:
                         except Exception:
                             target_per_beat = None
 
-                # Cache if we have targets
+                # Cache if we have targets (with LRU eviction)
                 if target_per_beat is not None and cache_key is not None:
                     try:
-                        self._cache[cache_key] = target_per_beat
+                        self._cache_put(cache_key, target_per_beat)
                     except Exception:
                         pass
 

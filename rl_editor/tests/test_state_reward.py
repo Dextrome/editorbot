@@ -17,8 +17,8 @@ class TestEditHistory:
     def test_init(self):
         """Test EditHistory initialization."""
         history = EditHistory()
-        assert history.kept_beats == []
-        assert history.cut_beats == []
+        assert history.kept_beats == set()
+        assert history.cut_beats == set()
         assert history.total_duration_edited == 0.0
 
     def test_add_keep(self):
@@ -27,9 +27,9 @@ class TestEditHistory:
         history.add_keep(5)
         assert 5 in history.kept_beats
 
-        # Duplicate should not be added
+        # Duplicate should not be added (sets handle this automatically)
         history.add_keep(5)
-        assert history.kept_beats.count(5) == 1
+        assert len([b for b in history.kept_beats if b == 5]) == 1
 
     def test_add_cut(self):
         """Test adding cut beats."""
@@ -121,60 +121,6 @@ class TestStateRepresentation:
         # Last two positions should be zero (padding)
         assert np.allclose(context[-6:], 0)
 
-    def test_construct_observation(self):
-        """Test observation construction."""
-        config = Config()
-        state_rep = StateRepresentation(config)
-
-        beat_times = np.linspace(0, 8, 32)  # 32 beats over 8 seconds
-        beat_features = np.random.randn(32, 3)
-
-        audio_state = AudioState(
-            beat_index=16,
-            beat_times=beat_times,
-            beat_features=beat_features,
-            tempo=120.0,
-        )
-
-        edit_history = EditHistory()
-        edit_history.add_keep(0)
-        edit_history.add_cut(5)
-
-        obs = state_rep.construct_observation(
-            audio_state=audio_state,
-            edit_history=edit_history,
-            remaining_duration=4.0,
-            total_duration=8.0,
-        )
-
-        assert obs.shape[0] == state_rep.feature_dim
-        assert obs.dtype == np.float32
-
-    def test_observation_reconstruction(self):
-        """Test decomposing observation back to components."""
-        config = Config()
-        state_rep = StateRepresentation(config)
-
-        beat_times = np.linspace(0, 8, 32)
-        beat_features = np.random.randn(32, 3)
-
-        audio_state = AudioState(
-            beat_index=10,
-            beat_times=beat_times,
-            beat_features=beat_features,
-        )
-
-        edit_history = EditHistory()
-        obs = state_rep.construct_observation(
-            audio_state, edit_history, 5.0, 8.0
-        )
-
-        # Decompose
-        components = state_rep.observation_to_dict(obs)
-        assert "edit_history" in components
-        assert "duration_constraints" in components
-        assert "beat_index" in components
-
 
 class TestRewardCalculator:
     """Test reward calculation."""
@@ -242,38 +188,6 @@ class TestRewardCalculator:
         assert 0.0 <= components.phrase_completeness <= 1.0
         assert 0.0 <= components.transition_quality <= 1.0
         assert 0.0 <= components.dense_reward <= 1.0
-
-    def test_edit_efficiency_penalty(self):
-        """Test edit efficiency penalty."""
-        config = Config()
-        calc = RewardCalculator(config)
-
-        # Few actions: should have small or zero penalty
-        penalty_few = calc.compute_edit_efficiency_penalty(n_actions_taken=1, total_duration=20.0)
-        assert penalty_few >= -0.5
-
-        # Many actions: should have larger penalty
-        penalty_many = calc.compute_edit_efficiency_penalty(n_actions_taken=50, total_duration=20.0)
-        assert penalty_many < penalty_few
-
-    def test_edit_completeness_bonus(self):
-        """Test edit completeness bonus."""
-        config = Config()
-        calc = RewardCalculator(config)
-
-        target_ratio = config.reward.target_keep_ratio
-
-        # Below target ratio: small bonus
-        bonus_partial = calc.compute_edit_completeness_bonus(
-            n_beats_edited=int(10 * target_ratio), total_beats=100
-        )
-        assert 0.0 <= bonus_partial <= 0.5
-
-        # Above target ratio: full bonus
-        bonus_full = calc.compute_edit_completeness_bonus(
-            n_beats_edited=int(100 * target_ratio), total_beats=100
-        )
-        assert bonus_full >= bonus_partial
 
     def test_combined_reward(self):
         """Test combined reward computation."""

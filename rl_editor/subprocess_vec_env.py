@@ -75,23 +75,24 @@ def _worker(
                                         first = v[0]
                                         if hasattr(first, 'tolist'):
                                             aux_dict[k] = first.tolist()
+                                        elif isinstance(first, (int, float, np.integer, np.floating)):
+                                            aux_dict[k] = float(first)
                                         else:
                                             aux_dict[k] = list(first)
                                     else:
                                         aux_dict[k] = []
-                                else:
+                                elif isinstance(v, (int, float, np.integer, np.floating)):
                                     # Scalar value
-                                    if len(v) > 0:
-                                        val = v[0]
-                                        aux_dict[k] = float(val) if np.isscalar(val) else float(val.item())
-                                    else:
-                                        aux_dict[k] = 0.0
-                            except Exception:
-                                # Fallback: convert to string to avoid IPC failures
-                                try:
-                                    aux_dict[k] = str(v)
-                                except Exception:
-                                    aux_dict[k] = None
+                                    aux_dict[k] = float(v)
+                                else:
+                                    # Unknown type - skip instead of corrupting with string
+                                    continue
+                            except Exception as e:
+                                # Skip keys that fail serialization rather than corrupt data
+                                # Log only in debug mode to avoid spam
+                                import logging
+                                logging.debug(f"Skipping aux target '{k}' due to serialization error: {e}")
+                                continue
                     info["aux_targets"] = aux_dict
                     
                     # Get factored action masks for next step

@@ -529,7 +529,8 @@ class EditHistoryFactored:
     def get_keep_ratio(self) -> float:
         total = len(self.kept_beats) + len(self.cut_beats)
         if total == 0:
-            return 1.0
+            # No decisions made yet - return neutral ratio to avoid biased penalties
+            return 0.5
         return len(self.kept_beats) / total
     
     def get_section_decision_count(self) -> int:

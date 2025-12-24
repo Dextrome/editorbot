@@ -484,8 +484,6 @@ class PolicyNetwork(nn.Module):
         if type_mask is not None:
             type_logits = type_logits.masked_fill(~type_mask.bool(), float("-inf"))
         type_logits = torch.clamp(type_logits, -20.0, 20.0)
-        type_logits = type_logits + torch.randn_like(type_logits) * 0.1
-        type_logits = type_logits / 1.5
         
         type_dist = torch.distributions.Categorical(logits=type_logits)
         type_log_prob = type_dist.log_prob(type_action)
@@ -498,8 +496,6 @@ class PolicyNetwork(nn.Module):
         if size_mask is not None:
             size_logits = size_logits.masked_fill(~size_mask.bool(), float("-inf"))
         size_logits = torch.clamp(size_logits, -20.0, 20.0)
-        size_logits = size_logits + torch.randn_like(size_logits) * 0.1
-        size_logits = size_logits / 1.5
         
         size_dist = torch.distributions.Categorical(logits=size_logits)
         size_log_prob = size_dist.log_prob(size_action)
@@ -511,8 +507,6 @@ class PolicyNetwork(nn.Module):
         if amount_mask is not None:
             amount_logits = amount_logits.masked_fill(~amount_mask.bool(), float("-inf"))
         amount_logits = torch.clamp(amount_logits, -20.0, 20.0)
-        amount_logits = amount_logits + torch.randn_like(amount_logits) * 0.1
-        amount_logits = amount_logits / 1.5
         
         amount_dist = torch.distributions.Categorical(logits=amount_logits)
         amount_log_prob = amount_dist.log_prob(amount_action)

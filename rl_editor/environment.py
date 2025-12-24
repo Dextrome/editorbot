@@ -15,18 +15,18 @@ import os
 import time
 from pathlib import Path
 
-from .config import Config
-from .state import AudioState, StateRepresentation
-from .actions import (
+from rl_editor.config import Config
+from rl_editor.state import AudioState, StateRepresentation
+from rl_editor.actions import (
     ActionType, ActionSize, ActionAmount,
     FactoredAction, FactoredActionSpace, EditHistoryFactored,
     N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,
     apply_factored_action,
     AMOUNT_TO_PITCH_UP, AMOUNT_TO_PITCH_DOWN, AMOUNT_TO_DB,
 )
+from rl_editor.reward import RewardCalculator
 
 logger = logging.getLogger(__name__)
-from .reward import RewardCalculator
 
 
 # Feature indices (based on default FeatureConfig order)
@@ -132,8 +132,8 @@ class AudioEditingEnvFactored(gym.Env):
         options: Optional[Dict[str, Any]] = None
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reset environment for new episode."""
-        if seed is not None:
-            np.random.seed(seed)
+        # Use Gymnasium's proper seeding for isolated random state per environment
+        super().reset(seed=seed)
         
         if options and "audio_state" in options:
             self.audio_state = options["audio_state"]
@@ -322,10 +322,10 @@ class AudioEditingEnvFactored(gym.Env):
         )
         
         # Create EditHistory-compatible object from factored history
-        from .state import EditHistory
+        from rl_editor.state import EditHistory
         edit_hist = EditHistory()
-        edit_hist.kept_beats = list(self.edit_history.kept_beats)
-        edit_hist.cut_beats = list(self.edit_history.cut_beats)
+        edit_hist.kept_beats = set(self.edit_history.kept_beats)
+        edit_hist.cut_beats = set(self.edit_history.cut_beats)
         # Map looped_sections to looped_beats dict (beat_idx: times)
         edit_hist.looped_beats = {}
         for start_beat, n_beats, times in self.edit_history.looped_sections:
@@ -642,8 +642,8 @@ class AudioEditingEnvFactored(gym.Env):
         elif keep_ratio < 0.30:
             keep_ratio_reward = -30 * (0.30 - keep_ratio)
         else:
-            # Bonus for hitting target range
-            keep_ratio_reward = 10 * (1 - abs(keep_ratio - target_keep) / 0.2)
+            # Bonus for hitting target range (clamped to [0, 10])
+            keep_ratio_reward = 10 * max(0.0, 1.0 - abs(keep_ratio - target_keep) / 0.2)
         reward += keep_ratio_reward
         self.episode_reward_breakdown['duration'] = keep_ratio_reward        
         self.episode_reward_breakdown['n_keep_ratio'] = keep_ratio
@@ -798,8 +798,6 @@ class AudioEditingEnvFactored(gym.Env):
         # Ensure the reconstruction key is always present so logs show 0 when unavailable.
         self.episode_reward_breakdown.setdefault('reconstruction', 0.0)
         try:
-            from .reward import RewardCalculator
-
             recon_reward = 0.0
             pred_mel_list = []
             mel_source = getattr(self.audio_state, 'mel_spectrogram', None)
@@ -807,7 +805,6 @@ class AudioEditingEnvFactored(gym.Env):
             # Use persistent reward calculator (created in __init__) to leverage cache
             rc_helper = getattr(self, '_reward_calculator', None)
             if rc_helper is None:
-                from .reward import RewardCalculator
                 rc_helper = RewardCalculator(self.config)
                 self._reward_calculator = rc_helper
             orig_per_beat = rc_helper.get_target_per_beat(self.audio_state)

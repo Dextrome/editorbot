@@ -110,3 +110,5 @@ Thumbs.db
 # Logs
 *.log
 logs/
+.claude/settings.local.json
+nul

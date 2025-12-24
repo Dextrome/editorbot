@@ -14,7 +14,13 @@ Features:
 
 import time
 import sys
+import os
 import multiprocessing as mp
+
+# Support running as script or module
+if __name__ == "__main__" and __package__ is None:
+    # Running as script - add parent dir to path
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rl_editor.features import BeatFeatureExtractor
 if sys.platform == 'win32':
@@ -25,13 +31,11 @@ if sys.platform == 'win32':
 
 import logging
 import math
-import os
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-import time
 
 import numpy as np
 import torch
@@ -40,21 +44,21 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.cuda.amp import autocast
 
-from .config import Config, get_default_config
-from .data import PairedAudioDataset, AudioDataset
-from .environment import AudioEditingEnvFactored
-from .actions import (
+from rl_editor.config import Config, get_default_config
+from rl_editor.data import PairedAudioDataset, AudioDataset
+from rl_editor.environment import AudioEditingEnvFactored
+from rl_editor.actions import (
     ActionType, ActionSize, ActionAmount,
     FactoredAction, FactoredActionSpace,
     N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,
 )
-from .agent import Agent
-from .state import AudioState, EditHistory
-from .reward import compute_trajectory_return
-from .logging_utils import TrainingLogger, create_logger
-from .learned_reward_integration import LearnedRewardIntegration
-from .auxiliary_tasks import AuxiliaryConfig, AuxiliaryTargetComputer, compute_auxiliary_targets
-from .infer import load_and_process_audio, run_inference, create_edited_audio
+from rl_editor.agent import Agent
+from rl_editor.state import AudioState, EditHistory
+from rl_editor.reward import compute_trajectory_return
+from rl_editor.logging_utils import TrainingLogger, create_logger
+from rl_editor.learned_reward_integration import LearnedRewardIntegration
+from rl_editor.auxiliary_tasks import AuxiliaryConfig, AuxiliaryTargetComputer, compute_auxiliary_targets
+from rl_editor.infer import load_and_process_audio, run_inference, create_edited_audio
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +284,16 @@ class VectorizedEnvWrapper:
             return self.envs[i].reset()
         return None, {}
 
+    def close(self):
+        """Shut down the thread pool executor."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+
+    def __del__(self):
+        """Ensure executor is cleaned up on garbage collection."""
+        self.close()
+
 
 class PPOTrainer:
     """PPO trainer for factored action space."""
@@ -306,7 +320,7 @@ class PPOTrainer:
         
         # Vectorized environments
         if use_subprocess:
-            from .subprocess_vec_env import make_subprocess_vec_env
+            from rl_editor.subprocess_vec_env import make_subprocess_vec_env
             self.vec_env = make_subprocess_vec_env(config, n_envs, learned_reward_model=learned_reward_model)
             logger.info(f"Using subprocess-based parallel environments ({n_envs} processes)")
         else:
@@ -818,10 +832,16 @@ class PPOTrainer:
                 batch_returns = batch_returns.float()
                 batch_old_log_probs = batch_old_log_probs.float()
                 
-                # Handle NaN outputs
-                if torch.isnan(new_log_probs).any() or torch.isinf(new_log_probs).any():
+                # Handle NaN outputs (log frequency to help diagnose issues)
+                nan_count_log_probs = torch.isnan(new_log_probs).sum().item()
+                inf_count_log_probs = torch.isinf(new_log_probs).sum().item()
+                if nan_count_log_probs > 0 or inf_count_log_probs > 0:
+                    logger.warning(f"NaN/Inf in log_probs: {nan_count_log_probs} NaN, {inf_count_log_probs} Inf (batch {batch_idx})")
                     new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0, posinf=-1.0, neginf=-10.0)
-                if torch.isnan(entropy).any() or torch.isinf(entropy).any():
+                nan_count_entropy = torch.isnan(entropy).sum().item()
+                inf_count_entropy = torch.isinf(entropy).sum().item()
+                if nan_count_entropy > 0 or inf_count_entropy > 0:
+                    logger.warning(f"NaN/Inf in entropy: {nan_count_entropy} NaN, {inf_count_entropy} Inf (batch {batch_idx})")
                     entropy = torch.nan_to_num(entropy, nan=0.5, posinf=3.0, neginf=0.0)
                 
                 # Ratio
@@ -868,7 +888,9 @@ class PPOTrainer:
                             # v is a tensor on device; ensure first dimension equals n_samples
                             if getattr(v, 'shape', None) and v.shape[0] == n_samples:
                                 # batch_indices is numpy array of indices into the rollout (0..n_samples-1)
-                                idx_tensor = torch.from_numpy(batch_indices).long().to(self.device)
+                                # Use v.device to ensure tensor is on same device as target
+                                target_device = v.device if hasattr(v, 'device') else self.device
+                                idx_tensor = torch.from_numpy(batch_indices).long().to(target_device)
                                 batch_aux_targets[k] = v[idx_tensor]
                         except Exception:
                             # If indexing fails, skip this auxiliary target
@@ -1232,25 +1254,60 @@ class PPOTrainer:
             param_group['lr'] = self.config.ppo.learning_rate
 
     def load_bc_dataset(self, npz_path: str, weight: float = 0.0, batch_size: int = 64):
-        """Load BC NPZ (states + type/size/amount labels) into trainer memory."""
+        """Load BC NPZ (states + type/size/amount labels) into trainer memory.
+
+        Performs atomic loading - either all required fields are loaded or none are.
+        """
+        required_keys = ['states', 'type_labels', 'size_labels', 'amount_labels']
         try:
             import numpy as _np
             data = _np.load(npz_path, allow_pickle=True)
-            self.bc_states = data['states']
-            self.bc_type_labels = data['type_labels']
-            self.bc_size_labels = data['size_labels']
-            self.bc_amount_labels = data['amount_labels']
-            # optional binary good/bad labels (per-beat)
+
+            # Validate all required keys exist before loading
+            missing_keys = [k for k in required_keys if k not in data]
+            if missing_keys:
+                raise KeyError(f"Missing required keys in BC dataset: {missing_keys}")
+
+            # Load into temporary variables first (atomic loading)
+            states = data['states']
+            type_labels = data['type_labels']
+            size_labels = data['size_labels']
+            amount_labels = data['amount_labels']
+
+            # Validate shapes match
+            n_samples = states.shape[0]
+            if type_labels.shape[0] != n_samples:
+                raise ValueError(f"type_labels has {type_labels.shape[0]} samples, expected {n_samples}")
+            if size_labels.shape[0] != n_samples:
+                raise ValueError(f"size_labels has {size_labels.shape[0]} samples, expected {n_samples}")
+            if amount_labels.shape[0] != n_samples:
+                raise ValueError(f"amount_labels has {amount_labels.shape[0]} samples, expected {n_samples}")
+
+            # All validation passed - now assign to instance
+            self.bc_states = states
+            self.bc_type_labels = type_labels
+            self.bc_size_labels = size_labels
+            self.bc_amount_labels = amount_labels
+
+            # Optional binary good/bad labels (per-beat)
             if 'good_bad' in data:
-                try:
-                    self.bc_good_bad_labels = data['good_bad']
-                    logger.info(f"Loaded BC good_bad labels (n={self.bc_good_bad_labels.shape[0]})")
-                except Exception:
-                    self.bc_good_bad_labels = None
+                good_bad = data['good_bad']
+                if good_bad.shape[0] == n_samples:
+                    self.bc_good_bad_labels = good_bad
+                    logger.info(f"Loaded BC good_bad labels (n={good_bad.shape[0]})")
+                else:
+                    logger.warning(f"good_bad labels shape mismatch ({good_bad.shape[0]} vs {n_samples}), skipping")
+
             self.bc_loss_weight = float(weight)
             self.bc_batch_size = int(batch_size)
-            logger.info(f"Loaded BC dataset: {npz_path} (n={self.bc_states.shape[0]})")
+            logger.info(f"Loaded BC dataset: {npz_path} (n={n_samples})")
         except Exception:
+            # Reset all BC fields to ensure consistent state
+            self.bc_states = None
+            self.bc_type_labels = None
+            self.bc_size_labels = None
+            self.bc_amount_labels = None
+            self.bc_good_bad_labels = None
             logger.exception(f"Failed to load BC dataset: {npz_path}")
 
     def bc_pretrain(self, epochs: int = 3, lr: float = 1e-4):

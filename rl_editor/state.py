@@ -33,75 +33,70 @@ class AudioState:
 
 @dataclass
 class EditHistory:
-    """Edit history tracking."""
+    """Edit history tracking.
 
-    kept_beats: list = None  # Indices of kept beats
-    cut_beats: list = None  # Indices of cut beats
+    Uses sets for O(1) membership checks on kept_beats and cut_beats.
+    """
+
+    kept_beats: set = None  # Indices of kept beats
+    cut_beats: set = None  # Indices of cut beats
     looped_beats: dict = None  # {beat_index: loop_times} for looped beats
-    crossfaded_pairs: list = None  # Pairs of crossfaded beats
-    reordered_pairs: list = None  # Pairs of reordered sections
+    crossfaded_pairs: set = None  # Pairs of crossfaded beats
+    reordered_pairs: set = None  # Pairs of reordered sections
     total_duration_edited: float = 0.0  # Total duration of edits applied
 
     def __post_init__(self):
-        """Initialize list fields."""
+        """Initialize set/dict fields."""
         if self.kept_beats is None:
-            self.kept_beats = []
+            self.kept_beats = set()
         if self.cut_beats is None:
-            self.cut_beats = []
+            self.cut_beats = set()
         if self.looped_beats is None:
             self.looped_beats = {}
         if self.crossfaded_pairs is None:
-            self.crossfaded_pairs = []
+            self.crossfaded_pairs = set()
         if self.reordered_pairs is None:
-            self.reordered_pairs = []
+            self.reordered_pairs = set()
 
     def get_edited_beats(self) -> list:
         """Get all edited beat indices."""
-        return sorted(
-            list(
-                set(
-                    self.kept_beats
-                    + self.cut_beats
-                    + list(self.looped_beats.keys())
-                    + [b for pair in self.crossfaded_pairs for b in pair]
-                    + [b for pair in self.reordered_pairs for b in pair]
-                )
-            )
+        all_beats = (
+            self.kept_beats
+            | self.cut_beats
+            | set(self.looped_beats.keys())
+            | {b for pair in self.crossfaded_pairs for b in pair}
+            | {b for pair in self.reordered_pairs for b in pair}
         )
+        return sorted(list(all_beats))
 
     def add_keep(self, beat_index: int) -> None:
         """Add kept beat."""
-        if beat_index not in self.kept_beats:
-            self.kept_beats.append(beat_index)
+        self.kept_beats.add(beat_index)
 
     def add_cut(self, beat_index: int) -> None:
         """Add cut beat."""
-        if beat_index not in self.cut_beats:
-            self.cut_beats.append(beat_index)
+        self.cut_beats.add(beat_index)
 
     def add_loop(self, beat_index: int, loop_times: int = 2) -> None:
         """Add looped beat with loop count.
-        
+
         Args:
             beat_index: Beat to loop
             loop_times: Number of times to play beat (2 = 2x, 3 = 3x, etc.)
         """
         self.looped_beats[beat_index] = loop_times
         # Also add to kept_beats since looped beats are kept
-        if beat_index not in self.kept_beats:
-            self.kept_beats.append(beat_index)
+        self.kept_beats.add(beat_index)
 
     def add_crossfade(self, beat_i: int, beat_j: int) -> None:
         """Add crossfaded pair."""
         pair = tuple(sorted([beat_i, beat_j]))
-        if pair not in self.crossfaded_pairs:
-            self.crossfaded_pairs.append(pair)
+        self.crossfaded_pairs.add(pair)
 
     def add_reorder(self, section_a: int, section_b: int) -> None:
         """Add reordered pair."""
         pair = tuple(sorted([section_a, section_b]))
-        if pair not in self.reordered_pairs:
-            self.reordered_pairs.append(pair)
+        self.reordered_pairs.add(pair)
 
 
 class StateRepresentation:
@@ -220,15 +215,42 @@ class StateRepresentation:
             if frame < len(centroid):
                 descriptors[i, 1] = centroid[min(frame, len(centroid) - 1)]
 
-        # Zero-crossing rate
-        zcr = np.mean(np.abs(np.diff(np.sign(y))))
-        descriptors[:, 2] = zcr
-
-        # RMS energy
+        # Zero-crossing rate (per-frame)
         frame_length = 2048
         hop_length = 512
-        rms = np.sqrt(np.mean(y**2))
-        descriptors[:, 3] = rms
+        n_frames = 1 + (len(y) - frame_length) // hop_length
+        if n_frames > 0:
+            zcr_frames = np.zeros(n_frames)
+            for f in range(n_frames):
+                start = f * hop_length
+                end = start + frame_length
+                frame_data = y[start:end]
+                zcr_frames[f] = np.mean(np.abs(np.diff(np.sign(frame_data))))
+
+            for i, frame in enumerate(beat_frames):
+                frame_idx = min(frame // hop_length, n_frames - 1)
+                descriptors[i, 2] = zcr_frames[max(0, frame_idx)]
+        else:
+            # Fallback for very short audio
+            zcr = np.mean(np.abs(np.diff(np.sign(y)))) if len(y) > 1 else 0.0
+            descriptors[:, 2] = zcr
+
+        # RMS energy (per-frame)
+        if n_frames > 0:
+            rms_frames = np.zeros(n_frames)
+            for f in range(n_frames):
+                start = f * hop_length
+                end = start + frame_length
+                frame_data = y[start:end]
+                rms_frames[f] = np.sqrt(np.mean(frame_data**2))
+
+            for i, frame in enumerate(beat_frames):
+                frame_idx = min(frame // hop_length, n_frames - 1)
+                descriptors[i, 3] = rms_frames[max(0, frame_idx)]
+        else:
+            # Fallback for very short audio
+            rms = np.sqrt(np.mean(y**2)) if len(y) > 0 else 0.0
+            descriptors[:, 3] = rms
 
         return descriptors
 

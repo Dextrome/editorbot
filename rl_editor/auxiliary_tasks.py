@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
+from collections import OrderedDict
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 import logging
@@ -136,15 +137,18 @@ class TempoPredictor(nn.Module):
         n_beats = len(beat_times)
         targets = np.zeros(n_beats, dtype=np.int64)
         
+        # Minimum time delta to avoid extreme tempo values (0.1s = 600 BPM max)
+        min_dt = 0.1
+
         for i in range(n_beats):
             # Compute local tempo from surrounding beats
             if i > 0 and i < n_beats - 1:
                 # Use 3-beat window for local tempo
                 dt = beat_times[min(i+1, n_beats-1)] - beat_times[max(i-1, 0)]
-                local_tempo = 120.0 / (dt / 2.0) if dt > 0 else 120.0
+                local_tempo = 120.0 / (dt / 2.0) if dt > min_dt else 120.0
             elif i == 0 and n_beats > 1:
                 dt = beat_times[1] - beat_times[0]
-                local_tempo = 60.0 / dt if dt > 0 else 120.0
+                local_tempo = 60.0 / dt if dt > min_dt else 120.0
             else:
                 local_tempo = 120.0
             
@@ -808,10 +812,19 @@ class AuxiliaryTaskModule(nn.Module):
 
 class AuxiliaryTargetComputer:
     """Caches and computes auxiliary targets efficiently during training."""
-    
+
     def __init__(self, config: Optional[AuxiliaryConfig] = None):
         self.config = config or AuxiliaryConfig()
-        self._cache: Dict[str, Dict[str, np.ndarray]] = {}
+        self._cache: OrderedDict[str, Dict[str, np.ndarray]] = OrderedDict()
+        self._cache_max_size = 200  # Limit cache to prevent OOM
+
+    def _cache_put(self, key: str, value: Dict[str, np.ndarray]):
+        """Add item to cache with LRU eviction."""
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        # Evict oldest entries if over limit
+        while len(self._cache) > self._cache_max_size:
+            self._cache.popitem(last=False)
     
     def get_targets(
         self,
@@ -834,7 +847,10 @@ class AuxiliaryTargetComputer:
         """
         # Check if we have cached full-track targets
         if audio_id not in self._cache:
-            self._cache[audio_id] = self._compute_full_targets(beat_times, beat_features)
+            self._cache_put(audio_id, self._compute_full_targets(beat_times, beat_features))
+        else:
+            # Move to end for LRU
+            self._cache.move_to_end(audio_id)
         
         # Index into cached targets
         cached = self._cache[audio_id]
@@ -875,7 +891,8 @@ class AuxiliaryTargetComputer:
                         if os.path.exists(chroma_path):
                             try:
                                 chroma_per_beat = np.load(chroma_path).astype(np.float32)
-                                self._cache.setdefault(audio_id, {})["chroma_reconstruction_full"] = chroma_per_beat
+                                if audio_id in self._cache:
+                                    self._cache[audio_id]["chroma_reconstruction_full"] = chroma_per_beat
                             except Exception:
                                 pass
                         edited_mel = per_beat
@@ -916,7 +933,8 @@ class AuxiliaryTargetComputer:
                                     mel_reshaped = mel.reshape(n_mels, n_beats, frames_per_beat)
                                     per_beat = mel_reshaped.mean(axis=2).T.astype(np.float32)
                                     try:
-                                        self._cache.setdefault(audio_id, {})["mel_reconstruction_full"] = per_beat
+                                        if audio_id in self._cache:
+                                            self._cache[audio_id]["mel_reconstruction_full"] = per_beat
                                     except Exception:
                                         pass
                                 else:
@@ -945,7 +963,8 @@ class AuxiliaryTargetComputer:
 
                                     chroma_per_beat = np.dot(per_beat, M).astype(np.float32)
                                     try:
-                                        self._cache.setdefault(audio_id, {})["chroma_reconstruction_full"] = chroma_per_beat
+                                        if audio_id in self._cache:
+                                            self._cache[audio_id]["chroma_reconstruction_full"] = chroma_per_beat
                                     except Exception:
                                         pass
                 except Exception:
