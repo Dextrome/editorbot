@@ -408,6 +408,7 @@ class PPOTrainer:
             list(self.agent.policy_net.parameters()) + 
             list(self.agent.value_net.parameters()),
             lr=lr,
+            weight_decay=self.config.ppo.weight_decay,
         )
         
         # Auxiliary task optimizer (separate to allow different learning rates)
@@ -663,6 +664,8 @@ class PPOTrainer:
             self.buffer.rewards,
             gamma=self.config.ppo.gamma,
             normalize=False,
+            clip_min=getattr(self.config.ppo, 'return_clip_min', None),
+            clip_max=getattr(self.config.ppo, 'return_clip_max', None),
         )
         
         # Convert to arrays

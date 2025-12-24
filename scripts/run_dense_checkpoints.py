@@ -76,17 +76,24 @@ def main():
 
     rows = []
     py = sys.executable
+    import random
     for epoch, ck in selected:
         print(f'Evaluating epoch {epoch} ({ck})')
         rewards = []
         for r_i in range(args.repeats):
+            # Use a different random seed per repeat to get variability
+            seed = random.randint(0, 2**31 - 1)
             out_name = out_dir / f'epoch_{epoch}_run{r_i}.wav'
-            rc, out = run_infer(py, args.input, ck, out_name, crossfade_ms=args.crossfade_ms)
+            cmd = [py, '-m', 'rl_editor.infer', args.input, '--checkpoint', str(ck), '--n-samples', '1', '--crossfade-ms', str(args.crossfade_ms), '--output', str(out_name), '--seed', str(seed)]
+            # Prefer stochastic sampling for variance; do not pass --deterministic here
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            rc = proc.returncode
+            out = proc.stdout
             if rc != 0:
                 print(f'  run {r_i}: infer failed (rc={rc})')
                 continue
             reward = parse_reward_from_stdout(out)
-            print(f'  run {r_i}: reward={reward}')
+            print(f'  run {r_i}: reward={reward}  (seed={seed})')
             if reward is not None:
                 rewards.append(reward)
 

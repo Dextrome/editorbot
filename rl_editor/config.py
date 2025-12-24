@@ -73,8 +73,8 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 2e-5  # Lower LR for stability with high entropy
-    lr_decay: bool = False  # Enable learning rate decay
+    learning_rate: float = 1e-5  # Halved LR for stability
+    lr_decay: bool = True  # Enable learning rate decay by default
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
     lr_min_ratio: float = 0.5  # Decay from 2e-5 to 1e-5
     lr_warmup_epochs: int = 10  # Warmup epochs before decay starts
@@ -83,16 +83,23 @@ class PPOConfig:
     lr_step_interval: int = 100  # Epochs between step decays
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_ratio: float = 0.2  # PPO clipping ratio - tighter for stability
+    clip_ratio: float = 0.1  # PPO clipping ratio - tighter for stability
     target_kl: float = 0.02  # Tighter KL target to prevent collapse
     # Tuned defaults for stable fine-tuning
-    entropy_coeff: float = 0.2  # Reduce entropy to encourage exploitation
+    # More conservative entropy scheduling for resumed training
+    entropy_coeff: float = 0.25  # Lower starting entropy to stabilise updates
     entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.01  # Lower floor for final convergence
-    value_loss_coeff: float = 0.5  # Stronger value loss to stabilize value updates
+    entropy_coeff_min: float = 0.05  # Lower floor for later exploitation
+    value_loss_coeff: float = 0.08  # Value loss weight (tunable)
+    # Clip returns (helps prevent FP16 overflow and huge losses)
+    # Widen return clipping to effectively disable aggressive clipping during recovery
+    return_clip_min: float = -1e6
+    return_clip_max: float = 1e6
+    # L2 weight decay for optimizer - disable for now to avoid training drift
+    weight_decay: float = 0.0
     max_grad_norm: float = 1.0  # Tighter gradient clipping to avoid large updates
     n_epochs: int = 6  # PPO epochs per update
-    batch_size: int = 512  # Balanced batch size for GPU utilization and stability
+    batch_size: int = 512  # Reduce batch size to speed iterations during recovery
     use_gradient_accumulation: bool = True
     gradient_accumulation_steps: int = 2
     use_mixed_precision: bool = False  # Disable FP16 to avoid overflow on large value losses

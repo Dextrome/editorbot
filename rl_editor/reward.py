@@ -504,7 +504,11 @@ class RewardCalculator:
 
 
 def compute_trajectory_return(
-    rewards: list, gamma: float = 0.99, normalize: bool = True
+    rewards: list,
+    gamma: float = 0.99,
+    normalize: bool = True,
+    clip_min: float = None,
+    clip_max: float = None,
 ) -> Tuple[list, float]:
     """Compute discounted cumulative returns from reward trajectory.
 
@@ -524,6 +528,15 @@ def compute_trajectory_return(
         returns.insert(0, cumulative_return)
 
     returns = np.array(returns, dtype=np.float32)
+
+    # Clip returns to a reasonable range to avoid extreme value targets
+    try:
+        # Use provided clip values if given, otherwise fall back to large bounds
+        low = -1000.0 if clip_min is None else float(clip_min)
+        high = 1000.0 if clip_max is None else float(clip_max)
+        returns = np.clip(returns, low, high)
+    except Exception:
+        returns = returns
 
     if normalize and len(returns) > 1:
         mean_return = np.mean(returns)
