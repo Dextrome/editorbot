@@ -344,22 +344,28 @@ def apply_crossfade(seg1: np.ndarray, seg2: np.ndarray, crossfade_samples: int) 
     if actual_fade < 10:  # Too short for meaningful crossfade
         return np.concatenate([seg1, seg2])
     
-    # Create fade curves
-    fade_out = np.linspace(1.0, 0.0, actual_fade)
-    fade_in = np.linspace(0.0, 1.0, actual_fade)
+    # Create smooth cosine (Hann-like) fade curves for fewer clicks
+    t = np.linspace(0.0, 1.0, actual_fade)
+    # fade_out goes from 1 -> 0, fade_in from 0 -> 1 using raised-cosine
+    fade_in = 0.5 * (1 - np.cos(np.pi * t))
+    fade_out = 0.5 * (1 + np.cos(np.pi * t))
     
     # Copy segments to avoid modifying originals
-    result = np.zeros(len(seg1) + len(seg2) - actual_fade)
-    result[:len(seg1) - actual_fade] = seg1[:-actual_fade]
-    
+    # Pre-allocate and copy non-overlap parts
+    result = np.zeros(len(seg1) + len(seg2) - actual_fade, dtype=seg1.dtype)
+    pre_len = len(seg1) - actual_fade
+    if pre_len > 0:
+        result[:pre_len] = seg1[:pre_len]
+
     # Apply crossfade in overlap region
-    overlap_start = len(seg1) - actual_fade
+    overlap_start = pre_len
     result[overlap_start:overlap_start + actual_fade] = (
         seg1[-actual_fade:] * fade_out + seg2[:actual_fade] * fade_in
     )
-    
-    # Add rest of second segment
-    result[overlap_start + actual_fade:] = seg2[actual_fade:]
+
+    # Append remainder of second segment
+    if len(seg2) > actual_fade:
+        result[overlap_start + actual_fade:] = seg2[actual_fade:]
     
     return result
 
@@ -646,15 +652,19 @@ def create_edited_audio(
         for seg in segments[1:]:
             current_beat = seg["beat"]
             segment_audio = seg["audio"]
-            
-            # Apply crossfade at non-consecutive beats
-            is_edit_boundary = (current_beat != prev_beat + 1) or seg.get("reorder", False)
-            
-            if is_edit_boundary and crossfade_samples > 0 and len(edited) > crossfade_samples and len(segment_audio) > crossfade_samples:
+
+            # Prefer applying a short crossfade at every boundary when possible
+            use_crossfade = (
+                crossfade_samples > 0
+                and len(edited) > crossfade_samples
+                and len(segment_audio) > crossfade_samples
+            )
+
+            if use_crossfade:
                 edited = apply_crossfade(edited, segment_audio, crossfade_samples)
             else:
                 edited = np.concatenate([edited, segment_audio])
-            
+
             prev_beat = current_beat
     
     # Log statistics

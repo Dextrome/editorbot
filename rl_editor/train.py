@@ -1385,6 +1385,7 @@ def train(
     learned_reward_model: Optional[Any] = None,
     max_beats: Optional[int] = None,
     val_audio: Optional[str] = None,
+    include_reference: Optional[bool] = None,
 ):
     """Main training function.
     
@@ -1418,11 +1419,17 @@ def train(
     
     # Load dataset with caching (use PairedAudioDataset for fast loading)
     cache_dir = getattr(config.data, 'cache_dir', None) or str(Path(data_dir) / "feature_cache")
+    # Determine whether to include reference tracks: CLI arg takes precedence,
+    # otherwise use the value from config.data.include_reference.
+    effective_include_reference = (
+        include_reference if include_reference is not None else getattr(config.data, 'include_reference', True)
+    )
+
     dataset = PairedAudioDataset(
-        data_dir, 
-        config, 
+        data_dir,
+        config,
         cache_dir=cache_dir,
-        include_reference=True,
+        include_reference=effective_include_reference,
         use_augmentation=True,
     )
     if len(dataset) == 0:
@@ -1490,10 +1497,10 @@ def train(
         # === Curriculum parameters ===
         # Start with short segments, gradually increase
         initial_short_beats = 500
-        final_short_beats = 2000
+        final_short_beats = 5000
         initial_short_prob = 1.0  # 100% short at start
-        final_short_prob = 0.2   # 20% short at end
-        curriculum_steps = 20000  # Number of epochs to anneal over
+        final_short_prob = 0.25   # 25% short at end
+        curriculum_steps = 5000  # Number of epochs to anneal over
         
         progress = min(epoch / curriculum_steps, 1.0)
         short_prob = initial_short_prob * (1 - progress) + final_short_prob * progress
@@ -1705,6 +1712,9 @@ def main():
     parser.add_argument("--bc_mixed_npz", type=str, default=None, help="NPZ file for mixed BC supervised loss during PPO")
     parser.add_argument("--bc_mixed_weight", type=float, default=0.0, help="Weight for mixed BC loss added to PPO updates")
     parser.add_argument("--bc_mixed_batch", type=int, default=64, help="Batch size for mixed BC sampling during PPO updates")
+    # `include_reference` default is read from config; CLI flags override when provided.
+    parser.add_argument('--include_reference', dest='include_reference', action='store_true', help='Include reference tracks when loading paired dataset', default=None)
+    parser.add_argument('--no_include_reference', dest='include_reference', action='store_false', help='Do not include reference tracks when loading paired dataset', default=None)
     
     args = parser.parse_args()
     
@@ -1737,6 +1747,7 @@ def main():
         bc_mixed_batch=args.bc_mixed_batch,
         use_subprocess=args.subprocess,
         max_beats=args.max_beats,
+        include_reference=args.include_reference,
     )
 
 

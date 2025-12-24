@@ -202,6 +202,8 @@ class DataConfig:
     
     # Train/val split (fraction of paired data to use for validation)
     val_split: float = 0.0  # 0 = use all for training (recommended with small datasets)
+    # Include reference (extra finished tracks) when loading paired dataset
+    include_reference: bool = False
 
 
 @dataclass

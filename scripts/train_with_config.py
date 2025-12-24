@@ -22,7 +22,9 @@ def parse_args():
     p.add_argument("--n_envs", type=int, default=4)
     p.add_argument("--steps", type=int, default=256)
     p.add_argument("--val_audio", type=str, default=None)
+    p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--hparams_json", type=str, default=None, help="Path to JSON file with hyperparameters to apply to config")
     # PPO-configurable params
     p.add_argument("--clip_ratio", type=float, default=None)
     p.add_argument("--entropy_coeff", type=float, default=None)
@@ -59,6 +61,32 @@ def main():
         cfg.ppo.batch_size = args.batch_size
     if args.gradient_accumulation_steps is not None:
         cfg.ppo.gradient_accumulation_steps = args.gradient_accumulation_steps
+    # Apply hyperparameters from JSON if provided. Supports either a flat dict
+    # whose keys map to fields on cfg.ppo, or a nested dict under the 'ppo' key.
+    if args.hparams_json:
+        try:
+            import json as _json
+            hpath = Path(args.hparams_json)
+            if hpath.exists():
+                with open(hpath, 'r', encoding='utf-8') as _f:
+                    hparams = _json.load(_f)
+                # If nested under 'ppo', use that mapping
+                pmap = hparams.get('ppo') if isinstance(hparams, dict) and 'ppo' in hparams else hparams
+                if isinstance(pmap, dict):
+                    for k, v in pmap.items():
+                        if hasattr(cfg.ppo, k):
+                            try:
+                                setattr(cfg.ppo, k, v)
+                            except Exception:
+                                pass
+                # allow top-level 'lr' or 'learning_rate' keys
+                if isinstance(hparams, dict):
+                    if 'lr' in hparams and getattr(cfg.ppo, 'learning_rate', None) is not None:
+                        cfg.ppo.learning_rate = float(hparams['lr'])
+                    if 'learning_rate' in hparams and getattr(cfg.ppo, 'learning_rate', None) is not None:
+                        cfg.ppo.learning_rate = float(hparams['learning_rate'])
+        except Exception:
+            print(f"Failed to load hparams json: {args.hparams_json}")
 
     # Ensure save dir exists
     Path(cfg.training.save_dir).mkdir(parents=True, exist_ok=True)
@@ -71,7 +99,7 @@ def main():
         n_envs=args.n_envs,
         steps_per_epoch=args.steps,
         val_audio=args.val_audio,
-        checkpoint_path=None,
+        checkpoint_path=args.checkpoint,
         bc_mixed_npz=None,
         bc_mixed_weight=args.bc_mixed_weight,
         bc_mixed_batch=64,
