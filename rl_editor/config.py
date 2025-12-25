@@ -84,11 +84,11 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2  # Standard PPO clipping - allows exploration
-    target_kl: float = 0.04  # Looser KL for early training exploration
-    # Exploration-friendly defaults for fresh training
-    entropy_coeff: float = 0.65  # High entropy to encourage action diversity
+    target_kl: float = 0.02  # Tighter KL to prevent too-aggressive updates
+    # Lower entropy to allow peaked distributions (BC provides supervision)
+    entropy_coeff: float = 0.02  # Much lower - BC entropy penalty counteracts this anyway
     entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.15  # Maintain some exploration late
+    entropy_coeff_min: float = 0.005  # Very low final entropy for exploitation
     value_loss_coeff: float = 0.1  # Standard PPO balance
     # Clip returns (helps prevent FP16 overflow and huge losses)
     # Widen return clipping to effectively disable aggressive clipping during recovery
@@ -98,10 +98,10 @@ class PPOConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0  # Tighter gradient clipping to avoid large updates
     n_epochs: int = 6  # PPO epochs per update
-    batch_size: int = 512  # Reduce batch size to speed iterations during recovery
+    batch_size: int = 2048  # Large batch for better GPU utilization
     use_gradient_accumulation: bool = True
-    gradient_accumulation_steps: int = 2
-    use_mixed_precision: bool = False  # Disable FP16 to avoid overflow on large value losses
+    gradient_accumulation_steps: int = 4
+    use_mixed_precision: bool = True  # FP16 for faster training (safe with bug fixes)
 
 
 @dataclass

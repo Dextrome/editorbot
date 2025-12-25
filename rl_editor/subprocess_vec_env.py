@@ -24,17 +24,19 @@ def _worker(
     worker_id: int,
 ):
     """Worker process that runs a single environment.
-    
+
     Each worker maintains its own auxiliary target computer for efficient
     local computation without IPC overhead.
+
+    Uses lightweight CPU-only auxiliary module to reduce memory footprint.
     """
     parent_remote.close()
     env_fn = cloudpickle.loads(env_fn_pickled)
     env = env_fn()
-    
-    # Local auxiliary target computer (avoids IPC for large arrays)
-    from rl_editor.auxiliary_tasks import AuxiliaryTargetComputer, AuxiliaryConfig
-    aux_computer = AuxiliaryTargetComputer(AuxiliaryConfig())
+
+    # Local auxiliary target computer (CPU-only, no torch import)
+    from rl_editor.auxiliary_targets_cpu import AuxiliaryTargetComputerCPU, AuxiliaryConfigCPU
+    aux_computer = AuxiliaryTargetComputerCPU(AuxiliaryConfigCPU())
     current_audio_id = None
     
     try:
@@ -120,13 +122,13 @@ def _worker(
                 # data is (type, size, amount) tuple
                 action_array = np.array(data, dtype=np.int64)
                 obs, reward, terminated, truncated, info = env.step(action_array)
-                
+
                 # Compute auxiliary targets locally (fast, no IPC for big arrays)
                 if env.audio_state is not None and env.audio_state.beat_features is not None:
                     beat_times = env.audio_state.beat_times
                     beat_features = env.audio_state.beat_features
                     beat_idx = env.current_beat
-                    
+
                     # Use cached computation
                     aux_targets = aux_computer.get_targets(
                         audio_id=current_audio_id or f"worker_{worker_id}",
@@ -161,14 +163,18 @@ def _worker(
                             except Exception:
                                 aux_dict[k] = None
                     info["aux_targets"] = aux_dict
-                
-                remote.send((obs, reward, terminated, truncated, info))
+
+                # Return masks with step result to avoid separate IPC call
+                type_mask, size_mask, amount_mask = env.get_action_masks()
+                remote.send((obs, reward, terminated, truncated, info, type_mask, size_mask, amount_mask))
                 
             elif cmd == "reset":
                 obs, info = env.reset()
                 # Clear cache on reset (new track)
                 aux_computer.clear_cache()
-                remote.send((obs, info))
+                # Return masks with reset to avoid separate IPC call
+                type_mask, size_mask, amount_mask = env.get_action_masks()
+                remote.send((obs, info, type_mask, size_mask, amount_mask))
                 
             elif cmd == "get_action_masks":
                 # Return factored masks
@@ -263,38 +269,55 @@ class SubprocessVecEnv:
             remote.send(("step", action))
         self.waiting = True
     
-    def step_wait(self) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
-        """Wait for all environments to complete their steps."""
+    def step_wait(self) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """Wait for all environments to complete their steps.
+
+        Returns:
+            Tuple of (obs_list, rewards, terminateds, truncateds, infos, type_masks, size_masks, amount_masks)
+        """
         results = [remote.recv() for remote in self.remotes]
         self.waiting = False
-        
+
         obs_list = [r[0] for r in results]
         rewards = [r[1] for r in results]
         terminateds = [r[2] for r in results]
         truncateds = [r[3] for r in results]
         infos = [r[4] for r in results]
-        
-        return obs_list, rewards, terminateds, truncateds, infos
+        type_masks = [r[5] for r in results]
+        size_masks = [r[6] for r in results]
+        amount_masks = [r[7] for r in results]
+
+        return obs_list, rewards, terminateds, truncateds, infos, type_masks, size_masks, amount_masks
     
-    def step_all(self, actions: List[Tuple[int, int, int]]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict]]:
+    def step_all(self, actions: List[Tuple[int, int, int]]) -> Tuple[List[np.ndarray], List[float], List[bool], List[bool], List[dict], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """Step all environments synchronously.
-        
+
         Args:
             actions: List of (type, size, amount) tuples
+
+        Returns:
+            Tuple of (obs_list, rewards, terminateds, truncateds, infos, type_masks, size_masks, amount_masks)
         """
         self.step_async(actions)
         return self.step_wait()
     
-    def reset_all(self) -> Tuple[List[np.ndarray], List[dict]]:
-        """Reset all environments."""
+    def reset_all(self) -> Tuple[List[np.ndarray], List[dict], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+        """Reset all environments.
+
+        Returns:
+            Tuple of (obs_list, info_list, type_masks, size_masks, amount_masks)
+        """
         for remote in self.remotes:
             remote.send(("reset", None))
-        
+
         results = [remote.recv() for remote in self.remotes]
         obs_list = [r[0] for r in results]
         info_list = [r[1] for r in results]
-        
-        return obs_list, info_list
+        type_masks = [r[2] for r in results]
+        size_masks = [r[3] for r in results]
+        amount_masks = [r[4] for r in results]
+
+        return obs_list, info_list, type_masks, size_masks, amount_masks
     
     def get_action_masks(self) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """Get factored action masks from all environments.
@@ -312,11 +335,15 @@ class SubprocessVecEnv:
         
         return type_masks, size_masks, amount_masks
     
-    def reset_env(self, i: int) -> Tuple[np.ndarray, dict]:
-        """Reset a single environment."""
+    def reset_env(self, i: int) -> Tuple[np.ndarray, dict, np.ndarray, np.ndarray, np.ndarray]:
+        """Reset a single environment.
+
+        Returns:
+            Tuple of (obs, info, type_mask, size_mask, amount_mask)
+        """
         self.remotes[i].send(("reset", None))
-        obs, info = self.remotes[i].recv()
-        return obs, info
+        result = self.remotes[i].recv()
+        return result[0], result[1], result[2], result[3], result[4]
     
     def set_audio_states(self, audio_states: List[Any]):
         """Set audio states for all environments."""

@@ -237,9 +237,9 @@ class HybridNATTENEncoder(nn.Module):
         Returns:
             Encoded tensor (batch_size, hidden_dim) or (batch_size, seq_len, hidden_dim)
         """
-        with torch.amp.autocast('cuda', enabled=False):
+        # Use autocast for FP16 speedup (guards against NaN below)
+        with torch.amp.autocast('cuda', enabled=True):
             original_dtype = x.dtype
-            x = x.float()
             
             # Handle 2D input (single position, no sequence)
             if x.dim() == 2:
@@ -514,7 +514,9 @@ class PolicyNetwork(nn.Module):
         
         # Combined
         combined_log_prob = type_log_prob + size_log_prob + amount_log_prob
-        combined_entropy = type_entropy + size_entropy + amount_entropy
+        # Normalize entropy by number of heads (3) so it's comparable to single-head policy
+        # Without this, max entropy = ln(20)+ln(5)+ln(5) ≈ 6.2, overwhelming reward signal
+        combined_entropy = (type_entropy + size_entropy + amount_entropy) / 3.0
         
         # Handle NaN
         combined_log_prob = torch.nan_to_num(combined_log_prob, nan=-5.0, posinf=0.0, neginf=-15.0)
@@ -550,6 +552,7 @@ class Agent:
 
         self.policy_net = PolicyNetwork(config, input_dim).to(self.device)
         self.value_net = ValueNetwork(config, input_dim).to(self.device)
+        self._compiled = False
         
         # Auxiliary task module (optional)
         self.auxiliary_module = None
@@ -572,6 +575,28 @@ class Agent:
             f"Initialized Agent with {input_dim} input dims, "
             f"{N_ACTION_TYPES} types, {N_ACTION_SIZES} sizes, {N_ACTION_AMOUNTS} amounts"
         )
+
+    def compile_models(self):
+        """Compile models with torch.compile for faster inference.
+
+        Call this AFTER loading checkpoint weights.
+        Note: Disabled on Windows due to Triton not being available.
+        """
+        if self._compiled:
+            return
+        # torch.compile requires Triton which isn't available on Windows
+        # Skip compilation - eager mode is fine
+        import sys
+        if sys.platform == "win32":
+            logger.info("Skipping torch.compile on Windows (Triton not available)")
+            return
+        try:
+            self.policy_net = torch.compile(self.policy_net, mode="reduce-overhead")
+            self.value_net = torch.compile(self.value_net, mode="reduce-overhead")
+            self._compiled = True
+            logger.info("Models compiled with torch.compile (reduce-overhead mode)")
+        except Exception as e:
+            logger.warning(f"torch.compile failed, using eager mode: {e}")
 
     def select_action(
         self,

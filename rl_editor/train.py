@@ -63,6 +63,48 @@ from rl_editor.infer import load_and_process_audio, run_inference, create_edited
 logger = logging.getLogger(__name__)
 
 
+class RunningMeanStd:
+    """Tracks running mean and std of observations for online normalization.
+
+    Uses Welford's algorithm for numerical stability.
+    """
+
+    def __init__(self, shape: tuple, epsilon: float = 1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon  # Small initial count to prevent div by zero
+        self.epsilon = epsilon
+
+    def update(self, batch: np.ndarray):
+        """Update running statistics with a batch of observations."""
+        batch = batch.astype(np.float64)
+        batch_mean = batch.mean(axis=0)
+        batch_var = batch.var(axis=0)
+        batch_count = batch.shape[0]
+
+        # Welford's algorithm for combining statistics
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        self.mean = self.mean + delta * batch_count / total_count
+
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        self.var = M2 / total_count
+
+        self.count = total_count
+
+    def normalize(self, x: np.ndarray, clip: float = 5.0) -> np.ndarray:
+        """Normalize observations using running statistics."""
+        normalized = (x - self.mean.astype(np.float32)) / (np.sqrt(self.var).astype(np.float32) + self.epsilon)
+        return np.clip(normalized, -clip, clip).astype(np.float32)
+
+    def get_stats(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return current mean and std."""
+        return self.mean.astype(np.float32), np.sqrt(self.var).astype(np.float32)
+
+
 def get_lr_scheduler(optimizer: optim.Optimizer, config: Config, total_epochs: int) -> Optional[LambdaLR]:
     """Create learning rate scheduler based on config."""
     ppo_config = config.ppo
@@ -369,7 +411,12 @@ class PPOTrainer:
         self.bc_good_bad_labels = None
         self.bc_loss_weight = 0.0
         self.bc_batch_size = 64
-        
+        # BC normalization stats (applied to both BC and rollout states)
+        self.bc_state_mean = None
+        self.bc_state_std = None
+        # Running normalizer for observation normalization (adapts to both BC and rollout)
+        self.obs_normalizer: Optional[RunningMeanStd] = None
+
         # Auxiliary tasks
         self.aux_config = AuxiliaryConfig()
         self.aux_target_computer = AuxiliaryTargetComputer(self.aux_config)
@@ -446,6 +493,9 @@ class PPOTrainer:
             self._load_checkpoint_weights(self._pending_checkpoint)
             self._pending_checkpoint = None
             logger.info("✓ Checkpoint loaded")
+
+        # Compile models for faster inference (must be after checkpoint load)
+        self.agent.compile_models()
     
     def get_current_entropy_coeff(self) -> float:
         if not self.entropy_coeff_decay:
@@ -486,56 +536,113 @@ class PPOTrainer:
         
         # Setup environments
         self.vec_env.set_audio_states(audio_states)
-        obs_list, _ = self.vec_env.reset_all()
-                                       
+
+        # Reset all environments - subprocess mode returns masks with reset
+        if self.use_subprocess:
+            obs_list, _, type_masks, size_masks, amount_masks = self.vec_env.reset_all()
+        else:
+            obs_list, _ = self.vec_env.reset_all()
+            type_masks, size_masks, amount_masks = self.vec_env.get_action_masks()
+
         # Initialize agent if needed
         if self.agent is None:
             input_dim = obs_list[0].shape[0]
             self._init_agent(input_dim)
-        
+
         self.buffer.clear()
         self._episode_reward_breakdowns = []
         episode_rewards = [0.0] * len(obs_list)
         episode_lengths = [0] * len(obs_list)
         section_decisions = [0] * len(obs_list)
         temporal_penalty_values: List[float] = []
-        
+
         # Exploration rate
         exploration_rate = max(0.15, 0.5 - self.global_step / 2000000)
-        
+
+        # Profiling accumulators
+        _prof_inference = 0.0
+        _prof_step_ipc = 0.0
+        _prof_buffer = 0.0
+        import time as _time
+
         for step in range(n_steps):
+            _t0 = _time.perf_counter()
+
             # Batch observations
             obs_batch = np.stack(obs_list)
-            
-            # Get factored masks
-            type_masks, size_masks, amount_masks = self.vec_env.get_action_masks()
+
+            # Debug: log observation stats on first step of first few epochs
+            if step == 0 and self.current_epoch % 20 == 1:
+                logger.info(f"[DIAG] Raw rollout obs: shape={obs_batch.shape}, overall_mean={obs_batch.mean():.2f}, overall_std={obs_batch.std():.2f}")
+                # Per-feature comparison
+                rollout_feat_mean = obs_batch.mean(axis=0)
+                rollout_feat_std = obs_batch.std(axis=0)
+                logger.info(f"[DIAG] Raw rollout per-feature mean (first 10): {rollout_feat_mean[:10]}")
+                logger.info(f"[DIAG] Raw rollout per-feature std (first 10): {rollout_feat_std[:10]}")
+                if self.bc_state_mean is not None:
+                    # Compare to BC stats
+                    mean_diff = rollout_feat_mean - self.bc_state_mean[0]
+                    logger.info(f"[DIAG] Rollout-BC mean diff (first 10): {mean_diff[:10]}")
+
+            # Normalize observations using running normalizer (adapts to both BC and rollout)
+            if self.obs_normalizer is not None:
+                # Update running stats with raw rollout observations
+                self.obs_normalizer.update(obs_batch)
+                # Normalize using the updated running stats
+                obs_batch = self.obs_normalizer.normalize(obs_batch, clip=5.0)
+                if step == 0 and self.current_epoch % 20 == 1:
+                    run_mean, run_std = self.obs_normalizer.get_stats()
+                    logger.info(f"[DIAG] Running norm: count={self.obs_normalizer.count:.0f}, mean[:5]={run_mean[:5]}, std[:5]={run_std[:5]}")
+                    logger.info(f"[DIAG] Normalized rollout obs: mean={obs_batch.mean():.4f}, std={obs_batch.std():.4f}, range=[{obs_batch.min():.2f}, {obs_batch.max():.2f}]")
+            elif self.bc_state_mean is not None and self.bc_state_std is not None:
+                # Fallback to BC stats if no running normalizer
+                obs_batch = (obs_batch - self.bc_state_mean) / self.bc_state_std
+                obs_batch = np.clip(obs_batch, -5, 5)
+
+            # Masks are already available (from reset or previous step)
             type_mask_batch = np.stack(type_masks)
             size_mask_batch = np.stack(size_masks)
             amount_mask_batch = np.stack(amount_masks)
-            
+
             # To GPU
-            obs_tensor = torch.from_numpy(obs_batch).float().to(self.device, non_blocking=True)
+            obs_tensor = torch.from_numpy(obs_batch.astype(np.float32)).to(self.device, non_blocking=True)
             type_mask_tensor = torch.from_numpy(type_mask_batch).bool().to(self.device, non_blocking=True)
             size_mask_tensor = torch.from_numpy(size_mask_batch).bool().to(self.device, non_blocking=True)
             amount_mask_tensor = torch.from_numpy(amount_mask_batch).bool().to(self.device, non_blocking=True)
             
             # Batch inference - returns (types, sizes, amounts, log_probs)
-            with torch.no_grad():
+            # Use autocast for FP16 speedup during inference
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.config.ppo.use_mixed_precision):
+                torch.cuda.synchronize()  # Ensure GPU is ready
+                _t_policy_start = _time.perf_counter()
+
                 types, sizes, amounts, log_probs = self.agent.select_action_batch(
                     obs_tensor,
                     type_mask_tensor,
                     size_mask_tensor,
                     amount_mask_tensor,
                 )
+                torch.cuda.synchronize()
+                _t_policy_end = _time.perf_counter()
+
                 values = self.agent.compute_value_batch(obs_tensor)
-                
-                # To CPU
+                torch.cuda.synchronize()
+                _t_value_end = _time.perf_counter()
+
+                # To CPU (convert to float32 first for numpy compatibility)
                 types_np = types.cpu().numpy()
                 sizes_np = sizes.cpu().numpy()
                 amounts_np = amounts.cpu().numpy()
-                log_probs_np = log_probs.cpu().numpy()
-                values_np = values.cpu().numpy()
-            
+                log_probs_np = log_probs.float().cpu().numpy()
+                values_np = values.float().cpu().numpy()
+
+            _t1 = _time.perf_counter()
+            _prof_inference += _t1 - _t0
+
+            # Detailed profiling (log every 100 steps)
+            if step == 0:
+                logger.debug(f"Step 0 timing: policy={(_t_policy_end-_t_policy_start)*1000:.1f}ms value={(_t_value_end-_t_policy_end)*1000:.1f}ms")
+
             # Epsilon-greedy exploration
             explore_mask = np.random.random(len(obs_list)) < exploration_rate
             for i in np.where(explore_mask)[0]:
@@ -559,12 +666,21 @@ class PPOTrainer:
                 )
             
             # Create action tuples
-            actions = [(int(types_np[i]), int(sizes_np[i]), int(amounts_np[i])) 
+            actions = [(int(types_np[i]), int(sizes_np[i]), int(amounts_np[i]))
                       for i in range(len(obs_list))]
-            
-            # Step environments
-            next_obs_list, rewards, terminateds, truncateds, infos = self.vec_env.step_all(actions)
-            
+
+            _t2 = _time.perf_counter()
+
+            # Step environments - subprocess mode returns masks with step (avoids extra IPC)
+            if self.use_subprocess:
+                next_obs_list, rewards, terminateds, truncateds, infos, next_type_masks, next_size_masks, next_amount_masks = self.vec_env.step_all(actions)
+            else:
+                next_obs_list, rewards, terminateds, truncateds, infos = self.vec_env.step_all(actions)
+                next_type_masks, next_size_masks, next_amount_masks = self.vec_env.get_action_masks()
+
+            _t3 = _time.perf_counter()
+            _prof_step_ipc += _t3 - _t2
+
             # Batch auxiliary target computation
             beat_indices = []
             aux_targets_list = []
@@ -616,12 +732,14 @@ class PPOTrainer:
                         beat_indices.append(0)
                         aux_targets_list.append(None)
             
+            _t4 = _time.perf_counter()
+
             # Store in buffer
             for i in range(len(obs_list)):
                 # Track section-level decisions
                 if sizes_np[i] >= ActionSize.BAR.value:  # BAR or larger
                     section_decisions[i] += 1
-                
+
                 self.buffer.add(
                     state=obs_list[i],
                     action_type=types_np[i],
@@ -646,6 +764,9 @@ class PPOTrainer:
                 except Exception:
                     tp = 0.0
                 temporal_penalty_values.append(tp)
+
+            _t5 = _time.perf_counter()
+            _prof_buffer += _t5 - _t4
             
             # Handle episode ends
             for i, (terminated, truncated) in enumerate(zip(terminateds, truncateds)):
@@ -666,13 +787,28 @@ class PPOTrainer:
                     episode_rewards[i] = 0.0
                     episode_lengths[i] = 0
                     section_decisions[i] = 0
-                    
-                    obs, _ = self.vec_env.reset_env(i)
+
+                    # Reset environment - subprocess returns masks with reset
+                    if self.use_subprocess:
+                        obs, _, type_m, size_m, amount_m = self.vec_env.reset_env(i)
+                        next_type_masks[i] = type_m
+                        next_size_masks[i] = size_m
+                        next_amount_masks[i] = amount_m
+                    else:
+                        obs, _ = self.vec_env.reset_env(i)
                     next_obs_list[i] = obs
-            
+
+            # Update for next iteration
             obs_list = next_obs_list
+            type_masks = next_type_masks
+            size_masks = next_size_masks
+            amount_masks = next_amount_masks
             self.global_step += len(obs_list)
-        
+
+        # Log profiling breakdown
+        _prof_other = (_prof_step_ipc + _prof_inference + _prof_buffer)
+        logger.info(f"Rollout profile: Inference={_prof_inference:.2f}s Step={_prof_step_ipc:.2f}s Buffer={_prof_buffer:.2f}s")
+
         # Compute returns (Monte Carlo)
         returns, _ = compute_trajectory_return(
             self.buffer.rewards,
@@ -704,6 +840,25 @@ class PPOTrainer:
         values_arr = np.nan_to_num(values_arr, nan=0.0, posinf=1e6, neginf=-1e6)
         returns_arr = np.nan_to_num(returns_arr, nan=0.0, posinf=1e6, neginf=-1e6)
         log_probs_arr = np.nan_to_num(log_probs_arr, nan=-5.0, posinf=0.0, neginf=-10.0)
+
+        # Normalize rollout states using running normalizer (adapts to both BC and rollout)
+        if self.obs_normalizer is not None:
+            # Debug: compare running norm stats
+            if self.current_epoch % 20 == 1:
+                run_mean, run_std = self.obs_normalizer.get_stats()
+                rollout_raw_mean = states_arr.mean(axis=0)
+                logger.info(f"[DIAG] Running norm stats: count={self.obs_normalizer.count:.0f}")
+                logger.info(f"[DIAG] Running norm mean[:5]: {run_mean[:5]}")
+                logger.info(f"[DIAG] Running norm std[:5]:  {run_std[:5]}")
+                logger.info(f"[DIAG] RAW rollout mean[:5]:  {rollout_raw_mean[:5]}")
+            # Normalize using running stats (don't update - already updated during rollout)
+            states_arr = self.obs_normalizer.normalize(states_arr, clip=5.0)
+            if self.current_epoch % 20 == 1:
+                logger.info(f"[DIAG] PPO normalized states: mean={states_arr.mean():.4f}, std={states_arr.std():.4f}")
+        elif self.bc_state_mean is not None and self.bc_state_std is not None:
+            # Fallback to BC stats
+            states_arr = (states_arr - self.bc_state_mean) / self.bc_state_std
+            states_arr = np.clip(states_arr, -5, 5)
         
         # Normalize returns for value targets
         ret_mean = returns_arr.mean()
@@ -784,6 +939,8 @@ class PPOTrainer:
         value_losses = []
         entropy_losses = []
         auxiliary_losses = []
+        bc_losses = []  # Track BC loss separately
+        bc_entropies = []  # Track BC entropy separately
         approx_kl_divs = []
         nan_batches_skipped = 0
         early_stop = False
@@ -836,12 +993,12 @@ class PPOTrainer:
                 nan_count_log_probs = torch.isnan(new_log_probs).sum().item()
                 inf_count_log_probs = torch.isinf(new_log_probs).sum().item()
                 if nan_count_log_probs > 0 or inf_count_log_probs > 0:
-                    logger.warning(f"NaN/Inf in log_probs: {nan_count_log_probs} NaN, {inf_count_log_probs} Inf (batch {batch_idx})")
+                    logger.warning(f"NaN/Inf in log_probs: {nan_count_log_probs} NaN, {inf_count_log_probs} Inf (batch start={start})")
                     new_log_probs = torch.nan_to_num(new_log_probs, nan=-3.0, posinf=-1.0, neginf=-10.0)
                 nan_count_entropy = torch.isnan(entropy).sum().item()
                 inf_count_entropy = torch.isinf(entropy).sum().item()
                 if nan_count_entropy > 0 or inf_count_entropy > 0:
-                    logger.warning(f"NaN/Inf in entropy: {nan_count_entropy} NaN, {inf_count_entropy} Inf (batch {batch_idx})")
+                    logger.warning(f"NaN/Inf in entropy: {nan_count_entropy} NaN, {inf_count_entropy} Inf (batch start={start})")
                     entropy = torch.nan_to_num(entropy, nan=0.5, posinf=3.0, neginf=0.0)
                 
                 # Ratio
@@ -928,7 +1085,45 @@ class PPOTrainer:
                         bc_n = self.bc_states.shape[0]
                         bc_bs = min(self.bc_batch_size, bc_n)
                         idx = np.random.randint(0, bc_n, size=bc_bs)
-                        bc_states_batch = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                        # BC states are stored RAW - normalize on-the-fly using running normalizer
+                        bc_states_raw = self.bc_states[idx]
+                        if self.obs_normalizer is not None:
+                            bc_states_normalized = self.obs_normalizer.normalize(bc_states_raw, clip=5.0)
+                        else:
+                            # Fallback to BC stats if no running normalizer
+                            bc_states_normalized = (bc_states_raw - self.bc_state_mean) / self.bc_state_std
+                            bc_states_normalized = np.clip(bc_states_normalized, -5, 5)
+                        bc_states_batch = torch.from_numpy(bc_states_normalized).float().to(self.device)
+
+                        # Debug: compare BC vs rollout state distributions and MODEL OUTPUTS (once per epoch, first batch)
+                        if start == 0 and self.current_epoch % 20 == 1:
+                            with torch.no_grad():
+                                # Rollout states stats (already on device from PPO forward pass)
+                                rollout_mean = batch_states.mean().item()
+                                rollout_std = batch_states.std().item()
+                                # BC states stats
+                                bc_mean_val = bc_states_batch.mean().item()
+                                bc_std_val = bc_states_batch.std().item()
+                                logger.info(f"[DIAG] Epoch {self.current_epoch}: Rollout states: mean={rollout_mean:.4f}, std={rollout_std:.4f} | BC states: mean={bc_mean_val:.4f}, std={bc_std_val:.4f}")
+
+                                # Direct entropy comparison: feed BOTH through model
+                                # Rollout entropy (sample from batch_states used in PPO)
+                                rollout_sample = batch_states[:bc_bs]  # Same size as BC batch
+                                r_enc = self.agent.policy_net.encoder(rollout_sample)
+                                r_type_logits = self.agent.policy_net.type_head(r_enc)
+                                r_type_dist = torch.distributions.Categorical(logits=r_type_logits)
+                                rollout_entropy_sample = r_type_dist.entropy().mean().item()
+
+                                # BC entropy (from bc_states_batch)
+                                bc_enc = self.agent.policy_net.encoder(bc_states_batch)
+                                bc_type_logits_diag = self.agent.policy_net.type_head(bc_enc)
+                                bc_type_dist_diag = torch.distributions.Categorical(logits=bc_type_logits_diag)
+                                bc_entropy_sample = bc_type_dist_diag.entropy().mean().item()
+
+                                logger.info(f"[DIAG] Model type entropy: rollout={rollout_entropy_sample:.4f} vs BC={bc_entropy_sample:.4f} (max=~2.99)")
+                                # Log per-feature stats (first 5 features)
+                                logger.info(f"[DIAG] Rollout per-feat mean[:5]: {batch_states.mean(dim=0)[:5].cpu().numpy()}")
+                                logger.info(f"[DIAG] BC per-feat mean[:5]: {bc_states_batch.mean(dim=0)[:5].cpu().numpy()}")
                         bc_type = torch.from_numpy(self.bc_type_labels[idx]).long().to(self.device)
                         bc_size = torch.from_numpy(self.bc_size_labels[idx]).long().to(self.device)
                         bc_amount = torch.from_numpy(self.bc_amount_labels[idx]).long().to(self.device)
@@ -946,18 +1141,36 @@ class PPOTrainer:
                         bc_loss_type = ce(type_logits, bc_type)
                         bc_loss_size = ce(size_logits, bc_size)
                         bc_loss_amount = ce(amount_logits, bc_amount)
-                        bc_loss = bc_loss_type + bc_loss_size + bc_loss_amount
-                        # Optional binary classifier BC loss
+                        # Normalize by number of heads (3) - same as entropy normalization
+                        # Without this, max BC loss = ln(20)+ln(5)+ln(5) ≈ 6.2
+                        bc_loss = (bc_loss_type + bc_loss_size + bc_loss_amount) / 3.0
+
+                        # Compute entropy on BC states and add as POSITIVE penalty
+                        # This counteracts the entropy bonus on BC-like states, preventing the model
+                        # from learning to output uniform distributions on rollout states while
+                        # outputting peaked distributions only on BC states
+                        bc_type_dist = torch.distributions.Categorical(logits=type_logits)
+                        bc_size_dist = torch.distributions.Categorical(logits=size_logits)
+                        bc_amount_dist = torch.distributions.Categorical(logits=amount_logits)
+                        bc_entropy = (bc_type_dist.entropy().mean() + bc_size_dist.entropy().mean() + bc_amount_dist.entropy().mean()) / 3.0
+                        # Add BC entropy penalty (positive = penalizes high entropy on BC states)
+                        # Use same coefficient as rollout entropy to roughly cancel out
+                        bc_entropy_penalty = current_entropy_coeff * bc_entropy
+
+                        # Optional binary classifier BC loss (BCE already 0-1 scale, weight it equally)
                         if self.bc_good_bad_labels is not None and self.agent.auxiliary_module is not None and getattr(self.agent.auxiliary_module, 'good_bad_classifier', None) is not None:
                             try:
                                 bc_gb = torch.from_numpy(self.bc_good_bad_labels[idx]).float().to(self.device)
                                 gb_preds = self.agent.auxiliary_module.good_bad_classifier(encoded).squeeze(-1)
                                 bce = nn.BCEWithLogitsLoss()
                                 bc_gb_loss = bce(gb_preds, bc_gb)
-                                bc_loss = bc_loss + bc_gb_loss
+                                # Average with the 3-head loss (bc_loss now ~2.0, bc_gb_loss ~0.7)
+                                bc_loss = (bc_loss + bc_gb_loss) / 2.0
                             except Exception:
                                 logger.exception("BC mixed good/bad loss failed")
-                        loss = loss + self.bc_loss_weight * bc_loss
+                        loss = loss + self.bc_loss_weight * bc_loss + bc_entropy_penalty
+                        bc_losses.append(bc_loss.item())
+                        bc_entropies.append(bc_entropy.item())
                     except Exception:
                         logger.exception("BC mixed loss failed")
                 
@@ -1009,6 +1222,7 @@ class PPOTrainer:
                 "policy_loss": 999.0,
                 "value_loss": 999.0,
                 "entropy_loss": 0.0,
+                "bc_loss": 0.0,
                 "episode_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0.0,
                 "total_loss": 999.0,
                 "approx_kl": 0.0,
@@ -1025,6 +1239,8 @@ class PPOTrainer:
             "policy_loss": np.mean(policy_losses),
             "value_loss": ppo_config.value_loss_coeff * np.mean(value_losses),
             "entropy_loss": np.mean(entropy_losses),
+            "bc_loss": np.mean(bc_losses) if bc_losses else 0.0,
+            "bc_entropy": np.mean(bc_entropies) if bc_entropies else 0.0,
             "auxiliary_loss": np.mean(auxiliary_losses) if auxiliary_losses else 0.0,
             "episode_reward": np.mean(self.episode_rewards[-100:]) if self.episode_rewards else 0.0,
             "total_loss": np.mean(policy_losses) + ppo_config.value_loss_coeff * np.mean(value_losses),
@@ -1057,6 +1273,22 @@ class PPOTrainer:
                 self.training_logger.log_scalar("train/auxiliary_loss", metrics.get("auxiliary_loss", 0.0), self.global_step)
             except Exception:
                 logger.exception("Failed to log auxiliary_loss to training logger")
+
+            # Log BC loss scalar
+            try:
+                bc_loss_val = metrics.get("bc_loss", 0.0)
+                if bc_loss_val > 0:
+                    self.training_logger.log_scalar("train/bc_loss", bc_loss_val, self.global_step)
+            except Exception:
+                logger.exception("Failed to log bc_loss to training logger")
+
+            # Log BC entropy scalar (should decrease as model learns peaked distributions on BC states)
+            try:
+                bc_entropy_val = metrics.get("bc_entropy", 0.0)
+                if bc_entropy_val > 0:
+                    self.training_logger.log_scalar("train/bc_entropy", bc_entropy_val, self.global_step)
+            except Exception:
+                logger.exception("Failed to log bc_entropy to training logger")
 
             # If we collected auxiliary loss breakdowns per-batch, log their means under auxiliary/breakdown/
             try:
@@ -1283,8 +1515,33 @@ class PPOTrainer:
             if amount_labels.shape[0] != n_samples:
                 raise ValueError(f"amount_labels has {amount_labels.shape[0]} samples, expected {n_samples}")
 
-            # All validation passed - now assign to instance
-            self.bc_states = states
+            # Normalize BC states to prevent numerical instability
+            # Raw states can have values up to ~10000 which cause NaN in training
+            bc_mean = states.mean(axis=0, keepdims=True)
+            bc_std = states.std(axis=0, keepdims=True) + 1e-8
+
+            # Log raw BC stats for distribution comparison
+            logger.info(f"[DIAG] Raw BC states: shape={states.shape}, overall_mean={states.mean():.2f}, overall_std={states.std():.2f}")
+            logger.info(f"[DIAG] Raw BC per-feature mean (first 10): {bc_mean[0, :10]}")
+            logger.info(f"[DIAG] Raw BC per-feature std (first 10): {bc_std[0, :10]}")
+
+            # Initialize running normalizer with BC data
+            # This will be updated with rollout data during training
+            n_features = states.shape[1]
+            self.obs_normalizer = RunningMeanStd(shape=(n_features,))
+            self.obs_normalizer.update(states)  # Initialize with BC raw stats
+            logger.info(f"Initialized obs_normalizer with BC data: count={self.obs_normalizer.count:.0f}")
+
+            # Store RAW BC states - normalize on-the-fly during training using running normalizer
+            # This ensures BC and rollout use the SAME normalization stats
+            logger.info(f"Storing RAW BC states (will normalize on-the-fly during training)")
+
+            # Also store static BC stats for backwards compatibility
+            self.bc_state_mean = bc_mean.astype(np.float32)
+            self.bc_state_std = bc_std.astype(np.float32)
+
+            # Store RAW states (not normalized)
+            self.bc_states = states.astype(np.float32)
             self.bc_type_labels = type_labels
             self.bc_size_labels = size_labels
             self.bc_amount_labels = amount_labels
@@ -1339,7 +1596,14 @@ class PPOTrainer:
             for start in range(0, len(perm), bs):
                 end = min(start + bs, len(perm))
                 idx = perm[start:end]
-                batch_states = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                # BC states are stored RAW - normalize on-the-fly
+                bc_states_raw = self.bc_states[idx]
+                if self.obs_normalizer is not None:
+                    bc_states_normalized = self.obs_normalizer.normalize(bc_states_raw, clip=5.0)
+                else:
+                    bc_states_normalized = (bc_states_raw - self.bc_state_mean) / self.bc_state_std
+                    bc_states_normalized = np.clip(bc_states_normalized, -5, 5)
+                batch_states = torch.from_numpy(bc_states_normalized).float().to(self.device)
                 batch_type = torch.from_numpy(self.bc_type_labels[idx]).long().to(self.device)
                 batch_size_lbl = torch.from_numpy(self.bc_size_labels[idx]).long().to(self.device)
                 batch_amount = torch.from_numpy(self.bc_amount_labels[idx]).long().to(self.device)
@@ -1373,7 +1637,14 @@ class PPOTrainer:
                     for start in range(0, len(val_idx), bs):
                         end = min(start + bs, len(val_idx))
                         idx = val_idx[start:end]
-                        batch_states = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                        # BC states are stored RAW - normalize on-the-fly
+                        bc_states_raw = self.bc_states[idx]
+                        if self.obs_normalizer is not None:
+                            bc_states_normalized = self.obs_normalizer.normalize(bc_states_raw, clip=5.0)
+                        else:
+                            bc_states_normalized = (bc_states_raw - self.bc_state_mean) / self.bc_state_std
+                            bc_states_normalized = np.clip(bc_states_normalized, -5, 5)
+                        batch_states = torch.from_numpy(bc_states_normalized).float().to(self.device)
                         batch_type = torch.from_numpy(self.bc_type_labels[idx]).long().to(self.device)
                         batch_size_lbl = torch.from_numpy(self.bc_size_labels[idx]).long().to(self.device)
                         batch_amount = torch.from_numpy(self.bc_amount_labels[idx]).long().to(self.device)
