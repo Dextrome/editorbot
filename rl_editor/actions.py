@@ -295,34 +295,6 @@ class FactoredActionSpace:
         if len(edit_history.fade_markers) >= 8:
             mask[ActionType.FADE_IN] = False
             mask[ActionType.FADE_OUT] = False
-        
-        #if len(edit_history.time_changes) >= 32:
-        #    mask[ActionType.SPEED_UP] = False
-        #    mask[ActionType.SPEED_DOWN] = False
-        
-        #if len(edit_history.pitch_changes) >= 32:
-        #    mask[ActionType.PITCH_UP] = False
-        #    mask[ActionType.PITCH_DOWN] = False
-        
-        #if len(edit_history.reversed_sections) >= 32:
-        #    mask[ActionType.REVERSE] = False
-        
-        #if len(edit_history.gain_changes) >= 64:
-        #    mask[ActionType.GAIN] = False
-        
-        #if len(edit_history.eq_changes) >= 64:
-        #    mask[ActionType.EQ_LOW] = False
-        #    mask[ActionType.EQ_HIGH] = False
-        
-        #if len(edit_history.audio_effects) >= 64:
-        #    mask[ActionType.DISTORTION] = False
-        #    mask[ActionType.REVERB] = False
-        
-        #if len(edit_history.repeated_sections) >= 8:
-        #    mask[ActionType.REPEAT_PREV] = False
-        
-        #if len(edit_history.swapped_sections) >= 32:
-        #    mask[ActionType.SWAP_NEXT] = False
 
         # Mask KEEP if projected keep ratio would exceed 0.95
         keep_ratio = edit_history.get_keep_ratio()

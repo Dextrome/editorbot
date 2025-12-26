@@ -220,21 +220,6 @@ def estimate_tempo(y: np.ndarray, sr: int = 22050) -> float:
     return float(tempo)
 
 
-def estimate_key(y: np.ndarray, sr: int = 22050) -> str:
-    """Estimate key from audio signal (simple frequency analysis).
-
-    Args:
-        y: Audio array
-        sr: Sample rate
-
-    Returns:
-        Estimated key as string (e.g., "C major")
-    """
-    # Simplified: just return C for now
-    # Full implementation would use chroma features and key estimation
-    return "C major"
-
-
 def get_energy_contour(
     y: np.ndarray, sr: int = 22050, hop_length: int = 512
 ) -> np.ndarray:
@@ -252,39 +237,6 @@ def get_energy_contour(
     S = librosa.feature.melspectrogram(y=y, sr=sr, hop_length=hop_length)
     energy = librosa.feature.rms(S=librosa.power_to_db(S))[0]
     return energy
-
-
-def crossfade_audio(
-    y1: np.ndarray, y2: np.ndarray, sr: int = 22050, duration: float = 1.0
-) -> np.ndarray:
-    """Crossfade between two audio segments.
-
-    Args:
-        y1: First audio segment
-        y2: Second audio segment
-        sr: Sample rate
-        duration: Crossfade duration in seconds
-
-    Returns:
-        Crossfaded audio
-    """
-    fade_samples = int(sr * duration)
-    fade_samples = min(fade_samples, len(y1), len(y2))
-
-    # Create fade curves
-    fade_out = np.linspace(1.0, 0.0, fade_samples)
-    fade_in = np.linspace(0.0, 1.0, fade_samples)
-
-    # Apply fades
-    y1_faded = y1.copy()
-    y2_faded = y2.copy()
-    y1_faded[-fade_samples:] *= fade_out
-    y2_faded[:fade_samples] *= fade_in
-
-    # Concatenate with overlap
-    result = np.concatenate([y1[:-fade_samples], y1_faded[-fade_samples:] + y2_faded[:fade_samples], y2[fade_samples:]])
-
-    return result
 
 
 def set_seed(seed: int) -> None:

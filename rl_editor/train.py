@@ -53,7 +53,7 @@ from rl_editor.actions import (
     N_ACTION_TYPES, N_ACTION_SIZES, N_ACTION_AMOUNTS,
 )
 from rl_editor.agent import Agent
-from rl_editor.state import AudioState, EditHistory
+from rl_editor.state import AudioState
 from rl_editor.reward import compute_trajectory_return
 from rl_editor.logging_utils import TrainingLogger, create_logger
 from rl_editor.learned_reward_integration import LearnedRewardIntegration

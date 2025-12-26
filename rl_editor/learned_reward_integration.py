@@ -13,7 +13,6 @@ Features:
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
-import json
 
 import numpy as np
 import torch

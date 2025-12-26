@@ -8,13 +8,6 @@ from dataclasses import dataclass, field
 from typing import Dict, Any
 
 
-# Stub for backwards compatibility with old checkpoints
-@dataclass
-class ActionSpaceConfig:
-    """Legacy action space config - kept for checkpoint compatibility."""
-    pass
-
-
 @dataclass
 class AudioConfig:
     """Audio processing configuration."""
