@@ -73,7 +73,7 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 4e-5  # Higher LR for fresh training (decay to 2e-5)
+    learning_rate: float = 1e-4  # Higher LR for fresh training (decay to 2e-5)
     lr_decay: bool = True  # Enable learning rate decay by default
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
     lr_min_ratio: float = 0.5  # Decay to 50% of initial LR
@@ -117,6 +117,22 @@ class TrainingConfig:
     # Evaluation truncation: 0 = full track, >0 = truncate to this many beats for eval
     # Increase default to a large snippet (2500 beats) for near-full-track eval during HPO
     eval_max_beats: int = 2500
+    # Debug mode: enable verbose diagnostics (entropy comparisons, state distribution logs)
+    # Disable for faster training
+    debug_diagnostics: bool = False
+    # Use torch.compile() for faster forward passes (PyTorch 2.0+)
+    # May have startup overhead but speeds up training significantly
+    use_torch_compile: bool = False
+    # Checkpoint save interval (epochs)
+    checkpoint_interval: int = 50
+    # TensorBoard logging interval (epochs) - reduce for faster training
+    log_interval: int = 10
+    # Curriculum learning parameters
+    curriculum_initial_beats: int = 1000  # Starting max beats per sample
+    curriculum_final_beats: int = 5000    # Ending max beats per sample
+    curriculum_initial_short_prob: float = 1.0  # Start with 100% short samples
+    curriculum_final_short_prob: float = 0.25   # End with 25% short samples
+    curriculum_steps: int = 5000  # Epochs to anneal curriculum over
 
 
 @dataclass

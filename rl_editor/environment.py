@@ -378,69 +378,47 @@ class AudioEditingEnvFactored(gym.Env):
         )
 
     def _compute_step_reward(self, action: FactoredAction) -> float:
-        """Compute minimal step reward.
-        
-        Most reward comes from episode end, but small signals help learning.
+        """Compute step reward with strong keep ratio shaping.
+
+        Most reward comes from episode end, but step rewards guide learning.
         """
         reward = 0.0
         keep_ratio = self.edit_history.get_keep_ratio()
-        
-        # Progress signal
+        target_keep = 0.45
         progress = self.current_beat / max(1, len(self.audio_state.beat_times))
-        
-        # Small penalty if keeping too much early in episode
-        if progress > 0.1 and progress < 0.3:
-            if keep_ratio > 0.95:
-                reward -= 0.1
-            elif keep_ratio > 0.90:
-                reward -= 0.05
 
-        # Small penalty if keeping too little late in episode
+        # === Strong immediate feedback for CUT vs KEEP based on current ratio ===
+        if action.action_type == ActionType.CUT:
+            if keep_ratio > 0.70:
+                reward += 0.3  # Strong bonus for cutting when way over target
+            elif keep_ratio > 0.55:
+                reward += 0.15  # Moderate bonus for cutting when over target
+            elif keep_ratio < 0.35:
+                reward -= 0.1  # Penalty for cutting when already under target
+        elif action.action_type == ActionType.KEEP:
+            if keep_ratio > 0.70:
+                reward -= 0.2  # Penalty for keeping when way over target
+            elif keep_ratio > 0.55:
+                reward -= 0.1  # Penalty for keeping when over target
+            elif keep_ratio < 0.35:
+                reward += 0.1  # Bonus for keeping when under target
+
+        # === Bonus for being in good range ===
+        if 0.35 < keep_ratio < 0.55:
+            reward += 0.1  # Bonus for being in target range
+
+        # === Progress-based guidance ===
+        # Early in episode: warn if keeping too much
+        if progress < 0.3 and keep_ratio > 0.90:
+            reward -= 0.15  # Early warning
+        # Late in episode: stronger signals
         if progress > 0.7:
-            if keep_ratio < 0.2:
-                reward -= 0.05
-            elif keep_ratio < 0.3:
-                reward -= 0.02
-        elif progress > 0.8:
-            if keep_ratio < 0.2:
-                reward -= 0.09
-            elif keep_ratio < 0.3:
-                reward -= 0.05
+            if keep_ratio > 0.65:
+                reward -= 0.2  # Late penalty for high keep ratio
+            elif keep_ratio < 0.30:
+                reward -= 0.1  # Penalty for cutting too much
 
-        if keep_ratio > 0.35 and keep_ratio < 0.65:
-            reward += 0.05  # Bonus for being in good range
-
-        if keep_ratio < 0.6 and action.action_type == ActionType.KEEP:
-            reward += 0.09  # Small bonus for keeping when keep ratio is high
-        elif keep_ratio < 0.3 and action.action_type == ActionType.CUT:
-            reward -= 0.03  # Small penalty for cutting when keep ratio is low
-        elif keep_ratio > 0.75 and action.action_type == ActionType.CUT:
-            reward += 0.03  # Small bonus for cutting when keep ratio is high
-
-        # Reward for moving keep ratio closer to 50% duration
-        target_keep = 0.5
-        prev_keep_ratio = self.edit_history.get_keep_ratio()
-        # Estimate new keep ratio if this action is applied
-        if action.action_type != ActionType.CUT:
-            beats_to_add = action.n_beats
-            new_keep = len(self.edit_history.kept_beats) + beats_to_add
-            new_total = len(self.edit_history.kept_beats) + len(self.edit_history.cut_beats) + beats_to_add
-            new_keep_ratio = new_keep / new_total if new_total > 0 else 1.0
-        else:
-            new_keep_ratio = prev_keep_ratio
-
-        if keep_ratio < 0.4 or keep_ratio > 0.6:
-            if abs(new_keep_ratio - target_keep) < abs(prev_keep_ratio - target_keep):
-                reward += 0.09  # Bonus for moving closer to target
-            elif new_keep_ratio > target_keep + 0.05:
-                reward -= 0.06  # Penalty for moving further away
-        else:
-            if abs(new_keep_ratio - target_keep) < abs(prev_keep_ratio - target_keep):
-                reward += 0.05  # Smaller bonus for being close to target
-            elif abs(new_keep_ratio - target_keep) > abs(prev_keep_ratio - target_keep):
-                reward -= 0.03  # Smaller penalty for moving away
-        
-        # Small bonus for section-level decisions (more efficient)
+        # === Section-level decisions bonus ===
         if action.n_beats >= 4:
             reward += 0.05
 
@@ -631,25 +609,40 @@ class AudioEditingEnvFactored(gym.Env):
         reward = 0.0
         n_beats = len(self.audio_state.beat_times)
         
-        # === 1. Keep ratio constraint ===
+        # === 1. Keep ratio constraint with reward shaping ===
         keep_ratio = self.edit_history.get_keep_ratio()
         target_keep = self.config.reward.target_keep_ratio if hasattr(self.config.reward, 'target_keep_ratio') else 0.45
-        
+
+        # Reward shaping: progressive reward/penalty based on distance from target
+        # Target: 45%, acceptable range: 35-55%
+        distance_from_target = abs(keep_ratio - target_keep)
+
         keep_ratio_reward = 0.0
-        # Penalty for keeping too much (want 35-60%)
-        if keep_ratio > 0.65:
-            keep_ratio_reward = -30 * (keep_ratio - 0.65)
-        elif keep_ratio < 0.30:
-            keep_ratio_reward = -30 * (0.30 - keep_ratio)
+
+        # Strong positive reward for being close to target (max +20 at exact target)
+        if distance_from_target < 0.10:
+            # Within 10% of target: positive reward
+            keep_ratio_reward = 20 * (1.0 - distance_from_target / 0.10)
+        elif distance_from_target < 0.20:
+            # Within 20%: small positive reward
+            keep_ratio_reward = 5 * (1.0 - (distance_from_target - 0.10) / 0.10)
         else:
-            # Bonus for hitting target range (clamped to [0, 10])
-            keep_ratio_reward = 10 * max(0.0, 1.0 - abs(keep_ratio - target_keep) / 0.2)
+            # Beyond 20%: quadratic penalty (grows faster as distance increases)
+            excess = distance_from_target - 0.20
+            keep_ratio_reward = -100 * (excess ** 1.5)  # Quadratic-ish penalty
+
+        # Extra asymmetric penalty for keeping too much (model's tendency)
+        if keep_ratio > 0.60:
+            # Additional penalty that grows with keep ratio
+            over_keep = keep_ratio - 0.60
+            keep_ratio_reward -= 50 * over_keep  # -50 at 100% keep, -20 at 80%
+
         reward += keep_ratio_reward
-        self.episode_reward_breakdown['duration'] = keep_ratio_reward        
+        self.episode_reward_breakdown['duration'] = keep_ratio_reward
         self.episode_reward_breakdown['n_keep_ratio'] = keep_ratio
         
         # === 2. Section coherence ===
-        # Reward for keeping consecutive sections
+        # Reward for keeping consecutive sections (but ONLY if actually cutting meaningfully)
         kept_beats = sorted(self.edit_history.kept_beats)
         coherence_reward = 0.0
         if len(kept_beats) > 1:
@@ -659,9 +652,49 @@ class AudioEditingEnvFactored(gym.Env):
                     consecutive_runs += 1
             coherence_score = consecutive_runs / len(kept_beats)
             coherence_reward = 15 * coherence_score
+
+            # Coherence reward is DISABLED when keeping too much (no reward for trivial coherence)
+            # Sharp cutoff: 0 reward if keep_ratio > 0.60, scales linearly from 0.45 to 0.60
+            if keep_ratio > 0.60:
+                coherence_reward = 0.0  # Complete disable
+            elif keep_ratio > target_keep:
+                # Linear scale from full (at target) to 0 (at 0.60)
+                scale = 1.0 - (keep_ratio - target_keep) / (0.60 - target_keep)
+                coherence_reward *= max(0.0, scale)
         reward += coherence_reward
         self.episode_reward_breakdown['coherence'] = coherence_reward
-        
+
+        # === 2b. Ground truth matching (supervised signal from human edits) ===
+        # Compare model's decisions against target_labels if available
+        gt_match_reward = 0.0
+        if hasattr(self.audio_state, 'target_labels') and self.audio_state.target_labels is not None:
+            target_labels = self.audio_state.target_labels
+            n_target = len(target_labels)
+
+            # Build prediction array from edit history
+            pred_labels = np.zeros(n_target, dtype=np.float32)
+            for b in self.edit_history.kept_beats:
+                if b < n_target:
+                    pred_labels[b] = 1.0
+            # cut_beats are implicitly 0
+
+            # Compute match rate
+            matches = (pred_labels == target_labels).sum()
+            match_rate = matches / n_target if n_target > 0 else 0.0
+
+            # Strong positive reward for matching human edits
+            # Max +30 for perfect match, scales down linearly
+            # Baseline ~50% match rate (random) = 0 reward
+            baseline_match = 0.5
+            if match_rate > baseline_match:
+                gt_match_reward = 60 * (match_rate - baseline_match)  # Up to +30 at 100%
+            else:
+                gt_match_reward = 30 * (match_rate - baseline_match)  # Smaller penalty for below baseline
+
+            self.episode_reward_breakdown['gt_match_rate'] = float(match_rate)
+        reward += gt_match_reward
+        self.episode_reward_breakdown['gt_match'] = gt_match_reward
+
         # === 3. Phrase alignment ===
         # Bonus for cutting at phrase boundaries
         phrase_size = self.action_space_factored.phrase_size if self.action_space_factored else 8

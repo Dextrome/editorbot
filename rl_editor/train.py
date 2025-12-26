@@ -97,8 +97,16 @@ class RunningMeanStd:
 
     def normalize(self, x: np.ndarray, clip: float = 5.0) -> np.ndarray:
         """Normalize observations using running statistics."""
-        normalized = (x - self.mean.astype(np.float32)) / (np.sqrt(self.var).astype(np.float32) + self.epsilon)
-        return np.clip(normalized, -clip, clip).astype(np.float32)
+        try:
+            # Handle NaN/inf in input before normalization
+            x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            normalized = (x - self.mean.astype(np.float32)) / (np.sqrt(self.var).astype(np.float32) + self.epsilon)
+            # Handle any NaN/inf that might result from normalization
+            normalized = np.nan_to_num(normalized, nan=0.0, posinf=clip, neginf=-clip)
+            return np.clip(normalized, -clip, clip).astype(np.float32)
+        except Exception:
+            # Fallback: clip raw input if normalization completely fails
+            return np.clip(np.nan_to_num(x, nan=0.0), -clip, clip).astype(np.float32)
 
     def get_stats(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return current mean and std."""
@@ -354,7 +362,11 @@ class PPOTrainer:
         self.current_epoch = 0
         self.use_subprocess = use_subprocess
         self.device = torch.device(config.training.device if torch.cuda.is_available() else "cpu")
-        
+
+        # Enable cudnn benchmark for consistent input sizes (speeds up convolutions)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
         # Entropy coefficient with decay
         self.initial_entropy_coeff = config.ppo.entropy_coeff
         self.entropy_coeff_min = getattr(config.ppo, 'entropy_coeff_min', 0.01)
@@ -397,6 +409,7 @@ class PPOTrainer:
         
         # Pending checkpoint
         self._pending_checkpoint: Optional[Dict] = None
+        self._pending_reset_lr: bool = False
         
         # Reward normalization
         self.reward_mean = 0.0
@@ -462,7 +475,16 @@ class PPOTrainer:
             beat_feature_dim=beat_feature_dim,
             use_auxiliary_tasks=True,
         )
-        
+
+        # Optional: torch.compile for faster forward passes (PyTorch 2.0+)
+        if self.config.training.use_torch_compile:
+            try:
+                self.agent.policy_net = torch.compile(self.agent.policy_net, mode="reduce-overhead")
+                self.agent.value_net = torch.compile(self.agent.value_net, mode="reduce-overhead")
+                logger.info("torch.compile() enabled for policy and value networks")
+            except Exception as e:
+                logger.warning(f"torch.compile() failed, continuing without: {e}")
+
         # Single optimizer for all networks (policy + value)
         lr = self.config.ppo.learning_rate
         self.optimizer = optim.Adam(
@@ -490,9 +512,10 @@ class PPOTrainer:
         # Load pending checkpoint
         if self._pending_checkpoint is not None:
             logger.info("Loading deferred checkpoint weights...")
-            self._load_checkpoint_weights(self._pending_checkpoint)
+            self._load_checkpoint_weights(self._pending_checkpoint, reset_lr=self._pending_reset_lr)
             self._pending_checkpoint = None
-            logger.info("✓ Checkpoint loaded")
+            self._pending_reset_lr = False
+            logger.info("Checkpoint loaded")
 
         # Compile models for faster inference (must be after checkpoint load)
         self.agent.compile_models()
@@ -572,7 +595,7 @@ class PPOTrainer:
             obs_batch = np.stack(obs_list)
 
             # Debug: log observation stats on first step of first few epochs
-            if step == 0 and self.current_epoch % 20 == 1:
+            if self.config.training.debug_diagnostics and step == 0 and self.current_epoch % 20 == 1:
                 logger.info(f"[DIAG] Raw rollout obs: shape={obs_batch.shape}, overall_mean={obs_batch.mean():.2f}, overall_std={obs_batch.std():.2f}")
                 # Per-feature comparison
                 rollout_feat_mean = obs_batch.mean(axis=0)
@@ -590,7 +613,7 @@ class PPOTrainer:
                 self.obs_normalizer.update(obs_batch)
                 # Normalize using the updated running stats
                 obs_batch = self.obs_normalizer.normalize(obs_batch, clip=5.0)
-                if step == 0 and self.current_epoch % 20 == 1:
+                if self.config.training.debug_diagnostics and step == 0 and self.current_epoch % 20 == 1:
                     run_mean, run_std = self.obs_normalizer.get_stats()
                     logger.info(f"[DIAG] Running norm: count={self.obs_normalizer.count:.0f}, mean[:5]={run_mean[:5]}, std[:5]={run_std[:5]}")
                     logger.info(f"[DIAG] Normalized rollout obs: mean={obs_batch.mean():.4f}, std={obs_batch.std():.4f}, range=[{obs_batch.min():.2f}, {obs_batch.max():.2f}]")
@@ -611,9 +634,8 @@ class PPOTrainer:
             amount_mask_tensor = torch.from_numpy(amount_mask_batch).bool().to(self.device, non_blocking=True)
             
             # Batch inference - returns (types, sizes, amounts, log_probs)
-            # Use autocast for FP16 speedup during inference
-            with torch.no_grad(), torch.amp.autocast('cuda', enabled=self.config.ppo.use_mixed_precision):
-                torch.cuda.synchronize()  # Ensure GPU is ready
+            # Use inference_mode (faster than no_grad) + autocast for FP16
+            with torch.inference_mode(), torch.amp.autocast('cuda', enabled=self.config.ppo.use_mixed_precision):
                 _t_policy_start = _time.perf_counter()
 
                 types, sizes, amounts, log_probs = self.agent.select_action_batch(
@@ -622,11 +644,9 @@ class PPOTrainer:
                     size_mask_tensor,
                     amount_mask_tensor,
                 )
-                torch.cuda.synchronize()
                 _t_policy_end = _time.perf_counter()
 
                 values = self.agent.compute_value_batch(obs_tensor)
-                torch.cuda.synchronize()
                 _t_value_end = _time.perf_counter()
 
                 # To CPU (convert to float32 first for numpy compatibility)
@@ -805,9 +825,10 @@ class PPOTrainer:
             amount_masks = next_amount_masks
             self.global_step += len(obs_list)
 
-        # Log profiling breakdown
-        _prof_other = (_prof_step_ipc + _prof_inference + _prof_buffer)
-        logger.info(f"Rollout profile: Inference={_prof_inference:.2f}s Step={_prof_step_ipc:.2f}s Buffer={_prof_buffer:.2f}s")
+        # Log profiling breakdown (only in debug mode or every 100 epochs)
+        if self.config.training.debug_diagnostics or self.current_epoch % 100 == 0:
+            _prof_other = (_prof_step_ipc + _prof_inference + _prof_buffer)
+            logger.info(f"Rollout profile: Inference={_prof_inference:.2f}s Step={_prof_step_ipc:.2f}s Buffer={_prof_buffer:.2f}s")
 
         # Compute returns (Monte Carlo)
         returns, _ = compute_trajectory_return(
@@ -844,7 +865,7 @@ class PPOTrainer:
         # Normalize rollout states using running normalizer (adapts to both BC and rollout)
         if self.obs_normalizer is not None:
             # Debug: compare running norm stats
-            if self.current_epoch % 20 == 1:
+            if self.config.training.debug_diagnostics and self.current_epoch % 20 == 1:
                 run_mean, run_std = self.obs_normalizer.get_stats()
                 rollout_raw_mean = states_arr.mean(axis=0)
                 logger.info(f"[DIAG] Running norm stats: count={self.obs_normalizer.count:.0f}")
@@ -853,7 +874,7 @@ class PPOTrainer:
                 logger.info(f"[DIAG] RAW rollout mean[:5]:  {rollout_raw_mean[:5]}")
             # Normalize using running stats (don't update - already updated during rollout)
             states_arr = self.obs_normalizer.normalize(states_arr, clip=5.0)
-            if self.current_epoch % 20 == 1:
+            if self.config.training.debug_diagnostics and self.current_epoch % 20 == 1:
                 logger.info(f"[DIAG] PPO normalized states: mean={states_arr.mean():.4f}, std={states_arr.std():.4f}")
         elif self.bc_state_mean is not None and self.bc_state_std is not None:
             # Fallback to BC stats
@@ -1096,7 +1117,8 @@ class PPOTrainer:
                         bc_states_batch = torch.from_numpy(bc_states_normalized).float().to(self.device)
 
                         # Debug: compare BC vs rollout state distributions and MODEL OUTPUTS (once per epoch, first batch)
-                        if start == 0 and self.current_epoch % 20 == 1:
+                        # This is CPU/GPU intensive - only run in debug mode
+                        if self.config.training.debug_diagnostics and start == 0 and self.current_epoch % 20 == 1:
                             with torch.no_grad():
                                 # Rollout states stats (already on device from PPO forward pass)
                                 rollout_mean = batch_states.mean().item()
@@ -1339,7 +1361,8 @@ class PPOTrainer:
                         self.training_logger.log_scalar("train/episode_reward_epoch_std", std_ep, self.global_step)
                     except Exception:
                         logger.debug("Failed to log per-epoch episode reward diagnostics to training logger")
-                    logger.info(f"Epoch diagnostic: new_episodes={n_ep} mean_ep_reward={mean_ep:.2f} std={std_ep:.2f}")
+                    if self.config.training.debug_diagnostics:
+                        logger.info(f"Epoch diagnostic: new_episodes={n_ep} mean_ep_reward={mean_ep:.2f} std={std_ep:.2f}")
                     # Also log per-rollout temporal penalty summaries if present
                     try:
                         tp_mean = float(rollout_data.get('temporal_penalty_mean_rollout', 0.0))
@@ -1418,8 +1441,13 @@ class PPOTrainer:
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
     
-    def load_checkpoint(self, path: str):
-        """Load checkpoint."""
+    def load_checkpoint(self, path: str, reset_lr: bool = False):
+        """Load checkpoint.
+
+        Args:
+            path: Path to checkpoint file
+            reset_lr: If True, don't load optimizer/scheduler state (use fresh LR from config)
+        """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         version = checkpoint.get("version", "v1")
@@ -1433,12 +1461,13 @@ class PPOTrainer:
         if self.agent is None:
             logger.info("Agent not initialized - storing checkpoint for deferred loading")
             self._pending_checkpoint = checkpoint
+            self._pending_reset_lr = reset_lr
             return
-        
-        self._load_checkpoint_weights(checkpoint)
+
+        self._load_checkpoint_weights(checkpoint, reset_lr=reset_lr)
         logger.info(f"Loaded checkpoint from {path} (epoch {self.current_epoch})")
     
-    def _load_checkpoint_weights(self, checkpoint: Dict):
+    def _load_checkpoint_weights(self, checkpoint: Dict, reset_lr: bool = False):
         """Load weights from checkpoint."""
         if checkpoint.get("policy_state_dict"):
             self.agent.policy_net.load_state_dict(checkpoint["policy_state_dict"])
@@ -1473,17 +1502,22 @@ class PPOTrainer:
                             except Exception:
                                 logger.debug("Failed to copy param %s into auxiliary module", name)
                     logger.info("Partially loaded auxiliary module (manual copy)")
-        if self.optimizer and checkpoint.get("optimizer"):
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            logger.info("Loaded optimizer")
-        if self.auxiliary_optimizer and checkpoint.get("auxiliary_optimizer"):
-            self.auxiliary_optimizer.load_state_dict(checkpoint["auxiliary_optimizer"])
-            logger.info("Loaded auxiliary optimizer")
-        if self.scheduler and checkpoint.get("scheduler"):
-            self.scheduler.load_state_dict(checkpoint["scheduler"])
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.config.ppo.learning_rate
+        if reset_lr:
+            # Skip loading optimizer/scheduler state - use fresh LR from config
+            logger.info(f"reset_lr=True: Using fresh LR={self.config.ppo.learning_rate:.2e} (ignoring checkpoint's optimizer/scheduler)")
+        else:
+            if self.optimizer and checkpoint.get("optimizer"):
+                self.optimizer.load_state_dict(checkpoint["optimizer"])
+                logger.info("Loaded optimizer")
+            if self.auxiliary_optimizer and checkpoint.get("auxiliary_optimizer"):
+                self.auxiliary_optimizer.load_state_dict(checkpoint["auxiliary_optimizer"])
+                logger.info("Loaded auxiliary optimizer")
+            if self.scheduler and checkpoint.get("scheduler"):
+                self.scheduler.load_state_dict(checkpoint["scheduler"])
+                logger.info("Loaded scheduler")
+            # Always apply config LR after loading (in case config changed)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.config.ppo.learning_rate
 
     def load_bc_dataset(self, npz_path: str, weight: float = 0.0, batch_size: int = 64):
         """Load BC NPZ (states + type/size/amount labels) into trainer memory.
@@ -1520,10 +1554,11 @@ class PPOTrainer:
             bc_mean = states.mean(axis=0, keepdims=True)
             bc_std = states.std(axis=0, keepdims=True) + 1e-8
 
-            # Log raw BC stats for distribution comparison
-            logger.info(f"[DIAG] Raw BC states: shape={states.shape}, overall_mean={states.mean():.2f}, overall_std={states.std():.2f}")
-            logger.info(f"[DIAG] Raw BC per-feature mean (first 10): {bc_mean[0, :10]}")
-            logger.info(f"[DIAG] Raw BC per-feature std (first 10): {bc_std[0, :10]}")
+            # Log raw BC stats for distribution comparison (only in debug mode)
+            if self.config.training.debug_diagnostics:
+                logger.info(f"[DIAG] Raw BC states: shape={states.shape}, overall_mean={states.mean():.2f}, overall_std={states.std():.2f}")
+                logger.info(f"[DIAG] Raw BC per-feature mean (first 10): {bc_mean[0, :10]}")
+                logger.info(f"[DIAG] Raw BC per-feature std (first 10): {bc_std[0, :10]}")
 
             # Initialize running normalizer with BC data
             # This will be updated with rollout data during training
@@ -1682,7 +1717,16 @@ class PPOTrainer:
                     for start in range(0, n, bs):
                         end = min(start + bs, n)
                         idx = perm[start:end]
-                        batch_states = torch.from_numpy(self.bc_states[idx]).float().to(self.device)
+                        # Normalize states before use (consistent with other BC training)
+                        bc_states_raw = self.bc_states[idx]
+                        if self.obs_normalizer is not None:
+                            bc_states_normalized = self.obs_normalizer.normalize(bc_states_raw, clip=5.0)
+                        elif self.bc_state_mean is not None:
+                            bc_states_normalized = (bc_states_raw - self.bc_state_mean) / self.bc_state_std
+                            bc_states_normalized = np.clip(bc_states_normalized, -5, 5)
+                        else:
+                            bc_states_normalized = bc_states_raw
+                        batch_states = torch.from_numpy(bc_states_normalized).float().to(self.device)
                         batch_gb = torch.from_numpy(self.bc_good_bad_labels[idx]).float().to(self.device)
                         gb_optimizer.zero_grad()
                         with torch.no_grad():
@@ -1717,6 +1761,7 @@ def train(
     max_beats: Optional[int] = None,
     val_audio: Optional[str] = None,
     include_reference: Optional[bool] = None,
+    reset_lr: bool = False,
 ):
     """Main training function.
     
@@ -1795,7 +1840,7 @@ def train(
         logger.exception("Failed to initialize TrainingLogger; continuing without it")
     
     if checkpoint_path and Path(checkpoint_path).exists():
-        trainer.load_checkpoint(checkpoint_path)
+        trainer.load_checkpoint(checkpoint_path, reset_lr=reset_lr)
         logger.info(f"Resumed from checkpoint: {checkpoint_path}")
 
     # Load BC datasets if provided
@@ -1814,6 +1859,9 @@ def train(
     
     # Training loop
     save_dir = Path(config.training.save_dir)
+    if not save_dir.exists():
+        save_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created save directory: {save_dir}")
     # Default maximum beats used when CLI/config does not set `max_beats`.
     # Set to None to allow unlimited when user omits the CLI flag.
     DEFAULT_MAXBEATS = None
@@ -1821,18 +1869,80 @@ def train(
     effective_global_max = max_beats if max_beats is not None else DEFAULT_MAXBEATS
     effective_display = effective_global_max if effective_global_max is not None else "unlimited"
     logger.info(f"Max beats per sample: {effective_display}")
+
+    # Helper for parallel sample loading
+    def load_sample(args):
+        """Load a single sample and create AudioState (for parallel loading)."""
+        idx, per_sample_max = args
+        sample = dataset[idx]
+        raw_data = sample.get('raw', sample)
+
+        beat_times = raw_data["beat_times"]
+        beat_features = raw_data["beat_features"]
+
+        # Convert to numpy if tensor
+        if hasattr(beat_times, 'numpy'):
+            beat_times = beat_times.numpy()
+        if hasattr(beat_features, 'numpy'):
+            beat_features = beat_features.numpy()
+
+        # Limit to per-sample max beats (if set)
+        beat_slice_start = 0
+        if per_sample_max is not None and len(beat_times) > per_sample_max:
+            start_idx = np.random.randint(0, len(beat_times) - per_sample_max)
+            end_idx = start_idx + per_sample_max
+            beat_slice_start = start_idx
+            beat_times = beat_times[start_idx:end_idx]
+            beat_features = beat_features[start_idx:end_idx]
+            beat_times = beat_times - beat_times[0]
+
+        tempo = raw_data.get("tempo", 120)
+        if hasattr(tempo, 'item'):
+            tempo = tempo.item()
+
+        audio_state = AudioState(
+            beat_index=0,
+            beat_times=beat_times,
+            beat_features=beat_features,
+            tempo=tempo,
+            raw_audio=raw_data.get("audio"),
+            sample_rate=raw_data.get("sample_rate", 22050),
+        )
+        # Attach pair id, target mel, and edit labels
+        if isinstance(sample, dict):
+            pair_id = sample.get("pair_id")
+            if pair_id:
+                audio_state.pair_id = pair_id
+            edited = sample.get("edited")
+            if edited and "mel" in edited:
+                mel = edited["mel"]
+                if hasattr(mel, 'numpy'):
+                    mel = mel.numpy()
+                audio_state.target_mel = mel
+            edit_labels = sample.get("edit_labels")
+            if edit_labels is not None:
+                if hasattr(edit_labels, 'numpy'):
+                    edit_labels = edit_labels.numpy()
+                if len(edit_labels) > len(beat_times):
+                    label_end = beat_slice_start + len(beat_times)
+                    edit_labels = edit_labels[beat_slice_start:label_end]
+                audio_state.target_labels = edit_labels
+        return audio_state
+
+    # Thread pool for parallel data loading
+    data_loader_pool = ThreadPoolExecutor(max_workers=min(n_envs, 8))
     
     for epoch in range(trainer.current_epoch, n_epochs):
         epoch_start = time.time()
         
-        # === Curriculum parameters ===
+        # === Curriculum parameters (from config) ===
         # Start with short segments, gradually increase
-        initial_short_beats = 500
-        final_short_beats = 5000
-        initial_short_prob = 1.0  # 100% short at start
-        final_short_prob = 0.25   # 25% short at end
-        curriculum_steps = 5000  # Number of epochs to anneal over
-        
+        initial_short_beats = config.training.curriculum_initial_beats
+        final_short_beats = config.training.curriculum_final_beats
+        initial_short_prob = config.training.curriculum_initial_short_prob
+        final_short_prob = config.training.curriculum_final_short_prob
+        curriculum_steps = config.training.curriculum_steps
+
         progress = min(epoch / curriculum_steps, 1.0)
         short_prob = initial_short_prob * (1 - progress) + final_short_prob * progress
         short_max_beats = int(initial_short_beats + (final_short_beats - initial_short_beats) * progress)
@@ -1842,63 +1952,21 @@ def train(
             trainer.training_logger.log_scalar("curriculum/short_prob", short_prob, trainer.global_step)
             trainer.training_logger.log_scalar("curriculum/short_max_beats", short_max_beats, trainer.global_step)
         
-        # Sample audio states
+        # Sample audio states (parallel loading for speed)
         data_start = time.time()
-        audio_states = []
         idxs = np.random.randint(0, len(dataset), size=n_envs)
-        
+
+        # Determine per-sample max beats for each sample
+        load_args = []
         for idx in idxs:
-            # Determine per-sample max beats based on curriculum and any global override
             if random.random() < short_prob:
                 per_sample_max = min(effective_global_max, short_max_beats) if effective_global_max is not None else short_max_beats
             else:
                 per_sample_max = effective_global_max
-            
-            sample = dataset[idx]
-            raw_data = sample.get('raw', sample)
-            
-            beat_times = raw_data["beat_times"]
-            beat_features = raw_data["beat_features"]
-            
-            # Convert to numpy if tensor
-            if hasattr(beat_times, 'numpy'):
-                beat_times = beat_times.numpy()
-            if hasattr(beat_features, 'numpy'):
-                beat_features = beat_features.numpy()
-            
-            # Limit to per-sample max beats (if set)
-            if per_sample_max is not None and len(beat_times) > per_sample_max:
-                start_idx = np.random.randint(0, len(beat_times) - per_sample_max)
-                end_idx = start_idx + per_sample_max
-                beat_times = beat_times[start_idx:end_idx]
-                beat_features = beat_features[start_idx:end_idx]
-                beat_times = beat_times - beat_times[0]  # Reset to 0
-            
-            tempo = raw_data.get("tempo", 120)
-            if hasattr(tempo, 'item'):
-                tempo = tempo.item()
-            
-            audio_state = AudioState(
-                beat_index=0,
-                beat_times=beat_times,
-                beat_features=beat_features,
-                tempo=tempo,
-                raw_audio=raw_data.get("audio"),
-                sample_rate=raw_data.get("sample_rate", 22050),
-            )
-            # Attach pair id and target mel from paired dataset when available
-            if isinstance(sample, dict):
-                pair_id = sample.get("pair_id")
-                if pair_id:
-                    audio_state.pair_id = pair_id
-                edited = sample.get("edited")
-                if edited and "mel" in edited:
-                    mel = edited["mel"]
-                    # Convert to numpy if tensor
-                    if hasattr(mel, 'numpy'):
-                        mel = mel.numpy()
-                    audio_state.target_mel = mel
-            audio_states.append(audio_state)
+            load_args.append((idx, per_sample_max))
+
+        # Load samples in parallel using thread pool
+        audio_states = list(data_loader_pool.map(load_sample, load_args))
         # Diagnostics: log sampled beat counts for this epoch (helps detect curriculum / max_beats effects)
         try:
             beats_counts = [len(s.beat_times) for s in audio_states]
@@ -2037,6 +2105,7 @@ def main():
     parser.add_argument("--subprocess", action="store_true", help="Use subprocess parallelism")
     parser.add_argument("--use_learned_rewards", action="store_true", help="Enable learned reward model (RLHF)")
     parser.add_argument("--no_lr_decay", action="store_true", help="Disable learning rate decay")
+    parser.add_argument("--reset_lr", action="store_true", help="Reset LR to config value when resuming (ignore checkpoint's LR)")
     parser.add_argument("--bc_pretrain_npz", type=str, default=None, help="NPZ file for BC pretraining (states+labels)")
     parser.add_argument("--bc_pretrain_epochs", type=int, default=0, help="Epochs for BC pretraining")
     parser.add_argument("--bc_pretrain_lr", type=float, default=1e-4, help="LR for BC pretraining")
@@ -2046,7 +2115,9 @@ def main():
     # `include_reference` default is read from config; CLI flags override when provided.
     parser.add_argument('--include_reference', dest='include_reference', action='store_true', help='Include reference tracks when loading paired dataset', default=None)
     parser.add_argument('--no_include_reference', dest='include_reference', action='store_false', help='Do not include reference tracks when loading paired dataset', default=None)
-    
+    parser.add_argument('--debug', action='store_true', help='Enable debug diagnostics (entropy comparisons, state distribution logs)')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile() for faster forward passes (PyTorch 2.0+)')
+
     args = parser.parse_args()
     
     # Config
@@ -2058,6 +2129,14 @@ def main():
     if args.no_lr_decay:
         config.ppo.lr_decay = False
         logger.info("Learning rate decay DISABLED")
+
+    if args.debug:
+        config.training.debug_diagnostics = True
+        logger.info("Debug diagnostics ENABLED")
+
+    if args.compile:
+        config.training.use_torch_compile = True
+        logger.info("torch.compile() ENABLED")
     
     if args.use_learned_rewards:
         config.reward.use_learned_rewards = True
@@ -2079,6 +2158,7 @@ def main():
         use_subprocess=args.subprocess,
         max_beats=args.max_beats,
         include_reference=args.include_reference,
+        reset_lr=args.reset_lr,
     )
 
 
