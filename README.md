@@ -1,11 +1,18 @@
 # RL Audio Editor
 
-A reinforcement learning system for automated music editing. The agent learns to make intelligent editing decisions (KEEP, CUT, LOOP, effects) by training on paired raw/edited audio examples.
+A deep learning system for automated music editing. The agent learns to make intelligent editing decisions by training on paired raw/edited audio examples.
 
 ## Overview
 
-Traditional audio editing uses hand-crafted rules. This RL-based approach learns the full editing policy end-to-end:
+Traditional audio editing uses hand-crafted rules. This system learns the full editing policy end-to-end using two approaches:
 
+### Approach 1: Supervised Mel Reconstruction
+```
+Raw Audio + Edit Labels → [Encoder] → Latent → [Decoder] → Edited Audio
+```
+Direct reconstruction using multi-scale perceptual losses. Faster to train, simpler architecture.
+
+### Approach 2: RL with Factored Actions
 ```
 Input Audio → [RL Agent] → Edited Output
                   ↑
@@ -14,6 +21,7 @@ Input Audio → [RL Agent] → Edited Output
          - Size: BEAT, BAR, PHRASE, TWO_BARS...
          - Amount: intensity/direction
 ```
+Sequential decision making with PPO + Behavioral Cloning.
 
 ## Quick Start
 
@@ -37,23 +45,49 @@ training_data/
 
 ### 3. Train
 
+**Option A: Supervised Reconstruction (Recommended to start)**
 ```bash
-# Fresh training with subprocess parallelism (recommended for Windows)
-python -m rl_editor.train --save_dir models/my_model --epochs 30000 --n_envs 16 --steps 512 --subprocess
+python -m rl_editor.supervised_trainer \
+    --data-dir training_data \
+    --save-dir models/supervised \
+    --epochs 100 \
+    --batch-size 8
+```
 
-# Resume from checkpoint
-python -m rl_editor.train --save_dir models/my_model --checkpoint models/my_model/best.pt --epochs 30000 --subprocess
+**Option B: RL with BC Mixed Training**
+```bash
+# Generate BC dataset first
+python -m scripts.infer_rich_bc_labels --data_dir training_data --out bc_rich.npz
+
+# Train with BC + PPO
+python -m rl_editor.train \
+    --save-dir models/rl_model \
+    --bc-mixed bc_rich.npz \
+    --bc-weight 0.3 \
+    --epochs 5000 \
+    --subprocess
 ```
 
 ### 4. Inference
 
 ```bash
-python -m rl_editor.infer "input.wav" --checkpoint "models/my_model/best.pt" --output "edited.wav"
+python -m rl_editor.infer "input.wav" --checkpoint "models/rl_model/best.pt" --output "edited.wav"
 ```
 
 ## Architecture
 
-### Factored Action Space
+### Supervised Model
+
+Inspired by FaceSwap's autoencoder architecture:
+
+| Component | Description |
+|-----------|-------------|
+| **EditEncoder** | Transformer encoder processing raw mel + edit label embeddings |
+| **MelDecoder** | Transformer decoder with residual connection to raw input |
+| **Multi-Scale STFT Loss** | Frequency-aware reconstruction at 512/1024/2048 FFT sizes |
+| **Edit Consistency Loss** | Preserves unedited regions |
+
+### RL Model - Factored Action Space
 
 Instead of 500 discrete actions, uses 3 factored heads:
 
@@ -65,12 +99,12 @@ Instead of 500 discrete actions, uses 3 factored heads:
 
 This yields 500 combinations from only 30 network outputs.
 
-### Neural Network
+### Neural Network (RL)
 
 - **Encoder**: HybridNATTENEncoder (neighborhood attention + global pooling)
 - **Policy**: 3-head output (type, size, amount distributions)
 - **Value**: Separate value network for PPO
-- **Auxiliary Tasks**: Tempo prediction, energy classification, phrase detection, mel reconstruction
+- **Auxiliary Tasks**: Tempo prediction, energy classification, phrase detection
 
 ### Features (121 dimensions)
 
@@ -90,6 +124,7 @@ Stem features:      12   (4 stems × 3 features, if enabled)
 ```
 editorbot/
 ├── rl_editor/              # Main package
+│   ├── supervised_trainer.py  # Supervised mel reconstruction
 │   ├── train.py            # PPO training loop
 │   ├── agent.py            # Policy/Value networks
 │   ├── environment.py      # Gymnasium RL environment
@@ -98,9 +133,10 @@ editorbot/
 │   ├── features.py         # Audio feature extraction
 │   ├── reward.py           # Reward computation
 │   ├── auxiliary_tasks.py  # Multi-task learning heads
-│   ├── cache.py            # Feature caching system
-│   ├── subprocess_vec_env.py # Parallel environments
 │   └── infer.py            # Inference/export
+├── scripts/                # Utilities
+│   ├── infer_rich_bc_labels.py  # Generate BC dataset
+│   └── augment_bc_with_synthetic.py  # Augment rare actions
 ├── training_data/          # Paired audio for training
 ├── models/                 # Saved checkpoints
 ├── logs/                   # TensorBoard logs
@@ -109,13 +145,26 @@ editorbot/
 
 ## Training Configuration
 
-Key hyperparameters in `rl_editor/config.py`:
+### Supervised (supervised_trainer.py)
+
+```python
+encoder_dim: 512
+decoder_dim: 512
+n_layers: 6
+n_heads: 8
+learning_rate: 1e-4
+batch_size: 8
+l1_weight: 1.0
+multiscale_stft_weight: 1.0
+edit_consistency_weight: 0.5
+```
+
+### RL (config.py)
 
 ```python
 # PPO
-learning_rate: 4e-5
-entropy_coeff: 0.15      # Lower = more deterministic policy
-entropy_coeff_min: 0.02  # Final entropy after decay
+learning_rate: 1e-4
+entropy_coeff: 0.02
 clip_ratio: 0.2
 target_kl: 0.02
 
@@ -131,29 +180,6 @@ gradient_accumulation_steps: 4
 use_mixed_precision: true
 ```
 
-## Behavioral Cloning (Optional)
-
-Pre-train from expert demonstrations before RL:
-
-```bash
-# 1. Generate rich BC dataset with action detection
-python -m scripts.infer_rich_bc_labels --data_dir training_data --out bc_rich.npz
-
-# 2. Pretrain policy on BC dataset
-python -m rl_editor.train --bc_pretrain_npz bc_rich.npz --bc_pretrain_epochs 10 --save_dir models/bc_init
-
-# 3. Or mix BC loss during PPO training
-python -m rl_editor.train --bc_mixed_npz bc_rich.npz --bc_mixed_weight 0.1 --subprocess
-```
-
-The rich BC generator (`scripts/infer_rich_bc_labels.py`) detects:
-- **KEEP/CUT**: From ground-truth alignment labels
-- **GAIN**: RMS energy differences (>1.5 dB)
-- **PITCH_UP/DOWN**: Spectral centroid shifts (>0.8 semitones)
-- **EQ_HIGH/LOW**: Band energy ratio changes (>1.5 dB)
-- **REORDER**: Position inversions in alignment mapping
-- **Multi-beat sizes**: Consecutive runs of 4+ (BAR), 8+ (TWO_BARS), 16+ (PHRASE) beats
-
 ## Monitoring
 
 View training progress with TensorBoard:
@@ -162,19 +188,23 @@ View training progress with TensorBoard:
 tensorboard --logdir logs
 ```
 
-Key metrics to watch:
+### Supervised Metrics
+- `train/l1_loss` - Should decrease
+- `train/msstft_loss` - Should decrease
+- `val/total_loss` - Should decrease (watch for overfitting)
+
+### RL Metrics
 - `train/episode_reward` - Should trend upward
-- `train/entropy` - Logged as negative; should NOT be at maximum (-6.2)
-- `learning_rate` - Should be at expected value, not decayed to 0
+- `train/entropy` - Should NOT be at maximum (-6.2)
 - `approx_kl` - Should stay near target_kl (0.02)
 
 ## Tips
 
-- Use `--subprocess` on Windows for true multiprocessing
-- Set `--epochs` high (30000) to prevent premature LR decay when resuming
-- Monitor entropy - if at maximum, policy is random (lower entropy_coeff)
+- **Start with supervised training** - faster iteration, simpler debugging
+- Use `--subprocess` on Windows for true multiprocessing (RL only)
 - Pre-cache features for faster training: features are cached in `rl_editor/cache/`
-- Watch for action type collapse (>90% one type) - indicates reward issues
+- Watch for overfitting in supervised training (val loss increasing)
+- For RL, watch for action type collapse (>90% one type)
 
 ## Development
 
@@ -194,5 +224,4 @@ python -c "import torch; c = torch.load('models/best.pt'); print(c.keys())"
 - PyTorch 2.0+
 - CUDA (recommended)
 - ~8GB+ VRAM for training
-- ~16GB RAM for 16 parallel environments
-
+- ~16GB RAM for 16 parallel environments (RL)
