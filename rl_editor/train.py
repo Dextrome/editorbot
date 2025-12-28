@@ -278,7 +278,13 @@ class VectorizedEnvWrapper:
         for env in self.envs:
             if env is not None:
                 env.set_learned_reward_model(model)
-    
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch on all environments (for curriculum learning)."""
+        for env in self.envs:
+            if env is not None:
+                env.set_epoch(epoch)
+
     def reset_all(self) -> Tuple[List[np.ndarray], List[dict]]:
         obs_list = []
         info_list = []
@@ -436,6 +442,11 @@ class PPOTrainer:
         self.auxiliary_optimizer: Optional[optim.Adam] = None
         # Training logger (may be created later)
         self.training_logger: Optional[TrainingLogger] = None
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set current epoch on all environments (for curriculum learning)."""
+        if hasattr(self.vec_env, 'set_epoch'):
+            self.vec_env.set_epoch(epoch)
 
     def set_auxiliary_config(self, new_config: AuxiliaryConfig) -> None:
         """Update auxiliary task configuration and clear/recompute any cached targets.
@@ -1934,7 +1945,10 @@ def train(
     
     for epoch in range(trainer.current_epoch, n_epochs):
         epoch_start = time.time()
-        
+
+        # Set epoch on all environments (for keep ratio curriculum)
+        trainer.set_epoch(epoch)
+
         # === Curriculum parameters (from config) ===
         # Start with short segments, gradually increase
         initial_short_beats = config.training.curriculum_initial_beats
@@ -1951,6 +1965,17 @@ def train(
         if trainer.training_logger is not None:
             trainer.training_logger.log_scalar("curriculum/short_prob", short_prob, trainer.global_step)
             trainer.training_logger.log_scalar("curriculum/short_max_beats", short_max_beats, trainer.global_step)
+            # Log keep ratio curriculum target (compute directly from config)
+            reward_cfg = config.reward
+            if getattr(reward_cfg, 'use_keep_ratio_curriculum', False):
+                initial = getattr(reward_cfg, 'target_keep_ratio_initial', 0.60)
+                final = getattr(reward_cfg, 'target_keep_ratio_final', 0.45)
+                curr_epochs = getattr(reward_cfg, 'keep_ratio_curriculum_epochs', 2000)
+                keep_progress = min(epoch / curr_epochs, 1.0)
+                keep_target = initial + keep_progress * (final - initial)
+            else:
+                keep_target = reward_cfg.target_keep_ratio
+            trainer.training_logger.log_scalar("curriculum/keep_ratio_target", keep_target, trainer.global_step)
         
         # Sample audio states (parallel loading for speed)
         data_start = time.time()

@@ -59,7 +59,7 @@ class SuperEditorPipeline:
 
     def _load_predictor(self, path: str) -> EditPredictor:
         """Load edit predictor model."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         config = checkpoint.get('config', Phase2Config())
         predictor = EditPredictor(config).to(self.device)
@@ -208,23 +208,23 @@ class SuperEditorPipeline:
 
         return result
 
-    def mel_to_audio(self, mel: np.ndarray) -> np.ndarray:
+    def mel_to_audio(self, mel: np.ndarray, normalize_volume: bool = True) -> np.ndarray:
         """Convert mel spectrogram to audio using Griffin-Lim.
 
         Args:
             mel: Mel spectrogram (T, n_mels) normalized to [0, 1]
+            normalize_volume: Whether to normalize output volume
 
         Returns:
             audio: Audio waveform
         """
         import librosa
 
-        # Denormalize (assuming mel was normalized to [0, 1])
-        # This is approximate - proper denormalization requires knowing original range
-        mel_db = mel * 80 - 80  # Approximate dB range
+        # Denormalize: [0, 1] -> [-60, 0] dB (calibrated for best quality)
+        mel_db = mel * 60 - 60
         mel_power = librosa.db_to_power(mel_db)
 
-        # Griffin-Lim
+        # Griffin-Lim with more iterations for better quality
         audio = librosa.feature.inverse.mel_to_audio(
             mel_power.T,  # librosa expects (n_mels, T)
             sr=self.audio_config.sample_rate,
@@ -233,7 +233,12 @@ class SuperEditorPipeline:
             win_length=self.audio_config.win_length,
             fmin=self.audio_config.fmin,
             fmax=self.audio_config.fmax,
+            n_iter=64,  # More iterations for better phase estimation
         )
+
+        # Normalize volume to prevent clipping
+        if normalize_volume and np.abs(audio).max() > 0:
+            audio = audio / np.abs(audio).max() * 0.9
 
         return audio
 

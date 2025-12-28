@@ -1,4 +1,8 @@
-"""Utility functions for RL-based audio editor."""
+"""Utility functions for RL-based audio editor.
+
+NOTE: Core audio utilities are now available in shared.audio_utils.
+This file contains rl_editor-specific utilities.
+"""
 
 import logging
 from pathlib import Path

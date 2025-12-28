@@ -1,8 +1,6 @@
 """Logging utilities for training with TensorBoard and Weights & Biases.
 
-NOTE: The canonical implementation is now in shared.logging_utils.
-This file is kept for backward compatibility but new code should
-consider using shared.logging_utils directly.
+Shared between rl_editor and super_editor for consistent logging.
 """
 
 import logging
@@ -21,10 +19,10 @@ class TrainingLogger:
     def __init__(
         self,
         log_dir: str,
-        experiment_name: str = "rl_audio_editor",
+        experiment_name: str = "training",
         use_tensorboard: bool = True,
         use_wandb: bool = False,
-        wandb_project: str = "rl-audio-editor",
+        wandb_project: str = "audio-editor",
         config: Optional[Dict[str, Any]] = None,
     ):
         """Initialize training logger.
@@ -41,12 +39,12 @@ class TrainingLogger:
         self.experiment_name = experiment_name
         self.use_tensorboard = use_tensorboard
         self.use_wandb = use_wandb
-        
+
         # Create log directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = self.log_dir / f"{experiment_name}_{timestamp}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Initialize TensorBoard
         self.tb_writer = None
         if use_tensorboard:
@@ -57,7 +55,7 @@ class TrainingLogger:
             except ImportError:
                 logger.warning("TensorBoard not available. Install with: pip install tensorboard")
                 self.use_tensorboard = False
-        
+
         # Initialize W&B
         self.wandb_run = None
         if use_wandb:
@@ -73,7 +71,7 @@ class TrainingLogger:
             except ImportError:
                 logger.warning("W&B not available. Install with: pip install wandb")
                 self.use_wandb = False
-        
+
         self.step = 0
 
     def log_scalar(self, tag: str, value: float, step: Optional[int] = None) -> None:
@@ -86,10 +84,10 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
         if self.tb_writer:
             self.tb_writer.add_scalar(tag, value, step)
-        
+
         if self.wandb_run:
             import wandb
             wandb.log({tag: value}, step=step)
@@ -104,10 +102,10 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
         if self.tb_writer:
             self.tb_writer.add_scalars(main_tag, tag_scalar_dict, step)
-        
+
         if self.wandb_run:
             import wandb
             wandb.log({f"{main_tag}/{k}": v for k, v in tag_scalar_dict.items()}, step=step)
@@ -122,10 +120,10 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
         if self.tb_writer:
             self.tb_writer.add_histogram(tag, values, step)
-        
+
         if self.wandb_run:
             import wandb
             wandb.log({tag: wandb.Histogram(values)}, step=step)
@@ -141,7 +139,7 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
         if self.tb_writer:
             # TensorBoard expects shape (1, L) or (2, L)
             if audio.ndim == 1:
@@ -149,7 +147,7 @@ class TrainingLogger:
             else:
                 audio_tb = audio
             self.tb_writer.add_audio(tag, audio_tb, step, sample_rate=sample_rate)
-        
+
         if self.wandb_run:
             import wandb
             wandb.log({tag: wandb.Audio(audio, sample_rate=sample_rate)}, step=step)
@@ -164,7 +162,7 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
         if self.tb_writer:
             # TensorBoard expects (C, H, W)
             if image.ndim == 2:
@@ -174,10 +172,28 @@ class TrainingLogger:
             else:
                 image_tb = image
             self.tb_writer.add_image(tag, image_tb, step)
-        
+
         if self.wandb_run:
             import wandb
             wandb.log({tag: wandb.Image(image)}, step=step)
+
+    def log_figure(self, tag: str, figure, step: Optional[int] = None) -> None:
+        """Log a matplotlib figure.
+
+        Args:
+            tag: Name of the figure
+            figure: Matplotlib figure
+            step: Global step
+        """
+        if step is None:
+            step = self.step
+
+        if self.tb_writer:
+            self.tb_writer.add_figure(tag, figure, step)
+
+        if self.wandb_run:
+            import wandb
+            wandb.log({tag: wandb.Image(figure)}, step=step)
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
         """Log multiple metrics at once.
@@ -189,69 +205,77 @@ class TrainingLogger:
         if step is None:
             step = self.step
 
-        # Special handling: if a metric value is a dict, expand it
         for tag, value in metrics.items():
-            # Route counters separately
-            if tag in ("n_actions", "n_creative"):
-                out_tag = f"counters/{tag}"
-                try:
-                    self.log_scalar(out_tag, float(value), step)
-                except Exception:
-                    self.log_scalar(out_tag, value, step)
-                continue
-
-            # If the value is a mapping of reward components, expand under a main tag
+            # Handle nested dicts
             if isinstance(value, dict):
                 for subk, subv in value.items():
                     out_tag = f"{tag}/{subk}"
                     try:
                         self.log_scalar(out_tag, float(subv), step)
-                    except Exception:
-                        self.log_scalar(out_tag, subv, step)
+                    except (TypeError, ValueError):
+                        pass
                 continue
 
-            # Default: log scalar as provided
+            # Default: log scalar
             try:
                 self.log_scalar(tag, float(value), step)
-            except Exception:
-                self.log_scalar(tag, value, step)
+            except (TypeError, ValueError):
+                pass
 
     def log_training_step(
         self,
-        policy_loss: float,
-        value_loss: float,
-        episode_reward: float,
-        episode_length: int,
-        entropy: Optional[float] = None,
+        loss: float,
         learning_rate: Optional[float] = None,
         step: Optional[int] = None,
+        **kwargs,
     ) -> None:
-        """Log standard training metrics.
+        """Log standard training step metrics.
 
         Args:
-            policy_loss: Policy network loss
-            value_loss: Value network loss
-            episode_reward: Total episode reward
-            episode_length: Episode length
-            entropy: Policy entropy (optional)
-            learning_rate: Current learning rate (optional)
+            loss: Training loss
+            learning_rate: Current learning rate
             step: Global step
+            **kwargs: Additional metrics to log
         """
         if step is None:
             step = self.step
-        
-        metrics = {
-            "train/policy_loss": policy_loss,
-            "train/value_loss": value_loss,
-            "train/episode_reward": episode_reward,
-            "train/episode_length": episode_length,
-        }
-        
-        if entropy is not None:
-            metrics["train/entropy"] = entropy
+
+        metrics = {"train/loss": loss}
+
         if learning_rate is not None:
             metrics["train/learning_rate"] = learning_rate
-        
+
+        # Add any additional metrics
+        for key, value in kwargs.items():
+            if not key.startswith("train/"):
+                key = f"train/{key}"
+            metrics[key] = value
+
+        self.log_metrics(metrics, step)
+
+    def log_validation(
+        self,
+        val_loss: float,
+        step: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        """Log validation metrics.
+
+        Args:
+            val_loss: Validation loss
+            step: Global step
+            **kwargs: Additional metrics to log
+        """
+        if step is None:
+            step = self.step
+
+        metrics = {"val/loss": val_loss}
+
+        for key, value in kwargs.items():
+            if not key.startswith("val/"):
+                key = f"val/{key}"
+            metrics[key] = value
+
         self.log_metrics(metrics, step)
 
     def log_evaluation(
@@ -263,7 +287,7 @@ class TrainingLogger:
         mean_length: Optional[float] = None,
         step: Optional[int] = None,
     ) -> None:
-        """Log evaluation metrics.
+        """Log RL evaluation metrics.
 
         Args:
             mean_reward: Mean evaluation reward
@@ -275,17 +299,17 @@ class TrainingLogger:
         """
         if step is None:
             step = self.step
-        
+
         metrics = {
             "eval/mean_reward": mean_reward,
             "eval/std_reward": std_reward,
             "eval/min_reward": min_reward,
             "eval/max_reward": max_reward,
         }
-        
+
         if mean_length is not None:
             metrics["eval/mean_length"] = mean_length
-        
+
         self.log_metrics(metrics, step)
 
     def increment_step(self) -> None:
@@ -296,20 +320,58 @@ class TrainingLogger:
         """Set internal step counter."""
         self.step = step
 
+    def flush(self) -> None:
+        """Flush any buffered data."""
+        if self.tb_writer:
+            self.tb_writer.flush()
+
     def close(self) -> None:
         """Close all loggers."""
         if self.tb_writer:
             self.tb_writer.close()
-        
+
         if self.wandb_run:
             import wandb
             wandb.finish()
-        
+
         logger.info("Training logger closed")
 
 
-def create_logger(config) -> TrainingLogger:
-    """Create training logger from config.
+def create_logger(
+    log_dir: str = "./logs",
+    experiment_name: str = "training",
+    use_tensorboard: bool = True,
+    use_wandb: bool = False,
+    wandb_project: str = "audio-editor",
+    config: Optional[Dict[str, Any]] = None,
+) -> TrainingLogger:
+    """Create training logger.
+
+    Args:
+        log_dir: Directory for logs
+        experiment_name: Name of the experiment
+        use_tensorboard: Whether to use TensorBoard
+        use_wandb: Whether to use W&B
+        wandb_project: W&B project name
+        config: Configuration to log
+
+    Returns:
+        TrainingLogger instance
+    """
+    return TrainingLogger(
+        log_dir=log_dir,
+        experiment_name=experiment_name,
+        use_tensorboard=use_tensorboard,
+        use_wandb=use_wandb,
+        wandb_project=wandb_project,
+        config=config,
+    )
+
+
+def create_logger_from_config(config) -> TrainingLogger:
+    """Create training logger from a config object.
+
+    Works with both rl_editor.config.Config and super_editor.config.Phase1Config/Phase2Config.
 
     Args:
         config: Config object with training settings
@@ -317,11 +379,23 @@ def create_logger(config) -> TrainingLogger:
     Returns:
         TrainingLogger instance
     """
+    # Handle rl_editor config
+    if hasattr(config, 'training'):
+        return TrainingLogger(
+            log_dir=config.training.log_dir,
+            experiment_name="rl_audio_editor",
+            use_tensorboard=config.training.use_tensorboard,
+            use_wandb=config.training.use_wandb,
+            wandb_project=config.training.wandb_project,
+            config=config.to_dict() if hasattr(config, 'to_dict') else None,
+        )
+
+    # Handle super_editor config (Phase1Config or Phase2Config)
+    log_dir = getattr(config, 'log_dir', './logs')
     return TrainingLogger(
-        log_dir=config.training.log_dir,
-        experiment_name="rl_audio_editor",
-        use_tensorboard=config.training.use_tensorboard,
-        use_wandb=config.training.use_wandb,
-        wandb_project=config.training.wandb_project,
-        config=config.to_dict(),
+        log_dir=log_dir,
+        experiment_name="super_editor",
+        use_tensorboard=True,
+        use_wandb=False,
+        config=None,
     )

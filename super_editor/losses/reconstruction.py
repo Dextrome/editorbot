@@ -126,13 +126,14 @@ class STFTLoss(nn.Module):
             pred = pred.reshape(pred.size(0), -1)
             target = target.reshape(target.size(0), -1)
 
-        # STFT
+        # STFT - ensure window is on same device
+        window = self.window.to(pred.device)
         pred_stft = torch.stft(
             pred,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window,
+            window=window,
             return_complex=True,
         )
         target_stft = torch.stft(
@@ -140,7 +141,7 @@ class STFTLoss(nn.Module):
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window,
+            window=window,
             return_complex=True,
         )
 

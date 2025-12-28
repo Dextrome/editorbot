@@ -7,15 +7,9 @@ Used by train.py with factored action space.
 from dataclasses import dataclass, field
 from typing import Dict, Any
 
-
-@dataclass
-class AudioConfig:
-    """Audio processing configuration."""
-
-    sample_rate: int = 22050
-    hop_length: int = 512
-    n_mels: int = 128
-    n_fft: int = 2048
+# Import AudioConfig from shared module for backward compatibility
+# New code should import from shared directly
+from shared.audio_config import AudioConfig
 
 
 @dataclass
@@ -31,7 +25,7 @@ class StateConfig:
 
 @dataclass
 class RewardConfig:
-    """Reward signal configuration."""    
+    """Reward signal configuration."""
     use_sparse_rewards: bool = True
     use_dense_rewards: bool = True
     use_learned_rewards: bool = False  # Disabled - needs real audio features to be useful
@@ -40,6 +34,20 @@ class RewardConfig:
     energy_flow_weight: float = 1.0
     phrase_completeness_weight: float = 0.8
     transition_quality_weight: float = 0.9
+
+    # === Reward stabilization (fixes for training plateau) ===
+    # Duration reward clamping to reduce variance
+    duration_reward_clip_min: float = -10.0  # Clamp extreme negative penalties
+    duration_reward_clip_max: float = 10.0   # Clamp extreme positive rewards
+
+    # Curriculum on keep ratio target (start lenient, tighten over time)
+    use_keep_ratio_curriculum: bool = True
+    target_keep_ratio_initial: float = 0.60  # Start with easier target
+    target_keep_ratio_final: float = 0.45    # End with actual target
+    keep_ratio_curriculum_epochs: int = 8000  # Epochs to anneal over (set high for resumed training)
+
+    # Cut action bonus to overcome "keep everything" inertia
+    cut_action_bonus: float = 0.3  # Small bonus per cut action to encourage cutting
 
 
 @dataclass
@@ -66,10 +74,10 @@ class ModelConfig:
 class PPOConfig:
     """PPO training configuration."""
 
-    learning_rate: float = 1e-4  # Higher LR for fresh training (decay to 2e-5)
+    learning_rate: float = 5e-5  # Moderate LR for resumed training (was 1e-4)
     lr_decay: bool = True  # Enable learning rate decay by default
     lr_decay_type: str = "cosine"  # Options: "cosine", "linear", "exponential", "step"
-    lr_min_ratio: float = 0.5  # Decay to 50% of initial LR
+    lr_min_ratio: float = 0.4  # Decay to 40% of initial LR (2e-5 minimum)
     lr_warmup_epochs: int = 10  # Warmup epochs before decay starts
     lr_decay_epochs: int = 500  # Total epochs for decay (for step/exponential)
     lr_step_factor: float = 0.5  # Factor for step decay
@@ -77,11 +85,11 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2  # Standard PPO clipping - allows exploration
-    target_kl: float = 0.02  # Tighter KL to prevent too-aggressive updates
-    # Lower entropy to allow peaked distributions (BC provides supervision)
-    entropy_coeff: float = 0.02  # Much lower - BC entropy penalty counteracts this anyway
+    target_kl: float = 0.015  # Tighter KL to prevent too-aggressive updates (was 0.02)
+    # Boost entropy to escape local minimum (model stuck at 67% keep ratio)
+    entropy_coeff: float = 0.05  # Higher to encourage exploration (was 0.02)
     entropy_coeff_decay: bool = True  # Decay entropy over training
-    entropy_coeff_min: float = 0.005  # Very low final entropy for exploitation
+    entropy_coeff_min: float = 0.02  # Keep some exploration even late (was 0.005)
     value_loss_coeff: float = 0.1  # Standard PPO balance
     # Clip returns (helps prevent FP16 overflow and huge losses)
     # Widen return clipping to effectively disable aggressive clipping during recovery
@@ -90,7 +98,7 @@ class PPOConfig:
     # L2 weight decay for optimizer - disable for now to avoid training drift
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0  # Tighter gradient clipping to avoid large updates
-    n_epochs: int = 6  # PPO epochs per update
+    n_epochs: int = 8  # PPO epochs per update
     batch_size: int = 2048  # Large batch for better GPU utilization
     use_gradient_accumulation: bool = True
     gradient_accumulation_steps: int = 4
@@ -122,10 +130,10 @@ class TrainingConfig:
     log_interval: int = 10
     # Curriculum learning parameters
     curriculum_initial_beats: int = 1000  # Starting max beats per sample
-    curriculum_final_beats: int = 5000    # Ending max beats per sample
+    curriculum_final_beats: int = 4000    # Ending max beats per sample
     curriculum_initial_short_prob: float = 1.0  # Start with 100% short samples
     curriculum_final_short_prob: float = 0.25   # End with 25% short samples
-    curriculum_steps: int = 5000  # Epochs to anneal curriculum over
+    curriculum_steps: int = 4000  # Epochs to anneal curriculum over
 
 
 @dataclass

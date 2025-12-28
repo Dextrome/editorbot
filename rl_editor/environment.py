@@ -126,6 +126,38 @@ class AudioEditingEnvFactored(gym.Env):
         except Exception:
             self._reward_calculator = None
 
+        # Epoch tracking for curriculum learning
+        self.current_epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set current training epoch for curriculum learning.
+
+        Args:
+            epoch: Current training epoch
+        """
+        self.current_epoch = epoch
+
+    def get_curriculum_keep_target(self) -> float:
+        """Get current keep ratio target based on curriculum.
+
+        Returns:
+            Target keep ratio for current epoch
+        """
+        reward_cfg = self.config.reward
+        if not getattr(reward_cfg, 'use_keep_ratio_curriculum', False):
+            return reward_cfg.target_keep_ratio
+
+        # Linear interpolation from initial to final over curriculum_epochs
+        initial = getattr(reward_cfg, 'target_keep_ratio_initial', 0.60)
+        final = getattr(reward_cfg, 'target_keep_ratio_final', 0.45)
+        curriculum_epochs = getattr(reward_cfg, 'keep_ratio_curriculum_epochs', 2000)
+
+        if self.current_epoch >= curriculum_epochs:
+            return final
+
+        progress = self.current_epoch / curriculum_epochs
+        return initial + progress * (final - initial)
+
     def reset(
         self,
         seed: Optional[int] = None,
@@ -384,8 +416,14 @@ class AudioEditingEnvFactored(gym.Env):
         """
         reward = 0.0
         keep_ratio = self.edit_history.get_keep_ratio()
-        target_keep = 0.45
+        # Use curriculum target for step rewards too
+        target_keep = self.get_curriculum_keep_target()
         progress = self.current_beat / max(1, len(self.audio_state.beat_times))
+
+        # === Cut action bonus (helps escape "keep everything" local minimum) ===
+        cut_bonus = getattr(self.config.reward, 'cut_action_bonus', 0.0)
+        if action.action_type == ActionType.CUT and cut_bonus > 0:
+            reward += cut_bonus
 
         # === Strong immediate feedback for CUT vs KEEP based on current ratio ===
         if action.action_type == ActionType.CUT:
@@ -611,10 +649,10 @@ class AudioEditingEnvFactored(gym.Env):
         
         # === 1. Keep ratio constraint with reward shaping ===
         keep_ratio = self.edit_history.get_keep_ratio()
-        target_keep = self.config.reward.target_keep_ratio if hasattr(self.config.reward, 'target_keep_ratio') else 0.45
+        # Use curriculum target if enabled (starts lenient, tightens over time)
+        target_keep = self.get_curriculum_keep_target()
 
         # Reward shaping: progressive reward/penalty based on distance from target
-        # Target: 45%, acceptable range: 35-55%
         distance_from_target = abs(keep_ratio - target_keep)
 
         keep_ratio_reward = 0.0
@@ -632,14 +670,22 @@ class AudioEditingEnvFactored(gym.Env):
             keep_ratio_reward = -100 * (excess ** 1.5)  # Quadratic-ish penalty
 
         # Extra asymmetric penalty for keeping too much (model's tendency)
-        if keep_ratio > 0.60:
+        # Use dynamic threshold based on curriculum target
+        over_keep_threshold = max(0.60, target_keep + 0.15)
+        if keep_ratio > over_keep_threshold:
             # Additional penalty that grows with keep ratio
-            over_keep = keep_ratio - 0.60
-            keep_ratio_reward -= 50 * over_keep  # -50 at 100% keep, -20 at 80%
+            over_keep = keep_ratio - over_keep_threshold
+            keep_ratio_reward -= 50 * over_keep
+
+        # Clamp duration reward to reduce variance (reward stabilization)
+        clip_min = getattr(self.config.reward, 'duration_reward_clip_min', -10.0)
+        clip_max = getattr(self.config.reward, 'duration_reward_clip_max', 10.0)
+        keep_ratio_reward = float(np.clip(keep_ratio_reward, clip_min, clip_max))
 
         reward += keep_ratio_reward
         self.episode_reward_breakdown['duration'] = keep_ratio_reward
         self.episode_reward_breakdown['n_keep_ratio'] = keep_ratio
+        self.episode_reward_breakdown['target_keep_ratio'] = target_keep  # Log curriculum target
         
         # === 2. Section coherence ===
         # Reward for keeping consecutive sections (but ONLY if actually cutting meaningfully)

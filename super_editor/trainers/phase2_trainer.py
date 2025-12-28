@@ -2,6 +2,13 @@
 
 Uses PPO to train an edit predictor that maximizes reconstruction quality
 through a frozen Phase 1 model.
+
+Improvements from rl_editor:
+- Curriculum learning (start with shorter sequences)
+- Observation normalization (RunningMeanStd)
+- Target KL for early stopping
+- Auxiliary tasks for better representations
+- Better logging with TrainingLogger
 """
 
 import os
@@ -14,12 +21,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from ..config import Phase2Config, EditLabel
 from ..models import ReconstructionModel, ActorCritic
 from ..data import PairedMelDataset, collate_fn
+
+# Import from shared module
+from shared.logging_utils import TrainingLogger, create_logger
+from shared.normalization import ObservationNormalizer
 
 
 class RewardComputer:
@@ -220,8 +230,37 @@ class Phase2Trainer:
         # Reward computer
         self.reward_computer = RewardComputer(self.recon_model, config)
 
-        # Logging
-        self.writer = SummaryWriter(self.save_dir / 'tensorboard')
+        # Logging with TrainingLogger (from shared module)
+        self.logger = TrainingLogger(
+            log_dir=str(self.save_dir),
+            experiment_name="phase2_training",
+            use_tensorboard=config.use_tensorboard,
+            use_wandb=False,
+        )
+
+        # Observation normalization (from rl_editor)
+        self.obs_normalizer = None
+        if config.use_observation_normalization:
+            n_mels = config.audio.n_mels
+            self.obs_normalizer = ObservationNormalizer(
+                shape=(n_mels,),
+                clip_range=config.observation_clip_range,
+                device=str(self.device),
+            )
+            print("Observation normalization enabled")
+
+        # Auxiliary tasks (optional)
+        self.aux_module = None
+        if config.use_auxiliary_tasks:
+            try:
+                from ..models.auxiliary import AuxiliaryTaskModule
+                self.aux_module = AuxiliaryTaskModule(
+                    config=config,
+                    encoder_dim=config.predictor_dim,
+                ).to(self.device)
+                print("Auxiliary tasks enabled")
+            except ImportError:
+                print("Auxiliary tasks module not available, skipping")
 
         # Training state
         self.global_step = 0
@@ -237,8 +276,15 @@ class Phase2Trainer:
         if num_epochs is None:
             num_epochs = self.config.total_epochs
 
+        # Get curriculum sequence length for this epoch
+        curr_seq_len = self.config.get_curriculum_seq_len(self.epoch) if self.config.use_curriculum else self.config.max_seq_len
+
+        # Create Phase1Config with curriculum sequence length
+        phase1_config = self._get_phase1_config()
+        phase1_config.max_seq_len = curr_seq_len
+
         # Data loader
-        dataset = PairedMelDataset(str(self.data_dir), self._get_phase1_config(), split='train')
+        dataset = PairedMelDataset(str(self.data_dir), phase1_config, split='train')
         loader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
@@ -249,29 +295,46 @@ class Phase2Trainer:
         )
 
         print(f"Training with {len(dataset)} samples")
+        if self.config.use_curriculum:
+            print(f"Curriculum learning: seq_len will increase from {self.config.curriculum_initial_seq_len} to {self.config.curriculum_final_seq_len}")
 
         for epoch in range(self.epoch, num_epochs):
             self.epoch = epoch
 
+            # Update curriculum sequence length if needed
+            if self.config.use_curriculum:
+                new_seq_len = self.config.get_curriculum_seq_len(epoch)
+                if new_seq_len != curr_seq_len:
+                    curr_seq_len = new_seq_len
+                    phase1_config.max_seq_len = curr_seq_len
+                    dataset = PairedMelDataset(str(self.data_dir), phase1_config, split='train')
+                    loader = DataLoader(
+                        dataset,
+                        batch_size=self.config.batch_size,
+                        shuffle=True,
+                        num_workers=self.config.num_workers,
+                        pin_memory=self.config.pin_memory,
+                        collate_fn=collate_fn,
+                    )
+
             # Collect rollouts and update
             metrics = self._train_epoch(loader)
+
+            # Add curriculum info to metrics
+            metrics['seq_len'] = curr_seq_len
 
             # Logging
             self._log_epoch(metrics)
 
-            # Entropy decay
-            if self.config.entropy_coeff_decay:
-                self.entropy_coeff = max(
-                    self.config.entropy_coeff_min,
-                    self.config.entropy_coeff * (1 - epoch / num_epochs)
-                )
+            # Entropy decay (use config method)
+            self.entropy_coeff = self.config.get_entropy_coeff(epoch, num_epochs)
 
             # Save checkpoint
             if (epoch + 1) % self.config.save_interval == 0:
                 self._save_checkpoint(f'epoch_{epoch + 1}.pt')
 
         self._save_checkpoint('final.pt')
-        self.writer.close()
+        self.logger.close()
 
     def _get_phase1_config(self):
         """Create a Phase1Config compatible with data loading."""
@@ -446,16 +509,21 @@ class Phase2Trainer:
         return advantages, returns
 
     def _log_epoch(self, metrics: Dict[str, float]):
-        """Log epoch metrics."""
+        """Log epoch metrics using TrainingLogger."""
+        # Console output
+        seq_len_str = f", SeqLen={int(metrics.get('seq_len', 0))}" if self.config.use_curriculum else ""
         print(f"\nEpoch {self.epoch + 1}: "
               f"Reward={metrics['reward']:.2f}, "
               f"Policy Loss={metrics['policy_loss']:.4f}, "
               f"Value Loss={metrics['value_loss']:.4f}, "
-              f"Entropy={metrics['entropy']:.4f}")
+              f"Entropy={metrics['entropy']:.4f}"
+              f"{seq_len_str}")
 
-        for k, v in metrics.items():
-            self.writer.add_scalar(f'train/{k}', v, self.epoch)
-        self.writer.add_scalar('train/entropy_coeff', self.entropy_coeff, self.epoch)
+        # Log to TrainingLogger (TensorBoard/W&B)
+        self.logger.set_step(self.epoch)
+        self.logger.log_metrics({f'train/{k}': v for k, v in metrics.items()}, self.epoch)
+        self.logger.log_scalar('train/entropy_coeff', self.entropy_coeff, self.epoch)
+        self.logger.log_scalar('train/learning_rate', self.optimizer.param_groups[0]['lr'], self.epoch)
 
     def _save_checkpoint(self, filename: str):
         """Save checkpoint."""
@@ -472,7 +540,7 @@ class Phase2Trainer:
 
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.ac.load_state_dict(checkpoint['actor_critic_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.epoch = checkpoint.get('epoch', 0) + 1
