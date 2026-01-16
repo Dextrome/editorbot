@@ -5,7 +5,10 @@ import torch.nn as nn
 from typing import Optional, Dict
 
 from ..config import Phase1Config
-from .reconstruction import L1MelLoss, MSEMelLoss, MultiScaleSTFTLoss
+from .reconstruction import (
+    L1MelLoss, MSEMelLoss, MultiScaleSTFTLoss,
+    LabelConditionedLoss, LabelContrastiveLoss
+)
 from .consistency import EditConsistencyLoss, SmoothnessLoss
 
 
@@ -17,7 +20,8 @@ class Phase1Loss(nn.Module):
         - MSE reconstruction loss (optional)
         - Multi-scale STFT loss
         - Edit consistency loss (preserve KEEP regions)
-        - Smoothness loss (optional)
+        - Label-conditioned loss (CUT->zero, KEEP->input)
+        - Label contrastive loss (CUT and KEEP should differ)
     """
 
     def __init__(self, config: Phase1Config):
@@ -25,21 +29,27 @@ class Phase1Loss(nn.Module):
         self.config = config
 
         # Individual loss functions
-        self.l1_loss = L1MelLoss(reduction='mean')
-        self.mse_loss = MSEMelLoss(reduction='mean')
+        self.l1_loss = L1MelLoss(reduction="mean")
+        self.mse_loss = MSEMelLoss(reduction="mean")
         self.stft_loss = MultiScaleSTFTLoss(
             fft_sizes=config.stft_fft_sizes,
             hop_sizes=config.stft_hop_sizes,
             win_sizes=config.stft_win_sizes,
         )
         self.consistency_loss = EditConsistencyLoss(keep_label=1)  # KEEP=1
-        self.smoothness_loss = SmoothnessLoss(reduction='mean')
+        self.smoothness_loss = SmoothnessLoss(reduction="mean")
+
+        # Label-enforcing losses (critical for making model use labels!)
+        self.label_conditioned_loss = LabelConditionedLoss(cut_weight=1.0, keep_weight=1.0)
+        self.label_contrastive_loss = LabelContrastiveLoss(margin=0.5)
 
         # Weights from config
         self.l1_weight = config.l1_weight
         self.mse_weight = config.mse_weight
         self.stft_weight = config.stft_weight
         self.consistency_weight = config.consistency_weight
+        self.label_conditioned_weight = getattr(config, "label_conditioned_weight", 2.0)
+        self.label_contrastive_weight = getattr(config, "label_contrastive_weight", 0.5)
 
     def forward(
         self,
@@ -58,40 +68,57 @@ class Phase1Loss(nn.Module):
             mask: Valid frame mask
 
         Returns:
-            Dictionary with 'total' loss and individual components
+            Dictionary with total loss and individual components
         """
         losses = {}
 
         # L1 reconstruction loss
         if self.l1_weight > 0:
-            losses['l1'] = self.l1_loss(pred, target, mask)
+            losses["l1"] = self.l1_loss(pred, target, mask)
         else:
-            losses['l1'] = torch.tensor(0.0, device=pred.device)
+            losses["l1"] = torch.tensor(0.0, device=pred.device)
 
         # MSE reconstruction loss
         if self.mse_weight > 0:
-            losses['mse'] = self.mse_loss(pred, target, mask)
+            losses["mse"] = self.mse_loss(pred, target, mask)
         else:
-            losses['mse'] = torch.tensor(0.0, device=pred.device)
+            losses["mse"] = torch.tensor(0.0, device=pred.device)
 
         # Multi-scale STFT loss
         if self.stft_weight > 0:
-            losses['stft'] = self.stft_loss(pred, target)
+            losses["stft"] = self.stft_loss(pred, target)
         else:
-            losses['stft'] = torch.tensor(0.0, device=pred.device)
+            losses["stft"] = torch.tensor(0.0, device=pred.device)
 
         # Edit consistency loss (preserve KEEP regions)
         if self.consistency_weight > 0:
-            losses['consistency'] = self.consistency_loss(pred, raw, edit_labels, mask)
+            losses["consistency"] = self.consistency_loss(pred, raw, edit_labels, mask)
         else:
-            losses['consistency'] = torch.tensor(0.0, device=pred.device)
+            losses["consistency"] = torch.tensor(0.0, device=pred.device)
+
+        # Label-conditioned loss (CUT->zero, KEEP->input)
+        if self.label_conditioned_weight > 0:
+            cut_loss, keep_loss = self.label_conditioned_loss(pred, raw, edit_labels, mask)
+            losses["cut_loss"] = cut_loss
+            losses["keep_loss"] = keep_loss
+        else:
+            losses["cut_loss"] = torch.tensor(0.0, device=pred.device)
+            losses["keep_loss"] = torch.tensor(0.0, device=pred.device)
+
+        # Label contrastive loss (CUT and KEEP should differ)
+        if self.label_contrastive_weight > 0:
+            losses["contrastive"] = self.label_contrastive_loss(pred, edit_labels)
+        else:
+            losses["contrastive"] = torch.tensor(0.0, device=pred.device)
 
         # Compute total loss
-        losses['total'] = (
-            self.l1_weight * losses['l1'] +
-            self.mse_weight * losses['mse'] +
-            self.stft_weight * losses['stft'] +
-            self.consistency_weight * losses['consistency']
+        losses["total"] = (
+            self.l1_weight * losses["l1"] +
+            self.mse_weight * losses["mse"] +
+            self.stft_weight * losses["stft"] +
+            self.consistency_weight * losses["consistency"] +
+            self.label_conditioned_weight * (losses["cut_loss"] + losses["keep_loss"]) +
+            self.label_contrastive_weight * losses["contrastive"]
         )
 
         return losses
@@ -102,6 +129,8 @@ class Phase1Loss(nn.Module):
         mse_weight: Optional[float] = None,
         stft_weight: Optional[float] = None,
         consistency_weight: Optional[float] = None,
+        label_conditioned_weight: Optional[float] = None,
+        label_contrastive_weight: Optional[float] = None,
     ):
         """Update loss weights during training (e.g., for curriculum)."""
         if l1_weight is not None:
@@ -112,6 +141,10 @@ class Phase1Loss(nn.Module):
             self.stft_weight = stft_weight
         if consistency_weight is not None:
             self.consistency_weight = consistency_weight
+        if label_conditioned_weight is not None:
+            self.label_conditioned_weight = label_conditioned_weight
+        if label_contrastive_weight is not None:
+            self.label_contrastive_weight = label_contrastive_weight
 
 
 class MultiScalePhase1Loss(nn.Module):
@@ -158,19 +191,19 @@ class MultiScalePhase1Loss(nn.Module):
         # Full scale loss
         full_losses = self.base_loss(pred_full, target, raw, edit_labels, mask)
         for k, v in full_losses.items():
-            losses[f'full_{k}'] = v
+            losses[f"full_{k}"] = v
 
         # Half scale loss (simplified - just L1)
-        losses['half_l1'] = self.base_loss.l1_loss(pred_half, target, mask)
+        losses["half_l1"] = self.base_loss.l1_loss(pred_half, target, mask)
 
         # Quarter scale loss
-        losses['quarter_l1'] = self.base_loss.l1_loss(pred_quarter, target, mask)
+        losses["quarter_l1"] = self.base_loss.l1_loss(pred_quarter, target, mask)
 
         # Combine
-        losses['total'] = (
-            self.scale_weights[0] * full_losses['total'] +
-            self.scale_weights[1] * losses['half_l1'] +
-            self.scale_weights[2] * losses['quarter_l1']
+        losses["total"] = (
+            self.scale_weights[0] * full_losses["total"] +
+            self.scale_weights[1] * losses["half_l1"] +
+            self.scale_weights[2] * losses["quarter_l1"]
         )
 
         return losses

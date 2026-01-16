@@ -2,6 +2,8 @@
 
 Provides common audio loading, mel spectrogram extraction, beat detection,
 and other audio analysis functions used by both rl_editor and super_editor.
+
+Updated to support BigVGAN-compatible mel extraction using torch.stft.
 """
 
 import logging
@@ -11,7 +13,9 @@ from typing import Dict, Optional, Tuple, Any
 
 import numpy as np
 import librosa
+from librosa.filters import mel as librosa_mel_fn
 import soundfile as sf
+import torch
 
 from .audio_config import AudioConfig, get_default_audio_config
 
@@ -228,6 +232,176 @@ def compute_mel_spectrogram_from_config(
         mel = mel.T  # (T, n_mels)
 
     return mel.astype(np.float32)
+
+
+# =============================================================================
+# BigVGAN-Compatible Mel Extraction (torch.stft based)
+# =============================================================================
+
+# Caches for mel basis and hann window
+_mel_basis_cache = {}
+_hann_window_cache = {}
+
+
+def compute_mel_spectrogram_bigvgan(
+    y: torch.Tensor,
+    n_fft: int = 2048,
+    num_mels: int = 128,
+    sampling_rate: int = 44100,
+    hop_size: int = 512,
+    win_size: int = 2048,
+    fmin: int = 0,
+    fmax: Optional[int] = None,
+    center: bool = False,
+) -> torch.Tensor:
+    """Compute mel spectrogram using BigVGAN's exact method.
+
+    This uses torch.stft and matches BigVGAN's preprocessing exactly,
+    ensuring compatibility with the pretrained vocoder.
+
+    Args:
+        y: Audio tensor (batch, samples) or (samples,), normalized to [-1, 1]
+        n_fft: FFT size
+        num_mels: Number of mel bins
+        sampling_rate: Sample rate
+        hop_size: Hop length
+        win_size: Window size
+        fmin: Minimum frequency
+        fmax: Maximum frequency (None = sr/2)
+        center: Whether to pad for centered frames
+
+    Returns:
+        mel: Log mel spectrogram (batch, num_mels, time) or (num_mels, time)
+    """
+    if y.dim() == 1:
+        y = y.unsqueeze(0)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+
+    device = y.device
+    key = f"{n_fft}_{num_mels}_{sampling_rate}_{hop_size}_{win_size}_{fmin}_{fmax}_{device}"
+
+    # Get or create mel basis and window
+    if key not in _mel_basis_cache:
+        mel = librosa_mel_fn(
+            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
+        )
+        _mel_basis_cache[key] = torch.from_numpy(mel).float().to(device)
+        _hann_window_cache[key] = torch.hann_window(win_size).to(device)
+
+    mel_basis = _mel_basis_cache[key]
+    hann_window = _hann_window_cache[key]
+
+    # Pad input (BigVGAN's padding scheme)
+    padding = (n_fft - hop_size) // 2
+    y = torch.nn.functional.pad(
+        y.unsqueeze(1), (padding, padding), mode="reflect"
+    ).squeeze(1)
+
+    # Compute STFT
+    spec = torch.stft(
+        y,
+        n_fft,
+        hop_length=hop_size,
+        win_length=win_size,
+        window=hann_window,
+        center=center,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=True,
+    )
+
+    # Get magnitude
+    spec = torch.sqrt(torch.view_as_real(spec).pow(2).sum(-1) + 1e-9)
+
+    # Apply mel filterbank
+    mel_spec = torch.matmul(mel_basis, spec)
+
+    # Log compression (BigVGAN's dynamic range compression)
+    mel_spec = torch.log(torch.clamp(mel_spec, min=1e-5))
+
+    if squeeze_output:
+        mel_spec = mel_spec.squeeze(0)
+
+    return mel_spec
+
+
+def compute_mel_spectrogram_bigvgan_from_file(
+    audio_path: str,
+    config: Optional[AudioConfig] = None,
+    normalize_volume: bool = True,
+    device: str = 'cpu',
+) -> Tuple[torch.Tensor, np.ndarray]:
+    """Extract BigVGAN-compatible mel spectrogram from audio file.
+
+    Args:
+        audio_path: Path to audio file
+        config: AudioConfig (uses defaults if None)
+        normalize_volume: Volume normalize to 0.95 (like BigVGAN training)
+        device: Device for tensor operations
+
+    Returns:
+        mel: Log mel spectrogram (num_mels, time) as torch tensor
+        audio: Audio waveform as numpy array
+    """
+    if config is None:
+        config = get_default_audio_config()
+
+    # Load audio using librosa (like BigVGAN)
+    y, sr = librosa.load(audio_path, sr=config.sample_rate, mono=True)
+
+    # Volume normalize (critical for BigVGAN!)
+    if normalize_volume:
+        y = librosa.util.normalize(y) * 0.95
+
+    # Convert to tensor
+    y_tensor = torch.FloatTensor(y).to(device)
+
+    # Compute mel
+    mel = compute_mel_spectrogram_bigvgan(
+        y_tensor,
+        n_fft=config.n_fft,
+        num_mels=config.n_mels,
+        sampling_rate=config.sample_rate,
+        hop_size=config.hop_length,
+        win_size=config.win_length,
+        fmin=int(config.fmin),
+        fmax=int(config.fmax) if config.fmax else None,
+    )
+
+    return mel, y
+
+
+# Normalization constants for BigVGAN mel
+BIGVGAN_MEL_MIN = -11.5  # Typical log(1e-5) minimum
+BIGVGAN_MEL_MAX = 2.5    # Typical maximum for normalized audio
+
+
+def normalize_mel_for_model(mel: torch.Tensor) -> torch.Tensor:
+    """Normalize BigVGAN mel to [0, 1] for our model.
+
+    Args:
+        mel: Log mel spectrogram from BigVGAN extraction
+
+    Returns:
+        Normalized mel in [0, 1] range
+    """
+    mel_norm = (mel - BIGVGAN_MEL_MIN) / (BIGVGAN_MEL_MAX - BIGVGAN_MEL_MIN)
+    return torch.clamp(mel_norm, 0, 1)
+
+
+def denormalize_mel_for_vocoder(mel: torch.Tensor) -> torch.Tensor:
+    """Denormalize mel from [0, 1] back to BigVGAN log scale.
+
+    Args:
+        mel: Normalized mel in [0, 1]
+
+    Returns:
+        Log mel for BigVGAN vocoder
+    """
+    return mel * (BIGVGAN_MEL_MAX - BIGVGAN_MEL_MIN) + BIGVGAN_MEL_MIN
 
 
 # =============================================================================

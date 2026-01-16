@@ -54,9 +54,15 @@ class Phase1Config:
     # Loss weights
     l1_weight: float = 1.0
     mse_weight: float = 0.0
-    stft_weight: float = 1.0
+    # DISABLED: STFT loss was incorrectly applied to mel values (not audio waveforms)
+    # Computing STFT on flattened mel is mathematically nonsensical
+    stft_weight: float = 0.0
     consistency_weight: float = 0.5
     perceptual_weight: float = 0.0  # Optional: feature-based loss
+
+    # Label-enforcing losses (critical for making model use labels!)
+    label_conditioned_weight: float = 2.0  # CUT->zero, KEEP->input
+    label_contrastive_weight: float = 0.5  # CUT and KEEP should differ
 
     # Multi-scale STFT params
     stft_fft_sizes: List[int] = field(default_factory=lambda: [512, 1024, 2048])

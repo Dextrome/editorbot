@@ -24,7 +24,7 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from ..config import Phase2Config, EditLabel
-from ..models import ReconstructionModel, ActorCritic
+from ..models import DSPEditor, ActorCritic
 from ..data import PairedMelDataset, collate_fn
 
 # Import from shared module
@@ -37,16 +37,12 @@ class RewardComputer:
 
     def __init__(
         self,
-        recon_model: ReconstructionModel,
+        dsp_editor: DSPEditor,
         config: Phase2Config,
     ):
-        self.recon_model = recon_model
+        self.dsp_editor = dsp_editor
         self.config = config
-
-        # Freeze reconstruction model
-        self.recon_model.eval()
-        for param in self.recon_model.parameters():
-            param.requires_grad = False
+        # DSPEditor has no trainable parameters - always in eval mode
 
     @torch.no_grad()
     def compute_reward(
@@ -73,7 +69,7 @@ class RewardComputer:
         B = raw_mel.size(0)
 
         # 1. Reconstruction quality reward
-        pred_mel = self.recon_model(raw_mel, pred_labels, mask)
+        pred_mel = self.dsp_editor(raw_mel, pred_labels, mask)
 
         # L1 difference (lower is better)
         if mask is not None:
@@ -184,7 +180,6 @@ class Phase2Trainer:
     def __init__(
         self,
         config: Phase2Config,
-        recon_model_path: str,
         data_dir: str,
         save_dir: str,
         resume_from: Optional[str] = None,
@@ -192,7 +187,6 @@ class Phase2Trainer:
         """
         Args:
             config: Phase2Config
-            recon_model_path: Path to trained Phase 1 model
             data_dir: Directory with preprocessed data
             save_dir: Directory for checkpoints
             resume_from: Optional checkpoint to resume from
@@ -209,13 +203,9 @@ class Phase2Trainer:
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
 
-        # Load frozen reconstruction model
-        print(f"Loading reconstruction model from {recon_model_path}")
-        self.recon_model = ReconstructionModel.from_checkpoint(recon_model_path)
-        self.recon_model = self.recon_model.to(self.device)
-        self.recon_model.eval()
-        for param in self.recon_model.parameters():
-            param.requires_grad = False
+        # DSP Editor - no neural network, just deterministic effects
+        print("Using DSP Editor (no neural network, deterministic effects)")
+        self.dsp_editor = DSPEditor().to(self.device)
 
         # Actor-critic network
         self.ac = ActorCritic(config).to(self.device)
@@ -228,7 +218,7 @@ class Phase2Trainer:
         )
 
         # Reward computer
-        self.reward_computer = RewardComputer(self.recon_model, config)
+        self.reward_computer = RewardComputer(self.dsp_editor, config)
 
         # Logging with TrainingLogger (from shared module)
         self.logger = TrainingLogger(
@@ -550,7 +540,6 @@ class Phase2Trainer:
 
 
 def train_phase2(
-    recon_model_path: str,
     data_dir: str,
     save_dir: str,
     config: Optional[Phase2Config] = None,
@@ -559,7 +548,6 @@ def train_phase2(
     """Convenience function to train Phase 2.
 
     Args:
-        recon_model_path: Path to trained Phase 1 model
         data_dir: Directory with preprocessed data
         save_dir: Directory for checkpoints
         config: Optional config
@@ -570,7 +558,6 @@ def train_phase2(
 
     trainer = Phase2Trainer(
         config=config,
-        recon_model_path=recon_model_path,
         data_dir=data_dir,
         save_dir=save_dir,
         resume_from=resume_from,

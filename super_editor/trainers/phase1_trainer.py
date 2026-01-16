@@ -156,7 +156,8 @@ class Phase1Trainer:
         self.model.train()
 
         total_losses = {
-            'total': 0, 'l1': 0, 'mse': 0, 'stft': 0, 'consistency': 0
+            'total': 0, 'l1': 0, 'mse': 0, 'stft': 0, 'consistency': 0,
+            'cut_loss': 0, 'keep_loss': 0, 'contrastive': 0
         }
         n_batches = 0
 
@@ -216,7 +217,8 @@ class Phase1Trainer:
         self.model.eval()
 
         total_losses = {
-            'total': 0, 'l1': 0, 'mse': 0, 'stft': 0, 'consistency': 0
+            'total': 0, 'l1': 0, 'mse': 0, 'stft': 0, 'consistency': 0,
+            'cut_loss': 0, 'keep_loss': 0, 'contrastive': 0
         }
         n_batches = 0
 

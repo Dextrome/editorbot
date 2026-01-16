@@ -1,6 +1,9 @@
 """Full inference pipeline for Super Editor.
 
 End-to-end: audio file -> edited audio file
+
+Updated for BigVGAN v2 compatibility - uses torch.stft based mel extraction
+that matches BigVGAN's preprocessing exactly.
 """
 
 import os
@@ -11,7 +14,14 @@ from pathlib import Path
 
 from ..config import Phase1Config, Phase2Config, AudioConfig
 from ..models import ReconstructionModel, EditPredictor
-from ..data.preprocessing import MelExtractor
+from shared.audio_utils import (
+    compute_mel_spectrogram_bigvgan,
+    compute_mel_spectrogram_bigvgan_from_file,
+    normalize_mel_for_model,
+    denormalize_mel_for_vocoder,
+    BIGVGAN_MEL_MIN,
+    BIGVGAN_MEL_MAX,
+)
 
 
 class SuperEditorPipeline:
@@ -54,8 +64,9 @@ class SuperEditorPipeline:
             print(f"Loading edit predictor from {predictor_model_path}")
             self.predictor = self._load_predictor(predictor_model_path)
 
-        # Mel extractor
-        self.mel_extractor = MelExtractor(self.audio_config)
+        # BigVGAN vocoder (loaded lazily)
+        self._bigvgan = None
+        self._bigvgan_sr = None
 
     def _load_predictor(self, path: str) -> EditPredictor:
         """Load edit predictor model."""
@@ -174,6 +185,30 @@ class SuperEditorPipeline:
             'pred_mel': pred_mel,
         }
 
+    def extract_mel(self, audio_path: str) -> torch.Tensor:
+        """Extract BigVGAN-compatible mel spectrogram from audio file.
+
+        Args:
+            audio_path: Path to audio file
+
+        Returns:
+            mel: Log mel spectrogram (T, n_mels) normalized to [0, 1]
+        """
+        # Use BigVGAN-compatible extraction with volume normalization
+        mel_log, _ = compute_mel_spectrogram_bigvgan_from_file(
+            audio_path,
+            config=self.audio_config,
+            normalize_volume=True,
+            device='cpu',  # CPU for extraction, move to GPU for model
+        )
+        # mel_log is (n_mels, T), transpose to (T, n_mels)
+        mel_log = mel_log.T
+
+        # Normalize to [0, 1] for our model
+        mel_norm = normalize_mel_for_model(mel_log)
+
+        return mel_norm
+
     def process_audio(
         self,
         audio_path: str,
@@ -192,12 +227,13 @@ class SuperEditorPipeline:
         Returns:
             Dictionary with results including mel and optionally audio
         """
-        # Extract mel
-        raw_mel = self.mel_extractor.extract(audio_path)
+        # Extract mel using BigVGAN-compatible method
+        raw_mel = self.extract_mel(audio_path)  # (T, n_mels) tensor normalized [0, 1]
 
-        # Process
-        result = self.process(raw_mel, edit_labels, predict_labels)
-        result['raw_mel'] = raw_mel
+        # Process (expects numpy, convert tensor)
+        raw_mel_np = raw_mel.numpy() if isinstance(raw_mel, torch.Tensor) else raw_mel
+        result = self.process(raw_mel_np, edit_labels, predict_labels)
+        result['raw_mel'] = raw_mel_np
 
         # Convert to audio if output path specified
         if output_path is not None:
@@ -208,23 +244,103 @@ class SuperEditorPipeline:
 
         return result
 
-    def mel_to_audio(self, mel: np.ndarray, normalize_volume: bool = True) -> np.ndarray:
-        """Convert mel spectrogram to audio using Griffin-Lim.
+    def _load_bigvgan(self):
+        """Load BigVGAN vocoder.
+
+        NOTE: Fine-tuning on small music dataset caused weight collapse (all gain
+        parameters became near-identical), producing buzz. Using pretrained model
+        instead, which was trained on large diverse dataset and works well for music.
+        """
+        if hasattr(self, '_bigvgan') and self._bigvgan is not None:
+            return self._bigvgan
+
+        import sys
+        import json
+
+        # Add BigVGAN to path
+        bigvgan_path = os.path.join(os.path.dirname(__file__), '..', '..', 'vocoder', 'BigVGAN')
+        if bigvgan_path not in sys.path:
+            sys.path.insert(0, bigvgan_path)
+
+        try:
+            from bigvgan import BigVGAN
+            from env import AttrDict
+
+            # Use pretrained BigVGAN v2 (44kHz, 128 band, 512x)
+            # Fine-tuned model had weight collapse issue - weights collapsed to
+            # near-identical values causing buzz. Pretrained works better.
+            pretrained_dir = os.path.expanduser(
+                "~/.cache/huggingface/hub/models--nvidia--bigvgan_v2_44khz_128band_512x/"
+                "snapshots/95a9d1dcb12906c03edd938d77b9333d6ded7dfb"
+            )
+
+            if os.path.exists(pretrained_dir):
+                model_dir = pretrained_dir
+                checkpoint_file = 'bigvgan_generator.pt'
+                print('Using pretrained BigVGAN v2 vocoder')
+            else:
+                print('BigVGAN model not found, falling back to Griffin-Lim')
+                return None
+
+            # Load config and model
+            with open(os.path.join(model_dir, 'config.json')) as f:
+                config = AttrDict(json.load(f))
+
+            model = BigVGAN(config)
+
+            # Load checkpoint
+            checkpoint_path = os.path.join(model_dir, checkpoint_file)
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+            if 'generator' in state_dict:
+                model.load_state_dict(state_dict['generator'])
+            else:
+                model.load_state_dict(state_dict)
+
+            model = model.to(self.device).eval()
+            model.remove_weight_norm()
+
+            self._bigvgan = model
+            self._bigvgan_sr = config.sampling_rate
+            print(f'BigVGAN vocoder loaded!')
+            return model
+        except Exception as e:
+            print(f'Failed to load BigVGAN: {e}, falling back to Griffin-Lim')
+            return None
+
+    def mel_to_audio(self, mel: np.ndarray, normalize_volume: bool = True, use_bigvgan: bool = True) -> np.ndarray:
+        """Convert mel spectrogram to audio.
 
         Args:
             mel: Mel spectrogram (T, n_mels) normalized to [0, 1]
             normalize_volume: Whether to normalize output volume
+            use_bigvgan: Use BigVGAN vocoder (default) or Griffin-Lim fallback
 
         Returns:
             audio: Audio waveform
         """
+        # Clip to valid range and denormalize to BigVGAN log scale
+        mel = np.clip(mel, 0, 1)
+        mel_tensor = torch.from_numpy(mel).float()
+        mel_log = denormalize_mel_for_vocoder(mel_tensor).numpy()  # [0,1] -> [-11.5, 2.5]
+
+        # Try BigVGAN first
+        if use_bigvgan:
+            bigvgan = self._load_bigvgan()
+            if bigvgan is not None:
+                # mel_log is already in BigVGAN's expected range [-11.5, 2.5]
+                mel_input = torch.FloatTensor(mel_log.T).unsqueeze(0).to(self.device)  # (1, n_mels, T)
+                with torch.no_grad():
+                    audio = bigvgan(mel_input).squeeze().cpu().numpy()
+
+                if normalize_volume and np.abs(audio).max() > 0:
+                    audio = audio / np.abs(audio).max() * 0.9
+                return audio
+
+        # Griffin-Lim fallback
         import librosa
+        mel_power = np.exp(mel_log)  # log -> power
 
-        # Denormalize: [0, 1] -> [-60, 0] dB (calibrated for best quality)
-        mel_db = mel * 60 - 60
-        mel_power = librosa.db_to_power(mel_db)
-
-        # Griffin-Lim with more iterations for better quality
         audio = librosa.feature.inverse.mel_to_audio(
             mel_power.T,  # librosa expects (n_mels, T)
             sr=self.audio_config.sample_rate,
@@ -233,10 +349,9 @@ class SuperEditorPipeline:
             win_length=self.audio_config.win_length,
             fmin=self.audio_config.fmin,
             fmax=self.audio_config.fmax,
-            n_iter=64,  # More iterations for better phase estimation
+            n_iter=64,
         )
 
-        # Normalize volume to prevent clipping
         if normalize_volume and np.abs(audio).max() > 0:
             audio = audio / np.abs(audio).max() * 0.9
 

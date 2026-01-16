@@ -269,3 +269,90 @@ class LogMagnitudeLoss(nn.Module):
         log_target = torch.log(torch.abs(target_stft) + 1e-8)
 
         return F.l1_loss(log_pred, log_target)
+
+
+class LabelConditionedLoss(nn.Module):
+    """Loss that enforces label-dependent behavior.
+
+    - CUT (0): Output should be silent (zero)
+    - KEEP (1): Output should match input (pass-through)
+
+    This forces the model to actually use the labels!
+    """
+
+    def __init__(self, cut_weight: float = 1.0, keep_weight: float = 1.0):
+        super().__init__()
+        self.cut_weight = cut_weight
+        self.keep_weight = keep_weight
+
+    def forward(
+        self,
+        pred: torch.Tensor,       # (B, T, n_mels)
+        raw_mel: torch.Tensor,    # (B, T, n_mels) - original input
+        edit_labels: torch.Tensor,  # (B, T) - 0=CUT, 1=KEEP
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            cut_loss: L1 loss pushing CUT frames toward zero
+            keep_loss: L1 loss keeping KEEP frames same as input
+        """
+        B, T, M = pred.shape
+
+        # Create label masks
+        cut_mask = (edit_labels == 0).unsqueeze(-1).float()  # (B, T, 1)
+        keep_mask = (edit_labels == 1).unsqueeze(-1).float()  # (B, T, 1)
+
+        if mask is not None:
+            valid_mask = mask.unsqueeze(-1).float()
+            cut_mask = cut_mask * valid_mask
+            keep_mask = keep_mask * valid_mask
+
+        # CUT loss: output should be zero for CUT frames
+        cut_loss = (torch.abs(pred) * cut_mask).sum() / (cut_mask.sum() * M + 1e-8)
+
+        # KEEP loss: output should match input for KEEP frames
+        keep_diff = torch.abs(pred - raw_mel) * keep_mask
+        keep_loss = keep_diff.sum() / (keep_mask.sum() * M + 1e-8)
+
+        return self.cut_weight * cut_loss, self.keep_weight * keep_loss
+
+
+class LabelContrastiveLoss(nn.Module):
+    """Contrastive loss ensuring CUT and KEEP outputs are different.
+
+    Pushes CUT frame outputs to be dissimilar from KEEP frame outputs.
+    """
+
+    def __init__(self, margin: float = 0.5):
+        super().__init__()
+        self.margin = margin
+
+    def forward(
+        self,
+        pred: torch.Tensor,       # (B, T, n_mels)
+        edit_labels: torch.Tensor,  # (B, T)
+    ) -> torch.Tensor:
+        """
+        Encourages CUT outputs to be at least `margin` different from KEEP outputs.
+        """
+        B, T, M = pred.shape
+
+        # Compute mean output for CUT and KEEP frames per batch
+        cut_mask = (edit_labels == 0).unsqueeze(-1).float()
+        keep_mask = (edit_labels == 1).unsqueeze(-1).float()
+
+        # Mean mel for CUT and KEEP frames
+        cut_sum = (pred * cut_mask).sum(dim=1)  # (B, M)
+        cut_count = cut_mask.sum(dim=1) + 1e-8  # (B, 1)
+        cut_mean = cut_sum / cut_count
+
+        keep_sum = (pred * keep_mask).sum(dim=1)
+        keep_count = keep_mask.sum(dim=1) + 1e-8
+        keep_mean = keep_sum / keep_count
+
+        # Contrastive: difference should be at least margin
+        diff = torch.abs(cut_mean - keep_mean).mean(dim=-1)  # (B,)
+        loss = F.relu(self.margin - diff).mean()
+
+        return loss
