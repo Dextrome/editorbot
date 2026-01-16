@@ -50,6 +50,7 @@ Pointer Sequence (B, T_edit)
 
 ### Core
 - **Pointer-based output**: Model points to frames rather than generating them
+- **Hierarchical pointers**: Coarse-to-fine prediction (bar → beat → frame)
 - **STOP token**: Handles variable-length output sequences
 - **Length prediction**: Predicts output length for planning
 
@@ -210,9 +211,55 @@ pointer_network/
 | Edit Labels + Reconstruction | Interpretable | Two-stage complexity |
 | RL (PPO) | Optimizes directly | Sample inefficient |
 
+## Hierarchical Pointers (NEW)
+
+The model now supports **coarse-to-fine hierarchical pointer prediction**:
+
+```
+Bar Level:   [Bar 0] [Bar 1] [Bar 2] ...     (n_bars = T_frames / 172)
+              ↓
+Beat Level:  [Beat 0-3 within bar] ...       (n_beats = T_frames / 43)
+              ↓
+Frame Level: [Frames 0-42 within beat] ...   (T_frames)
+```
+
+### How It Works
+
+1. **Training**: Three parallel losses computed from frame-level targets
+   - Bar loss: `target_bar = frame_pointer // frames_per_bar`
+   - Beat loss: `target_beat = frame_pointer // frames_per_beat`
+   - Frame loss: Original frame pointer prediction
+
+2. **Generation**: Two modes available
+   - `generate()`: Standard frame-level prediction
+   - `generate_hierarchical(coarse_to_fine=True)`:
+     - Sample bar first
+     - Sample beat constrained to selected bar
+     - Sample frame constrained to selected beat
+
+### Benefits
+
+- **More structured edits**: Respects musical boundaries (bars, beats)
+- **Better long-range coherence**: Coarse predictions guide fine details
+- **Reduced error accumulation**: Hierarchical constraint prevents drift
+- **Interpretable**: Can inspect bar/beat decisions separately
+
+### Usage
+
+```python
+# Standard generation
+result = model.generate(raw_mel)
+
+# Hierarchical coarse-to-fine generation
+result = model.generate_hierarchical(raw_mel, coarse_to_fine=True)
+print(result['bar_indices'])   # Which bars were selected
+print(result['beat_indices'])  # Which beats within bars
+print(result['pointers'])      # Final frame pointers
+```
+
 ## Future Improvements
 
-- [ ] Hierarchical pointers (bar → beat → frame)
+- [x] Hierarchical pointers (bar → beat → frame) ✅ IMPLEMENTED
 - [ ] Edit operations format (COPY, LOOP, etc.)
 - [ ] Style conditioning from reference tracks
 - [ ] RL fine-tuning with audio quality rewards

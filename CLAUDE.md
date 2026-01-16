@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-RL-based music editor that learns to automatically edit raw music recordings into polished tracks. The system supports **two training paradigms**:
+ML-based music editor that learns to automatically edit raw music recordings into polished tracks. The system supports **three training paradigms**:
 
 1. **Supervised Mel Reconstruction** - Direct reconstruction of edited audio (faster, simpler)
 2. **Behavioral Cloning + PPO** - Sequential action prediction with reinforcement learning
+3. **Pointer Network** - Frame-level alignment that preserves audio quality (current focus)
 
 **Stack**: Python 3.10+, PyTorch, librosa, NATTEN (neighborhood attention), Demucs (stem separation), Gymnasium
 
@@ -51,6 +52,33 @@ The factored 3-head action space (20×5×5 = 500 combinations) makes pure RL exp
 - Faster convergence than pure exploration
 - Prevents entropy collapse to uniform distributions
 
+### Approach 3: Pointer Network (Current Focus)
+
+Instead of generating audio, the pointer network **points to frames** in the original raw audio to construct the edit. For each output frame, it predicts which raw frame to copy.
+
+```
+Raw Mel (T_raw frames) → Encoder → Pointer Decoder → Pointer Sequence (T_edit indices)
+```
+
+**Key Insight**: Editing is mostly rearrangement (cuts, loops, reordering) not generation. By copying frames from the original, we preserve 100% audio quality.
+
+**Advantages:**
+- **Perfect quality** - Copies original frames, no generation artifacts
+- **Learns edit patterns** - Cuts, loops, reordering from examples
+- **Variable output length** - STOP token handles different edit lengths
+- **Style diversity** - VAE latent enables multiple valid edits
+
+**Architecture:**
+- Multi-scale encoder (frame/beat/bar levels)
+- Music-aware positional encoding
+- Hierarchical decoder with sparse attention
+- Pointer head + STOP prediction
+
+**Data Pipeline:**
+1. Align raw ↔ edited audio pairs via cross-correlation
+2. Generate pointer sequences mapping each edit frame → raw frame
+3. Train pointer network to predict these sequences
+
 ## Commands
 
 ```bash
@@ -78,6 +106,17 @@ python -m rl_editor.infer "input.wav" --checkpoint "models/v1/best.pt" --output 
 
 # === Tests ===
 pytest rl_editor/tests/
+
+# === Pointer Network ===
+# Generate pointer sequences (aligns raw ↔ edited audio frame-by-frame)
+python -m pointer_network.generate_pointer_sequences
+
+# Train pointer network
+python -m pointer_network.trainers.pointer_trainer \
+    --cache-dir training_data/super_editor_cache \
+    --pointer-dir training_data/pointer_sequences \
+    --save-dir models/pointer_network \
+    --epochs 100
 ```
 
 ## Architecture
@@ -123,6 +162,7 @@ The system uses a factored action space instead of 500 discrete actions:
 | `features.py` | 121-dim beat features (spectral, MFCCs, chroma, stems) |
 | `state.py` | StateRepresentation (861-dim observation from beat context) |
 | `auxiliary_tasks.py` | Multi-task learning (tempo, energy, phrase, mel reconstruction) |
+| `pointer_network/` | Frame-level pointer model for quality-preserving edits |
 
 ## Key Metrics to Monitor (TensorBoard)
 
@@ -163,18 +203,38 @@ Inspired by FaceSwap's multi-scale perceptual losses:
 
 ```
 training_data/
-├── input/           # Raw audio (*_raw.wav)
-├── desired_output/  # Human-edited versions (*_edit.wav)
-└── reference/       # Additional finished tracks (optional)
+├── input/              # Raw audio (*_raw.wav)
+├── desired_output/     # Human-edited versions (*_edit.wav)
+├── reference/          # Additional finished tracks (optional)
+└── pointer_sequences/  # Generated pointer sequences for pointer network
 
 editorbot/
-├── rl_editor/
-│   ├── cache/       # Cached features and mel spectrograms
+├── rl_editor/          # RL-based editor (BC + PPO)
+│   ├── cache/          # Cached features and mel spectrograms
 │   └── ...
-├── bc_rich.npz      # BC dataset from infer_rich_bc_labels
-├── bc_augmented.npz # BC dataset with synthetic augmentation
-├── models/          # Saved checkpoints
-└── logs/            # TensorBoard logs
+├── super_editor/       # Supervised mel reconstruction (Phase 1 & 2)
+│   └── _train_*.py     # Training experiment scripts
+├── audio_slicer/       # FaceSwap-style audio segmentation
+│   └── _train_*.py     # Training/test scripts
+├── mel_to_mel_editor/  # Direct mel transformation
+│   └── _train_*.py     # Training/test scripts
+├── pointer_network/    # Pointer network for frame alignment
+│   └── generate_pointer_sequences.py  # Generate training data
+├── scripts/            # Utility scripts
+│   ├── generate_synthetic_pairs.py    # Create synthetic training pairs
+│   ├── precache_labels.py             # Pre-cache edit labels
+│   ├── precache_stems.py              # Pre-cache Demucs stems
+│   ├── regenerate_cache.py            # Rebuild super_editor cache
+│   ├── train_super_editor.py          # Main super_editor training
+│   ├── infer_rich_bc_labels.py        # Generate BC dataset
+│   ├── augment_bc_with_synthetic.py   # Augment BC with rare actions
+│   └── find_lr.py                     # Learning rate finder
+├── models/             # Saved checkpoints
+├── logs/               # TensorBoard logs
+├── test_audio/         # Test output audio files (gitignored)
+├── lr_finder/          # Learning rate finder outputs (gitignored)
+├── bc_rich.npz         # BC dataset from infer_rich_bc_labels
+└── bc_augmented.npz    # BC dataset with synthetic augmentation
 ```
 
 ## Development Guidelines

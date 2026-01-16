@@ -234,23 +234,19 @@ class PointerNetworkTrainer:
         # Move to device
         raw_mel = batch['raw_mel'].to(self.device)
         target_pointers = batch['target_pointers'].to(self.device)
-        raw_padding_mask = batch['raw_padding_mask'].to(self.device)
-        tgt_padding_mask = batch['tgt_padding_mask'].to(self.device)
 
-        # Forward pass
+        # Forward pass - model computes all losses internally
         outputs = self.model(
             raw_mel=raw_mel,
             target_pointers=target_pointers,
-            raw_padding_mask=raw_padding_mask,
-            tgt_padding_mask=tgt_padding_mask,
         )
 
-        # Compute losses
-        losses = self.compute_losses(outputs, target_pointers, tgt_padding_mask)
+        # Use model's computed loss directly
+        total_loss = outputs['loss']
 
         # Backward pass
         self.optimizer.zero_grad()
-        losses['total_loss'].backward()
+        total_loss.backward()
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
@@ -261,46 +257,63 @@ class PointerNetworkTrainer:
         self.optimizer.step()
         self.global_step += 1
 
-        return {k: v.item() for k, v in losses.items()}
+        # Return all losses for logging (including hierarchical)
+        loss_dict = {
+            'total_loss': outputs['loss'].item(),
+            'pointer_loss': outputs['pointer_loss'].item(),
+            'bar_pointer_loss': outputs.get('bar_pointer_loss', torch.tensor(0.0)).item(),
+            'beat_pointer_loss': outputs.get('beat_pointer_loss', torch.tensor(0.0)).item(),
+            'stop_loss': outputs['stop_loss'].item(),
+            'kl_loss': outputs['kl_loss'].item(),
+            'length_loss': outputs['length_loss'].item(),
+            'structure_loss': outputs['structure_loss'].item(),
+        }
+        return loss_dict
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """Run validation."""
         self.model.eval()
 
-        total_losses = {}
-        total_metrics = {}
+        total_losses = {
+            'loss': 0.0, 'pointer_loss': 0.0, 'bar_pointer_loss': 0.0,
+            'beat_pointer_loss': 0.0, 'stop_loss': 0.0,
+        }
+        total_correct = 0
+        total_frames = 0
         n_batches = 0
 
         for batch in val_loader:
             raw_mel = batch['raw_mel'].to(self.device)
             target_pointers = batch['target_pointers'].to(self.device)
-            raw_padding_mask = batch['raw_padding_mask'].to(self.device)
-            tgt_padding_mask = batch['tgt_padding_mask'].to(self.device)
 
             outputs = self.model(
                 raw_mel=raw_mel,
                 target_pointers=target_pointers,
-                raw_padding_mask=raw_padding_mask,
-                tgt_padding_mask=tgt_padding_mask,
+                use_vae=False,  # Deterministic for validation
             )
 
-            losses = self.compute_losses(outputs, target_pointers, tgt_padding_mask)
-            metrics = self.compute_metrics(outputs, target_pointers, tgt_padding_mask)
+            # Accumulate losses
+            total_losses['loss'] += outputs['loss'].item()
+            total_losses['pointer_loss'] += outputs['pointer_loss'].item()
+            total_losses['bar_pointer_loss'] += outputs.get('bar_pointer_loss', torch.tensor(0.0)).item()
+            total_losses['beat_pointer_loss'] += outputs.get('beat_pointer_loss', torch.tensor(0.0)).item()
+            total_losses['stop_loss'] += outputs['stop_loss'].item()
 
-            # Accumulate
-            for k, v in losses.items():
-                total_losses[k] = total_losses.get(k, 0) + v.item()
-            for k, v in metrics.items():
-                total_metrics[k] = total_metrics.get(k, 0) + v
+            # Compute accuracy (frame-level)
+            predictions = outputs['pointer_logits'].argmax(dim=-1)
+            stop_mask = target_pointers == STOP_TOKEN
+            correct = (predictions == target_pointers) & (~stop_mask)
+            total_correct += correct.sum().item()
+            total_frames += (~stop_mask).sum().item()
 
             n_batches += 1
 
         # Average
         avg_losses = {f'val_{k}': v / n_batches for k, v in total_losses.items()}
-        avg_metrics = {f'val_{k}': v / n_batches for k, v in total_metrics.items()}
+        avg_losses['val_accuracy'] = total_correct / max(total_frames, 1)
 
-        return {**avg_losses, **avg_metrics}
+        return avg_losses
 
     def save_checkpoint(self, path: Optional[Path] = None, is_best: bool = False):
         """Save model checkpoint."""
@@ -362,10 +375,12 @@ class PointerNetworkTrainer:
                 for k, v in losses.items():
                     epoch_losses[k] = epoch_losses.get(k, 0) + v
 
-                # Update progress bar
+                # Update progress bar with hierarchical losses
                 pbar.set_postfix({
                     'loss': f"{losses['total_loss']:.4f}",
-                    'ptr': f"{losses['pointer_loss']:.4f}",
+                    'bar': f"{losses['bar_pointer_loss']:.4f}",
+                    'beat': f"{losses['beat_pointer_loss']:.4f}",
+                    'frame': f"{losses['pointer_loss']:.4f}",
                 })
 
                 # Log periodically

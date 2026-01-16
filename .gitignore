@@ -108,6 +108,8 @@ tmp/
 
 # Output
 output/
+test_audio/
+lr_finder/
 
 # OS
 .DS_Store
