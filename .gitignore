@@ -69,7 +69,7 @@ dmypy.json
 *.m3u
 
 # Data folder (samples, training data, etc.)
-data/
+/data/
 cache/
 rl_editor/cache/
 feature_cache/
@@ -99,7 +99,7 @@ desktop.ini
 *.pt
 *.pth
 *.onnx
-models/
+/models/
 
 # Temporary files
 temp/
