@@ -73,6 +73,12 @@ data/
 cache/
 rl_editor/cache/
 feature_cache/
+training_data/
+
+# Pointer sequence data (generated, not source)
+*_pointers.npy
+*_info.json
+*_alignment.png
 
 # Large binary files
 *.npz
