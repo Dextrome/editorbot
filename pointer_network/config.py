@@ -57,7 +57,7 @@ class TrainConfig:
     model: PointerNetworkConfig = field(default_factory=PointerNetworkConfig)
 
     # Data paths
-    cache_dir: str = "F:/editorbot/training_data/super_editor_cache"
+    cache_dir: str = "F:/editorbot/cache"
     pointer_dir: str = "F:/editorbot/training_data/pointer_sequences"
     save_dir: str = "F:/editorbot/models/pointer_network"
 
@@ -66,6 +66,15 @@ class TrainConfig:
     epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
+
+    # Performance optimizations
+    num_workers: int = 4  # DataLoader workers (0 for single-process)
+    prefetch_factor: int = 2  # Batches to prefetch per worker
+    use_amp: bool = True  # Automatic mixed precision
+    use_compile: bool = True  # torch.compile (PyTorch 2.0+)
+    gradient_accumulation_steps: int = 1  # Accumulate gradients
+    pin_memory: bool = True  # Pin memory for faster GPU transfer
+    persistent_workers: bool = True  # Keep workers alive between epochs
 
     # Logging
     log_every: int = 10

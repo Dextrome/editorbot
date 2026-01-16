@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 from typing import Optional, Dict, List, Tuple
 import random
+from functools import lru_cache
 
 
 class PointerDataset(Dataset):
@@ -24,6 +25,8 @@ class PointerDataset(Dataset):
         max_edit_frames: int = 65536,
         chunk_size: Optional[int] = None,
         chunk_overlap: int = 64,
+        use_mmap: bool = True,
+        preload_pointers: bool = True,
     ):
         """
         Args:
@@ -33,6 +36,8 @@ class PointerDataset(Dataset):
             max_edit_frames: maximum edited frames (output length)
             chunk_size: if set, split long sequences into chunks
             chunk_overlap: overlap between chunks
+            use_mmap: use memory-mapped file loading (faster, lower memory)
+            preload_pointers: preload all pointer sequences into memory
         """
         self.cache_dir = Path(cache_dir)
         self.pointer_dir = Path(pointer_dir)
@@ -40,10 +45,19 @@ class PointerDataset(Dataset):
         self.max_edit_frames = max_edit_frames
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.use_mmap = use_mmap
+        self.preload_pointers = preload_pointers
 
         # Find all pointer files
         self.samples = self._find_samples()
         print(f"Found {len(self.samples)} samples")
+
+        # Preload pointer sequences (they're small)
+        if self.preload_pointers:
+            self._preloaded_pointers = {}
+            for sample in self.samples:
+                self._preloaded_pointers[sample['name']] = np.load(sample['pointer_file'])
+            print(f"Preloaded {len(self._preloaded_pointers)} pointer sequences")
 
     def _find_samples(self) -> List[Dict]:
         """Find all valid training samples."""
@@ -61,16 +75,28 @@ class PointerDataset(Dataset):
             with open(info_file) as f:
                 info = json.load(f)
 
-            # Find raw mel file in cache
+            # Find raw mel file in cache - support both .npy and .npz formats
             raw_path = Path(info['raw_path'])
-            raw_mel_file = self.cache_dir / f"{raw_path.stem}_mel.npy"
+            raw_mel_file = None
 
-            if not raw_mel_file.exists():
-                # Try without _raw suffix
-                raw_mel_file = self.cache_dir / f"{base_name}_raw_mel.npy"
+            # Try different possible cache file patterns
+            possible_patterns = [
+                # .npz format (super_editor_cache style): {stem}.npz with 'mel' key
+                self.cache_dir / "features" / f"{raw_path.stem}.npz",
+                self.cache_dir / f"{raw_path.stem}.npz",
+                # .npy format: {stem}_mel.npy
+                self.cache_dir / f"{raw_path.stem}_mel.npy",
+                self.cache_dir / f"{base_name}_raw_mel.npy",
+            ]
 
-            if not raw_mel_file.exists():
+            for pattern in possible_patterns:
+                if pattern.exists():
+                    raw_mel_file = pattern
+                    break
+
+            if raw_mel_file is None:
                 print(f"Warning: mel file not found for {base_name}")
+                print(f"  Tried: {[str(p) for p in possible_patterns]}")
                 continue
 
             samples.append({
@@ -101,17 +127,46 @@ class PointerDataset(Dataset):
         else:
             return self._get_chunk(idx)
 
+    def _load_mel(self, mel_file: Path) -> np.ndarray:
+        """Load mel spectrogram with optional memory mapping.
+
+        Supports both:
+        - .npy files: direct mel array
+        - .npz files: archive with 'mel' key (super_editor_cache format)
+        """
+        if mel_file.suffix == '.npz':
+            # .npz format - load archive and extract 'mel' key
+            # mmap not supported for .npz, but file is cached anyway
+            data = np.load(mel_file)
+            raw_mel = data['mel']
+        else:
+            # .npy format - direct array
+            if self.use_mmap:
+                raw_mel = np.load(mel_file, mmap_mode='r')
+            else:
+                raw_mel = np.load(mel_file)
+
+        # Ensure shape is (n_mels, time) for consistency
+        if raw_mel.shape[0] != 128:  # Assume n_mels=128
+            # Data is (time, n_mels) - transpose to (n_mels, time)
+            raw_mel = np.array(raw_mel.T)
+        return raw_mel
+
+    def _load_pointers(self, sample: Dict) -> np.ndarray:
+        """Load pointers, using preloaded cache if available."""
+        if self.preload_pointers:
+            return self._preloaded_pointers[sample['name']].copy()
+        return np.load(sample['pointer_file'])
+
     def _get_full_sample(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a full sample (may be truncated if too long)."""
         sample = self.samples[idx]
 
-        # Load raw mel
-        raw_mel = np.load(sample['raw_mel_file'])  # (n_mels, time) or (time, n_mels)
-        if raw_mel.shape[0] != 128:  # Assume n_mels=128
-            raw_mel = raw_mel.T  # Transpose if needed
+        # Load raw mel (memory-mapped for efficiency)
+        raw_mel = self._load_mel(sample['raw_mel_file'])
 
-        # Load pointers
-        pointers = np.load(sample['pointer_file'])
+        # Load pointers (from preloaded cache or disk)
+        pointers = self._load_pointers(sample)
 
         # Truncate if needed
         if raw_mel.shape[1] > self.max_raw_frames:
@@ -147,13 +202,11 @@ class PointerDataset(Dataset):
 
     def _get_chunk_from_sample(self, sample: Dict, chunk_idx: int) -> Dict[str, torch.Tensor]:
         """Get a specific chunk from a sample."""
-        # Load raw mel
-        raw_mel = np.load(sample['raw_mel_file'])
-        if raw_mel.shape[0] != 128:
-            raw_mel = raw_mel.T
+        # Load raw mel (memory-mapped for efficiency)
+        raw_mel = self._load_mel(sample['raw_mel_file'])
 
-        # Load pointers
-        pointers = np.load(sample['pointer_file'])
+        # Load pointers (from preloaded cache or disk)
+        pointers = self._load_pointers(sample)
 
         # Calculate chunk boundaries
         stride = self.chunk_size - self.chunk_overlap

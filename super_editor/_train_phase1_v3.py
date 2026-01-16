@@ -23,7 +23,7 @@ print("=" * 60)
 
 trainer = Phase1Trainer(
     config=config,
-    data_dir='F:/editorbot/training_data/super_editor_cache',
+    data_dir='F:/editorbot/cache',
     save_dir='F:/editorbot/models/phase1_v3_label_aware',
     resume_from=None,  # Fresh start with new architecture
 )

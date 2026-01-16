@@ -34,7 +34,7 @@ print("=" * 60)
 
 trainer = AnomalyTrainer(
     config=config,
-    cache_dir='F:/editorbot/training_data/super_editor_cache',
+    cache_dir='F:/editorbot/cache',
     save_dir='F:/editorbot/models/anomaly_detector_500',
 )
 

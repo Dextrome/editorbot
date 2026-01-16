@@ -105,7 +105,7 @@ if hasattr(torch, 'set_float32_matmul_precision'):
 
 trainer = Phase2Trainer(
     config=config,
-    data_dir='F:/editorbot/training_data/super_editor_cache',
+    data_dir='F:/editorbot/cache',
     save_dir='F:/editorbot/models/phase2_fixed',
 )
 

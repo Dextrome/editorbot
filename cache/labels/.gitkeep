@@ -1,0 +1,2 @@
+# This file ensures the cache/labels directory is tracked in git
+# Actual label files (.npy) are ignored

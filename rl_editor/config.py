@@ -212,9 +212,9 @@ class DataConfig:
     reference_subdir: str = "reference"
     test_subdir: str = "test_input"
     
-    # Caching - centralized in rl_editor/cache/
+    # Caching - centralized cache folder
     cache_features: bool = True
-    cache_dir: str = "./rl_editor/cache"
+    cache_dir: str = "F:/editorbot/cache"
     
     # DataLoader settings
     num_workers: int = 4

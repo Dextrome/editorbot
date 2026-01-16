@@ -1,7 +1,7 @@
 """Pre-extract and cache Demucs stems for all training audio files.
 
 Run this before training to avoid memory issues during training.
-Stems are cached in rl_editor/cache/stems/
+Stems are cached in cache/stems/
 """
 
 import argparse
@@ -22,7 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pre-cache Demucs stems for training data")
     parser.add_argument("--data_dir", type=str, default="./training_data",
                         help="Training data directory")
-    parser.add_argument("--cache_dir", type=str, default="./rl_editor/cache",
+    parser.add_argument("--cache_dir", type=str, default="./cache",
                         help="Cache directory")
     parser.add_argument("--sr", type=int, default=22050, help="Sample rate")
     

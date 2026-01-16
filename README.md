@@ -53,7 +53,7 @@ python -m pointer_network.generate_pointer_sequences
 
 # 2. Train the pointer network
 python -m pointer_network.trainers.pointer_trainer \
-    --cache-dir training_data/super_editor_cache \
+    --cache-dir cache \
     --pointer-dir training_data/pointer_sequences \
     --save-dir models/pointer_network \
     --epochs 100

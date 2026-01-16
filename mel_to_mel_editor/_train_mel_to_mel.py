@@ -50,7 +50,7 @@ torch.backends.cudnn.benchmark = True
 
 trainer = Trainer(
     config=config,
-    cache_dir='F:/editorbot/training_data/super_editor_cache',
+    cache_dir='F:/editorbot/cache',
     save_dir='F:/editorbot/models/mel_to_mel',
 )
 

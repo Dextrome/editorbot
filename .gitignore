@@ -70,7 +70,16 @@ dmypy.json
 
 # Data folder (samples, training data, etc.)
 /data/
-cache/
+# Cache folders - ignore contents but keep structure via .gitkeep
+/cache/**
+!/cache/
+!/cache/features/
+!/cache/labels/
+!/cache/stems/
+!/cache/mel/
+!/cache/full/
+!/cache/metadata/
+!/cache/**/.gitkeep
 rl_editor/cache/
 feature_cache/
 training_data/

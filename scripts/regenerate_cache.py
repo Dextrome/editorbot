@@ -8,7 +8,7 @@ from super_editor.data.preprocessing import process_audio_pair
 def main():
     input_dir = Path("training_data/input")
     output_dir_base = Path("training_data/desired_output")
-    cache_dir = Path("training_data/super_editor_cache")
+    cache_dir = Path("cache")
 
     config = AudioConfig()
 

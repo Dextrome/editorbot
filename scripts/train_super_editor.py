@@ -15,7 +15,7 @@ from super_editor.trainers.phase2_trainer import train_phase2
 
 
 def train_phase1_until_target(
-    data_dir: str = "training_data/super_editor_cache",
+    data_dir: str = "cache",
     save_dir: str = "models/super_editor_v2",
     target_loss: float = 0.1,
     max_epochs: int = 500,
@@ -125,7 +125,7 @@ def train_phase1_until_target(
 
 def train_phase2_steps(
     phase1_checkpoint: str,
-    data_dir: str = "training_data/super_editor_cache",
+    data_dir: str = "cache",
     save_dir: str = "models/super_editor_v2",
     total_steps: int = 30000,
 ):
@@ -200,7 +200,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="training_data/super_editor_cache")
+    parser.add_argument("--data-dir", default="cache")
     parser.add_argument("--save-dir", default="models/super_editor_v2")
     parser.add_argument("--target-loss", type=float, default=0.05)
     parser.add_argument("--max-epochs", type=int, default=500)

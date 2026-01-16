@@ -1,15 +1,17 @@
-"""Trainer for pointer network."""
+"""Trainer for pointer network with performance optimizations."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from pathlib import Path
 import json
 from typing import Dict, Optional
 from tqdm import tqdm
 import numpy as np
+import sys
 
 from ..models import PointerNetwork, STOP_TOKEN, PAD_TOKEN
 from ..data.dataset import PointerDataset, collate_fn
@@ -17,7 +19,7 @@ from ..config import TrainConfig
 
 
 class PointerNetworkTrainer:
-    """Trainer for pointer network with all losses."""
+    """Trainer for pointer network with all losses and performance optimizations."""
 
     def __init__(
         self,
@@ -37,6 +39,14 @@ class PointerNetworkTrainer:
             dropout=config.model.dropout,
         ).to(device)
 
+        # Optionally compile model for PyTorch 2.0+
+        if config.use_compile and hasattr(torch, 'compile'):
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+                print("Model compiled with torch.compile()")
+            except Exception as e:
+                print(f"torch.compile failed (will use eager mode): {e}")
+
         # Optimizer
         self.optimizer = AdamW(
             self.model.parameters(),
@@ -50,6 +60,15 @@ class PointerNetworkTrainer:
             T_0=10,  # Restart every 10 epochs
             T_mult=2,  # Double period after each restart
         )
+
+        # Mixed precision scaler
+        self.use_amp = config.use_amp and device == "cuda"
+        self.scaler = GradScaler(enabled=self.use_amp)
+        if self.use_amp:
+            print("Using automatic mixed precision (AMP)")
+
+        # Gradient accumulation
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
 
         # Loss weights
         self.pointer_loss_weight = 1.0
@@ -68,13 +87,15 @@ class PointerNetworkTrainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def create_dataloaders(self) -> tuple:
-        """Create train and validation dataloaders."""
+        """Create train and validation dataloaders with optimized settings."""
         # Create full dataset
         full_dataset = PointerDataset(
             cache_dir=self.config.cache_dir,
             pointer_dir=self.config.pointer_dir,
             chunk_size=self.config.model.chunk_size,
             chunk_overlap=self.config.model.chunk_overlap,
+            use_mmap=True,
+            preload_pointers=True,
         )
 
         # Split 90/10
@@ -86,22 +107,40 @@ class PointerNetworkTrainer:
             full_dataset, [n_train, n_val]
         )
 
+        # DataLoader settings for performance
+        num_workers = self.config.num_workers
+        # On Windows, multiprocessing can be tricky
+        if sys.platform == 'win32' and num_workers > 0:
+            # Windows requires spawn method, which is slower but works
+            print(f"Using {num_workers} workers on Windows")
+
+        # Common dataloader kwargs
+        loader_kwargs = {
+            'batch_size': self.config.batch_size,
+            'collate_fn': collate_fn,
+            'pin_memory': self.config.pin_memory and self.device == "cuda",
+        }
+
+        # Add worker settings if using multiple workers
+        if num_workers > 0:
+            loader_kwargs.update({
+                'num_workers': num_workers,
+                'prefetch_factor': self.config.prefetch_factor,
+                'persistent_workers': self.config.persistent_workers,
+            })
+        else:
+            loader_kwargs['num_workers'] = 0
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=0,
-            collate_fn=collate_fn,
-            pin_memory=True,
+            **loader_kwargs,
         )
 
         val_loader = DataLoader(
             val_dataset,
-            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=0,
-            collate_fn=collate_fn,
-            pin_memory=True,
+            **loader_kwargs,
         )
 
         return train_loader, val_loader
@@ -227,35 +266,43 @@ class PointerNetworkTrainer:
 
             return metrics
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Single training step."""
+    def train_step(self, batch: Dict[str, torch.Tensor], accumulation_step: int) -> Dict[str, float]:
+        """Single training step with AMP and gradient accumulation."""
         self.model.train()
 
-        # Move to device
-        raw_mel = batch['raw_mel'].to(self.device)
-        target_pointers = batch['target_pointers'].to(self.device)
+        # Move to device (non-blocking for better overlap)
+        raw_mel = batch['raw_mel'].to(self.device, non_blocking=True)
+        target_pointers = batch['target_pointers'].to(self.device, non_blocking=True)
 
-        # Forward pass - model computes all losses internally
-        outputs = self.model(
-            raw_mel=raw_mel,
-            target_pointers=target_pointers,
-        )
+        # Forward pass with automatic mixed precision
+        with autocast(enabled=self.use_amp):
+            outputs = self.model(
+                raw_mel=raw_mel,
+                target_pointers=target_pointers,
+            )
+            # Scale loss by accumulation steps for correct averaging
+            total_loss = outputs['loss'] / self.gradient_accumulation_steps
 
-        # Use model's computed loss directly
-        total_loss = outputs['loss']
+        # Backward pass with gradient scaling
+        self.scaler.scale(total_loss).backward()
 
-        # Backward pass
-        self.optimizer.zero_grad()
-        total_loss.backward()
+        # Only update weights after accumulation steps
+        if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
+            # Unscale gradients for clipping
+            self.scaler.unscale_(self.optimizer)
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.config.model.gradient_clip,
-        )
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.model.gradient_clip,
+            )
 
-        self.optimizer.step()
-        self.global_step += 1
+            # Optimizer step with scaler
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+
+            self.global_step += 1
 
         # Return all losses for logging (including hierarchical)
         loss_dict = {
@@ -272,7 +319,7 @@ class PointerNetworkTrainer:
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Run validation."""
+        """Run validation with AMP."""
         self.model.eval()
 
         total_losses = {
@@ -284,14 +331,16 @@ class PointerNetworkTrainer:
         n_batches = 0
 
         for batch in val_loader:
-            raw_mel = batch['raw_mel'].to(self.device)
-            target_pointers = batch['target_pointers'].to(self.device)
+            raw_mel = batch['raw_mel'].to(self.device, non_blocking=True)
+            target_pointers = batch['target_pointers'].to(self.device, non_blocking=True)
 
-            outputs = self.model(
-                raw_mel=raw_mel,
-                target_pointers=target_pointers,
-                use_vae=False,  # Deterministic for validation
-            )
+            # Use AMP for validation too
+            with autocast(enabled=self.use_amp):
+                outputs = self.model(
+                    raw_mel=raw_mel,
+                    target_pointers=target_pointers,
+                    use_vae=False,  # Deterministic for validation
+                )
 
             # Accumulate losses
             total_losses['loss'] += outputs['loss'].item()
@@ -320,12 +369,18 @@ class PointerNetworkTrainer:
         if path is None:
             path = self.save_dir / f"checkpoint_epoch{self.epoch}.pt"
 
+        # Get state dict - handle compiled models
+        model_to_save = self.model
+        if hasattr(self.model, '_orig_mod'):
+            model_to_save = self.model._orig_mod  # Get uncompiled model
+
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': self.config,
         }
@@ -346,17 +401,26 @@ class PointerNetworkTrainer:
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Handle compiled models
+        model_to_load = self.model
+        if hasattr(self.model, '_orig_mod'):
+            model_to_load = self.model._orig_mod
+
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
         print(f"Loaded checkpoint from {path} (epoch {self.epoch})")
 
     def train(self, resume_from: Optional[Path] = None):
-        """Full training loop."""
+        """Full training loop with all optimizations."""
         # Create dataloaders
         train_loader, val_loader = self.create_dataloaders()
         print(f"Train: {len(train_loader)} batches, Val: {len(val_loader)} batches")
+        print(f"Effective batch size: {self.config.batch_size * self.gradient_accumulation_steps}")
 
         # Resume if specified
         if resume_from:
@@ -367,9 +431,12 @@ class PointerNetworkTrainer:
             self.epoch = epoch
             epoch_losses = {}
 
+            # Zero gradients at start of epoch
+            self.optimizer.zero_grad(set_to_none=True)
+
             pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
             for batch_idx, batch in enumerate(pbar):
-                losses = self.train_step(batch)
+                losses = self.train_step(batch, batch_idx)
 
                 # Accumulate epoch losses
                 for k, v in losses.items():
@@ -384,7 +451,7 @@ class PointerNetworkTrainer:
                 })
 
                 # Log periodically
-                if self.global_step % self.config.log_every == 0:
+                if self.global_step % self.config.log_every == 0 and self.global_step > 0:
                     print(f"Step {self.global_step}: loss={losses['total_loss']:.4f}")
 
             # End of epoch
@@ -401,7 +468,7 @@ class PointerNetworkTrainer:
                 print(f"Validation: {val_results}")
 
                 # Check if best
-                val_loss = val_results['val_total_loss']
+                val_loss = val_results['val_loss']
                 is_best = val_loss < self.best_val_loss
                 if is_best:
                     self.best_val_loss = val_loss
@@ -429,13 +496,18 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache-dir", type=str, default="F:/editorbot/training_data/super_editor_cache")
+    parser.add_argument("--cache-dir", type=str, default="F:/editorbot/cache")
     parser.add_argument("--pointer-dir", type=str, default="F:/editorbot/training_data/pointer_sequences")
     parser.add_argument("--save-dir", type=str, default="F:/editorbot/models/pointer_network")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--resume", type=str, default=None)
+    # Performance options
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -445,6 +517,10 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         epochs=args.epochs,
         learning_rate=args.lr,
+        num_workers=args.num_workers,
+        use_amp=not args.no_amp,
+        use_compile=not args.no_compile,
+        gradient_accumulation_steps=args.grad_accum,
     )
 
     trainer = PointerNetworkTrainer(config)

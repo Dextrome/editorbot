@@ -113,7 +113,7 @@ python -m pointer_network.generate_pointer_sequences
 
 # Train pointer network
 python -m pointer_network.trainers.pointer_trainer \
-    --cache-dir training_data/super_editor_cache \
+    --cache-dir cache \
     --pointer-dir training_data/pointer_sequences \
     --save-dir models/pointer_network \
     --epochs 100
@@ -202,37 +202,23 @@ Inspired by FaceSwap's multi-scale perceptual losses:
 ## Data Structure
 
 ```
-training_data/
-├── input/              # Raw audio (*_raw.wav)
-├── desired_output/     # Human-edited versions (*_edit.wav)
-├── reference/          # Additional finished tracks (optional)
-└── pointer_sequences/  # Generated pointer sequences for pointer network
-
 editorbot/
+├── cache/              # Centralized cache for all editors (gitignored contents)
+│   ├── features/       # Cached mel spectrograms (.npz files)
+│   └── labels/         # Cached edit labels (.npy files)
+├── training_data/      # Training audio pairs (gitignored)
+│   ├── input/          # Raw audio (*_raw.wav)
+│   ├── desired_output/ # Human-edited versions (*_edit.wav)
+│   ├── reference/      # Additional finished tracks (optional)
+│   └── pointer_sequences/  # Generated pointer sequences
 ├── rl_editor/          # RL-based editor (BC + PPO)
-│   ├── cache/          # Cached features and mel spectrograms
-│   └── ...
 ├── super_editor/       # Supervised mel reconstruction (Phase 1 & 2)
-│   └── _train_*.py     # Training experiment scripts
 ├── audio_slicer/       # FaceSwap-style audio segmentation
-│   └── _train_*.py     # Training/test scripts
 ├── mel_to_mel_editor/  # Direct mel transformation
-│   └── _train_*.py     # Training/test scripts
 ├── pointer_network/    # Pointer network for frame alignment
-│   └── generate_pointer_sequences.py  # Generate training data
 ├── scripts/            # Utility scripts
-│   ├── generate_synthetic_pairs.py    # Create synthetic training pairs
-│   ├── precache_labels.py             # Pre-cache edit labels
-│   ├── precache_stems.py              # Pre-cache Demucs stems
-│   ├── regenerate_cache.py            # Rebuild super_editor cache
-│   ├── train_super_editor.py          # Main super_editor training
-│   ├── infer_rich_bc_labels.py        # Generate BC dataset
-│   ├── augment_bc_with_synthetic.py   # Augment BC with rare actions
-│   └── find_lr.py                     # Learning rate finder
-├── models/             # Saved checkpoints
-├── logs/               # TensorBoard logs
-├── test_audio/         # Test output audio files (gitignored)
-├── lr_finder/          # Learning rate finder outputs (gitignored)
+├── models/             # Saved checkpoints (gitignored)
+├── logs/               # TensorBoard logs (gitignored)
 ├── bc_rich.npz         # BC dataset from infer_rich_bc_labels
 └── bc_augmented.npz    # BC dataset with synthetic augmentation
 ```

@@ -68,7 +68,7 @@ def run_phase2():
     trainer = Phase2Trainer(
         config=config,
         recon_model_path='F:/editorbot/models/phase1_v3_label_aware/best.pt',
-        data_dir='F:/editorbot/training_data/super_editor_cache',
+        data_dir='F:/editorbot/cache',
         save_dir='F:/editorbot/models/phase2_v1',
     )
     

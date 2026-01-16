@@ -1,0 +1,2 @@
+# This file ensures the cache/stems directory is tracked in git
+# Actual stem cache files are ignored

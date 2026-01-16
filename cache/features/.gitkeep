@@ -1,0 +1,2 @@
+# This file ensures the cache/features directory is tracked in git
+# Actual cache files (.npz, .npy) are ignored
