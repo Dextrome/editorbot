@@ -118,5 +118,10 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# External reference repos (cloned separately)
+faceswap/
+vocoder/BigVGAN/
+vocoder/hifi-gan/
 .claude/settings.local.json
 nul
