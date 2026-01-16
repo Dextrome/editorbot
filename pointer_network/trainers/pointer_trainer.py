@@ -61,6 +61,10 @@ class PointerNetworkTrainer:
             T_mult=2,  # Double period after each restart
         )
 
+        # Warmup settings
+        self.warmup_steps = getattr(config, 'warmup_steps', 500)
+        self.base_lr = config.learning_rate
+
         # Mixed precision scaler
         self.use_amp = config.use_amp and device == "cuda"
         self.scaler = GradScaler(enabled=self.use_amp)
@@ -266,9 +270,19 @@ class PointerNetworkTrainer:
 
             return metrics
 
+    def _apply_warmup(self):
+        """Apply linear warmup to learning rate."""
+        if self.global_step < self.warmup_steps:
+            warmup_factor = (self.global_step + 1) / self.warmup_steps
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.base_lr * warmup_factor
+
     def train_step(self, batch: Dict[str, torch.Tensor], accumulation_step: int) -> Dict[str, float]:
         """Single training step with AMP and gradient accumulation."""
         self.model.train()
+
+        # Apply warmup
+        self._apply_warmup()
 
         # Move to device (non-blocking for better overlap)
         raw_mel = batch['raw_mel'].to(self.device, non_blocking=True)
@@ -280,8 +294,20 @@ class PointerNetworkTrainer:
                 raw_mel=raw_mel,
                 target_pointers=target_pointers,
             )
+            total_loss = outputs['loss']
+
+            # Check for NaN and skip if detected
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"Warning: NaN/Inf loss detected at step {self.global_step}, skipping batch")
+                self.optimizer.zero_grad(set_to_none=True)
+                return {
+                    'total_loss': 0.0, 'pointer_loss': 0.0, 'bar_pointer_loss': 0.0,
+                    'beat_pointer_loss': 0.0, 'stop_loss': 0.0, 'kl_loss': 0.0,
+                    'length_loss': 0.0, 'structure_loss': 0.0,
+                }
+
             # Scale loss by accumulation steps for correct averaging
-            total_loss = outputs['loss'] / self.gradient_accumulation_steps
+            total_loss = total_loss / self.gradient_accumulation_steps
 
         # Backward pass with gradient scaling
         self.scaler.scale(total_loss).backward()

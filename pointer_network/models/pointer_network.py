@@ -402,6 +402,8 @@ class EditStyleVAE(nn.Module):
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # Clamp logvar to prevent numerical instability
+        logvar = logvar.clamp(-10, 10)
         return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
 
@@ -550,17 +552,20 @@ class PointerNetwork(nn.Module):
             decoder_out = layer(decoder_out, cond_frame_emb)
 
         # === Hierarchical pointer logits (bar -> beat -> frame) ===
+        # Scale factor for attention temperature (prevents very large logits)
+        scale = math.sqrt(self.d_model)
+
         # Frame-level pointers
         pointer_queries = self.pointer_proj(decoder_out)
-        pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2))
+        pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2)) / scale
 
         # Bar-level pointers
         bar_queries = self.bar_pointer_proj(decoder_out)
-        bar_pointer_logits = torch.matmul(bar_queries, bar_emb.transpose(1, 2))
+        bar_pointer_logits = torch.matmul(bar_queries, bar_emb.transpose(1, 2)) / scale
 
         # Beat-level pointers
         beat_queries = self.beat_pointer_proj(decoder_out)
-        beat_pointer_logits = torch.matmul(beat_queries, beat_emb.transpose(1, 2))
+        beat_pointer_logits = torch.matmul(beat_queries, beat_emb.transpose(1, 2)) / scale
 
         # Stop logits
         stop_logits = self.stop_head(decoder_out).squeeze(-1)
@@ -604,22 +609,28 @@ class PointerNetwork(nn.Module):
         # Stop loss
         stop_loss = F.binary_cross_entropy_with_logits(stop_logits, stop_mask.float())
 
-        # Length loss
+        # Length loss (normalized by scale factor to prevent huge values)
         predicted_length = self.length_predictor(encoded['frame'], src_len)
+        length_scale = 1000.0  # Normalize to reasonable range
         length_loss = F.mse_loss(
-            predicted_length,
-            torch.tensor([tgt_len], device=device).float().expand(batch_size)
+            predicted_length / length_scale,
+            torch.tensor([tgt_len / length_scale], device=device).float().expand(batch_size)
         )
 
-        # Structure loss
+        # Structure loss (handle shape mismatches carefully)
         structure_preds = self.structure_head(frame_emb)
         pointer_diff = torch.diff(target_pointers, dim=1)
         cut_labels = (pointer_diff.abs() > 50).float()
         cut_labels = F.pad(cut_labels, (0, 1), value=0)
-        structure_loss = F.binary_cross_entropy_with_logits(
-            structure_preds['cut_logits'][:, :tgt_len],
-            cut_labels[:, :structure_preds['cut_logits'].shape[1]],
-        )
+        # Use minimum length to avoid indexing errors
+        min_len = min(tgt_len, structure_preds['cut_logits'].shape[1], cut_labels.shape[1])
+        if min_len > 0:
+            structure_loss = F.binary_cross_entropy_with_logits(
+                structure_preds['cut_logits'][:, :min_len],
+                cut_labels[:, :min_len],
+            )
+        else:
+            structure_loss = torch.tensor(0.0, device=device)
 
         # Combined hierarchical pointer loss (coarse-to-fine weighting)
         # Bar loss weighted lower since it's easier, frame loss weighted higher for precision

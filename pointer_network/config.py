@@ -66,6 +66,7 @@ class TrainConfig:
     epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
+    warmup_steps: int = 500  # Linear warmup steps
 
     # Performance optimizations
     num_workers: int = 4  # DataLoader workers (0 for single-process)
