@@ -18,7 +18,8 @@ Features:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple, List
+from torch.utils.checkpoint import checkpoint
+from typing import Optional, Dict, Tuple, List, Any
 import math
 
 
@@ -71,14 +72,26 @@ class MusicAwarePositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
         self.dropout = nn.Dropout(dropout)
 
+        # Cache for position indices (avoids recomputing modulo ops each forward)
+        self._pos_cache: Dict[Tuple[int, str], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def _get_position_indices(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get cached position indices or compute them."""
+        cache_key = (seq_len, str(device))
+        if cache_key not in self._pos_cache:
+            frames = torch.arange(seq_len, device=device)
+            beat_pos = frames % self.frames_per_beat
+            bar_pos = (frames // self.frames_per_beat) % self.beats_per_bar
+            phrase_pos = (frames // (self.frames_per_beat * self.beats_per_bar)) % self.bars_per_phrase
+            self._pos_cache[cache_key] = (beat_pos, bar_pos, phrase_pos)
+        return self._pos_cache[cache_key]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         device = x.device
 
-        frames = torch.arange(seq_len, device=device)
-        beat_pos = frames % self.frames_per_beat
-        bar_pos = (frames // self.frames_per_beat) % self.beats_per_bar
-        phrase_pos = (frames // (self.frames_per_beat * self.beats_per_bar)) % self.bars_per_phrase
+        # Get cached position indices
+        beat_pos, bar_pos, phrase_pos = self._get_position_indices(seq_len, device)
 
         frame_pe = self.frame_embed(beat_pos).unsqueeze(0).expand(batch_size, -1, -1)
         beat_pe = self.beat_embed(bar_pos).unsqueeze(0).expand(batch_size, -1, -1)
@@ -213,6 +226,31 @@ class SparseAttention(nn.Module):
 
         self.global_tokens = nn.Parameter(torch.randn(n_global_tokens, d_model) * 0.02)
 
+        # Cache for attention masks (avoids recreating on each forward)
+        self._mask_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+    def _get_or_create_mask(self, tgt_len: int, src_len: int, device: torch.device) -> torch.Tensor:
+        """Get cached mask or create new one."""
+        cache_key = (tgt_len, src_len, str(device))
+        if cache_key not in self._mask_cache:
+            # Create sparse mask
+            attn_mask = torch.zeros(tgt_len, src_len + self.n_global_tokens, device=device)
+            attn_mask[:, :self.n_global_tokens] = 1  # Global tokens always attend
+
+            # Vectorized local window computation (faster than loop)
+            positions = torch.arange(tgt_len, device=device).unsqueeze(1)
+            src_positions = torch.arange(src_len, device=device).unsqueeze(0)
+            local_mask = (src_positions >= positions - self.local_window // 2) & \
+                         (src_positions < positions + self.local_window // 2)
+            attn_mask[:, self.n_global_tokens:] = local_mask.float()
+
+            # Add strided positions
+            strided = torch.arange(0, src_len, self.stride, device=device)
+            attn_mask[:, self.n_global_tokens + strided] = 1
+
+            self._mask_cache[cache_key] = attn_mask
+        return self._mask_cache[cache_key]
+
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         batch_size, tgt_len, d_model = query.shape
         src_len = key.shape[1]
@@ -227,16 +265,8 @@ class SparseAttention(nn.Module):
         k = torch.cat([global_k, k], dim=1)
         v = torch.cat([global_k, v], dim=1)
 
-        # Sparse mask
-        attn_mask = torch.zeros(tgt_len, src_len + self.n_global_tokens, device=device)
-        attn_mask[:, :self.n_global_tokens] = 1  # Global tokens
-
-        for i in range(tgt_len):
-            local_start = max(0, i - self.local_window // 2)
-            local_end = min(src_len, i + self.local_window // 2)
-            attn_mask[i, self.n_global_tokens + local_start:self.n_global_tokens + local_end] = 1
-            strided = torch.arange(0, src_len, self.stride, device=device)
-            attn_mask[i, self.n_global_tokens + strided] = 1
+        # Get cached or create sparse mask
+        attn_mask = self._get_or_create_mask(tgt_len, src_len, device)
 
         q = q.view(batch_size, tgt_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)
@@ -267,12 +297,14 @@ class MultiScaleEncoder(nn.Module):
         frames_per_beat: int = 43,
         beats_per_bar: int = 4,
         dropout: float = 0.1,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.frames_per_beat = frames_per_beat
         self.beats_per_bar = beats_per_bar
         self.frames_per_bar = frames_per_beat * beats_per_bar
         self.d_model = d_model
+        self.use_checkpoint = use_checkpoint
 
         self.mel_proj = nn.Linear(n_mels, d_model)
         self.pos_enc = MusicAwarePositionalEncoding(d_model, dropout=dropout)
@@ -296,6 +328,18 @@ class MultiScaleEncoder(nn.Module):
             num_layers=2
         )
 
+    def _frame_encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Frame encoder forward (for checkpointing)."""
+        return self.frame_encoder(x)
+
+    def _beat_encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Beat encoder forward (for checkpointing)."""
+        return self.beat_encoder(x)
+
+    def _bar_encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Bar encoder forward (for checkpointing)."""
+        return self.bar_encoder(x)
+
     def forward(self, mel: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -309,12 +353,19 @@ class MultiScaleEncoder(nn.Module):
         x = mel.transpose(1, 2)
         x = self.mel_proj(x)
         x = self.pos_enc(x)
-        frame_emb = self.frame_encoder(x)
+
+        if self.use_checkpoint and self.training:
+            frame_emb = checkpoint(self._frame_encode, x, use_reentrant=False)
+        else:
+            frame_emb = self.frame_encoder(x)
 
         # Beat level
         if time >= self.frames_per_beat:
             beat_emb = self.beat_pool(frame_emb.transpose(1, 2)).transpose(1, 2)
-            beat_emb = self.beat_encoder(beat_emb)
+            if self.use_checkpoint and self.training:
+                beat_emb = checkpoint(self._beat_encode, beat_emb, use_reentrant=False)
+            else:
+                beat_emb = self.beat_encoder(beat_emb)
         else:
             beat_emb = frame_emb.mean(dim=1, keepdim=True)
 
@@ -322,7 +373,10 @@ class MultiScaleEncoder(nn.Module):
         n_beats = beat_emb.shape[1]
         if n_beats >= self.beats_per_bar:
             bar_emb = self.bar_pool(beat_emb.transpose(1, 2)).transpose(1, 2)
-            bar_emb = self.bar_encoder(bar_emb)
+            if self.use_checkpoint and self.training:
+                bar_emb = checkpoint(self._bar_encode, bar_emb, use_reentrant=False)
+            else:
+                bar_emb = self.bar_encoder(bar_emb)
         else:
             bar_emb = beat_emb.mean(dim=1, keepdim=True)
 
@@ -446,6 +500,7 @@ class PointerNetwork(nn.Module):
         beats_per_bar: int = 4,
         dropout: float = 0.1,
         max_length: int = 65536,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -454,11 +509,18 @@ class PointerNetwork(nn.Module):
         self.frames_per_beat = frames_per_beat
         self.beats_per_bar = beats_per_bar
         self.frames_per_bar = frames_per_beat * beats_per_bar
+        self.use_checkpoint = use_checkpoint
+
+        # Precomputed constants
+        self.scale = math.sqrt(d_model)  # Attention temperature scale
+
+        # Cache for position indices
+        self._position_cache: Dict[Tuple[int, str], torch.Tensor] = {}
 
         # Encoder
         self.encoder = MultiScaleEncoder(
             n_mels, d_model, n_heads, n_encoder_layers,
-            frames_per_beat, beats_per_bar, dropout
+            frames_per_beat, beats_per_bar, dropout, use_checkpoint
         )
 
         # VAE for style
@@ -496,6 +558,13 @@ class PointerNetwork(nn.Module):
 
         # Auxiliary task
         self.structure_head = StructurePredictionHead(d_model)
+
+    def _get_positions(self, length: int, device: torch.device) -> torch.Tensor:
+        """Get cached position indices."""
+        cache_key = (length, str(device))
+        if cache_key not in self._position_cache:
+            self._position_cache[cache_key] = torch.arange(length, device=device)
+        return self._position_cache[cache_key]
 
     def forward(
         self,
@@ -538,8 +607,8 @@ class PointerNetwork(nn.Module):
         cond_frame_emb = self.duration_cond(frame_emb, target_length)
         cond_frame_emb = cond_frame_emb + style_cond.unsqueeze(1)
 
-        # Decoder queries
-        positions = torch.arange(tgt_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        # Decoder queries (use cached positions)
+        positions = self._get_positions(tgt_len, device).unsqueeze(0).expand(batch_size, -1)
         queries = self.query_embed(positions.clamp(0, self.stop_embed_idx - 1))
 
         # Hierarchical + sparse attention
@@ -552,20 +621,17 @@ class PointerNetwork(nn.Module):
             decoder_out = layer(decoder_out, cond_frame_emb)
 
         # === Hierarchical pointer logits (bar -> beat -> frame) ===
-        # Scale factor for attention temperature (prevents very large logits)
-        scale = math.sqrt(self.d_model)
-
-        # Frame-level pointers
+        # Frame-level pointers (use precomputed scale)
         pointer_queries = self.pointer_proj(decoder_out)
-        pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2)) / scale
+        pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2)) / self.scale
 
         # Bar-level pointers
         bar_queries = self.bar_pointer_proj(decoder_out)
-        bar_pointer_logits = torch.matmul(bar_queries, bar_emb.transpose(1, 2)) / scale
+        bar_pointer_logits = torch.matmul(bar_queries, bar_emb.transpose(1, 2)) / self.scale
 
         # Beat-level pointers
         beat_queries = self.beat_pointer_proj(decoder_out)
-        beat_pointer_logits = torch.matmul(beat_queries, beat_emb.transpose(1, 2)) / scale
+        beat_pointer_logits = torch.matmul(beat_queries, beat_emb.transpose(1, 2)) / self.scale
 
         # Stop logits
         stop_logits = self.stop_head(decoder_out).squeeze(-1)

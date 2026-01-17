@@ -1,0 +1,22 @@
+{
+    "model": {
+        "d_model": 128,
+        "n_heads": 4,
+        "n_encoder_layers": 2,
+        "n_decoder_layers": 2,
+        "dim_feedforward": 512,
+        "dropout": 0.1,
+        "gradient_clip": 0.5
+    },
+    "cache_dir": "F:/editorbot/cache",
+    "pointer_dir": "F:/editorbot/training_data/pointer_sequences",
+    "save_dir": "F:/editorbot/models/pointer_network_mini",
+    "batch_size": 4,
+    "epochs": 50,
+    "learning_rate": 5e-5,
+    "warmup_steps": 200,
+    "num_workers": 0,
+    "use_amp": true,
+    "use_compile": false,
+    "use_onecycle": true
+}

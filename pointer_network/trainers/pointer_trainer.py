@@ -3,9 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 import json
 from typing import Dict, Optional
@@ -14,7 +15,7 @@ import numpy as np
 import sys
 
 from ..models import PointerNetwork, STOP_TOKEN, PAD_TOKEN
-from ..data.dataset import PointerDataset, collate_fn
+from ..data.dataset import PointerDataset, collate_fn, make_fixed_collate_fn
 from ..config import TrainConfig
 
 
@@ -30,6 +31,7 @@ class PointerNetworkTrainer:
         self.device = device
 
         # Create model
+        use_checkpoint = getattr(config, 'use_gradient_checkpoint', False)
         self.model = PointerNetwork(
             n_mels=config.model.n_mels,
             d_model=config.model.d_model,
@@ -37,13 +39,21 @@ class PointerNetworkTrainer:
             n_encoder_layers=config.model.n_encoder_layers,
             n_decoder_layers=config.model.n_decoder_layers,
             dropout=config.model.dropout,
+            use_checkpoint=use_checkpoint,
         ).to(device)
+        if use_checkpoint:
+            print("Using gradient checkpointing (saves VRAM, slightly slower)")
 
         # Optionally compile model for PyTorch 2.0+
         if config.use_compile and hasattr(torch, 'compile'):
+            compile_backend = getattr(config, 'compile_backend', 'inductor')
             try:
-                self.model = torch.compile(self.model, mode='reduce-overhead')
-                print("Model compiled with torch.compile()")
+                # Only inductor supports 'mode' argument
+                if compile_backend == 'inductor':
+                    self.model = torch.compile(self.model, mode='reduce-overhead', backend=compile_backend)
+                else:
+                    self.model = torch.compile(self.model, backend=compile_backend)
+                print(f"Model compiled with torch.compile(backend='{compile_backend}')")
             except Exception as e:
                 print(f"torch.compile failed (will use eager mode): {e}")
 
@@ -54,14 +64,12 @@ class PointerNetworkTrainer:
             weight_decay=config.weight_decay,
         )
 
-        # Scheduler with warm restarts
-        self.scheduler = CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=10,  # Restart every 10 epochs
-            T_mult=2,  # Double period after each restart
-        )
+        # Scheduler - OneCycleLR often converges faster
+        self.use_onecycle = getattr(config, 'use_onecycle', True)
+        self.scheduler = None  # Created after dataloaders for OneCycleLR
+        self.scheduler_type = 'onecycle' if self.use_onecycle else 'cosine'
 
-        # Warmup settings
+        # Warmup settings (only for cosine)
         self.warmup_steps = getattr(config, 'warmup_steps', 500)
         self.base_lr = config.learning_rate
 
@@ -89,6 +97,9 @@ class PointerNetworkTrainer:
         # Create save directory
         self.save_dir = Path(config.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # TensorBoard logging
+        self.writer = SummaryWriter(log_dir=self.save_dir / "tensorboard")
 
     def create_dataloaders(self) -> tuple:
         """Create train and validation dataloaders with optimized settings."""
@@ -118,10 +129,20 @@ class PointerNetworkTrainer:
             # Windows requires spawn method, which is slower but works
             print(f"Using {num_workers} workers on Windows")
 
+        # Choose collate function (fixed sizes for torch.compile optimization)
+        use_fixed_length = getattr(self.config, 'use_fixed_length', False)
+        if use_fixed_length:
+            fixed_raw_len = getattr(self.config, 'fixed_raw_len', 2048)
+            fixed_tgt_len = getattr(self.config, 'fixed_tgt_len', 512)
+            the_collate_fn = make_fixed_collate_fn(fixed_raw_len, fixed_tgt_len)
+            print(f"Using fixed-length collation: raw={fixed_raw_len}, tgt={fixed_tgt_len}")
+        else:
+            the_collate_fn = collate_fn
+
         # Common dataloader kwargs
         loader_kwargs = {
             'batch_size': self.config.batch_size,
-            'collate_fn': collate_fn,
+            'collate_fn': the_collate_fn,
             'pin_memory': self.config.pin_memory and self.device == "cuda",
         }
 
@@ -271,7 +292,10 @@ class PointerNetworkTrainer:
             return metrics
 
     def _apply_warmup(self):
-        """Apply linear warmup to learning rate."""
+        """Apply linear warmup to learning rate (only for CosineAnnealing)."""
+        # OneCycleLR has built-in warmup, so skip
+        if self.use_onecycle:
+            return
         if self.global_step < self.warmup_steps:
             warmup_factor = (self.global_step + 1) / self.warmup_steps
             for param_group in self.optimizer.param_groups:
@@ -317,16 +341,26 @@ class PointerNetworkTrainer:
             # Unscale gradients for clipping
             self.scaler.unscale_(self.optimizer)
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
+            # Check gradient norm before clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.config.model.gradient_clip,
             )
 
-            # Optimizer step with scaler
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+            # Skip update only if gradient norm is NaN/Inf (not just large - clipping handles that)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                print(f"Warning: Skipping update at step {self.global_step}, grad_norm={grad_norm}")
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scaler.update()
+            else:
+                # Optimizer step with scaler
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                # Log gradient norm periodically
+                if self.global_step % self.config.log_every == 0:
+                    self.writer.add_scalar('train/grad_norm', grad_norm.item(), self.global_step)
 
             self.global_step += 1
 
@@ -421,7 +455,7 @@ class PointerNetworkTrainer:
 
     def load_checkpoint(self, path: Path):
         """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
@@ -447,6 +481,27 @@ class PointerNetworkTrainer:
         train_loader, val_loader = self.create_dataloaders()
         print(f"Train: {len(train_loader)} batches, Val: {len(val_loader)} batches")
         print(f"Effective batch size: {self.config.batch_size * self.gradient_accumulation_steps}")
+
+        # Create scheduler (needs total steps for OneCycleLR)
+        total_steps = len(train_loader) * self.config.epochs // self.gradient_accumulation_steps
+        if self.use_onecycle:
+            self.scheduler = OneCycleLR(
+                self.optimizer,
+                max_lr=self.config.learning_rate * 10,  # Peak at 10x base LR
+                total_steps=total_steps,
+                pct_start=0.1,  # 10% warmup
+                anneal_strategy='cos',
+                div_factor=10,  # Start at base_lr
+                final_div_factor=100,  # End at base_lr/100
+            )
+            print(f"Using OneCycleLR scheduler (total_steps={total_steps})")
+        else:
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.config.epochs,
+                eta_min=self.config.learning_rate * 0.01,
+            )
+            print(f"Using CosineAnnealingLR scheduler")
 
         # Resume if specified
         if resume_from:
@@ -479,9 +534,21 @@ class PointerNetworkTrainer:
                 # Log periodically
                 if self.global_step % self.config.log_every == 0 and self.global_step > 0:
                     print(f"Step {self.global_step}: loss={losses['total_loss']:.4f}")
+                    # TensorBoard logging
+                    self.writer.add_scalar('train/loss', losses['total_loss'], self.global_step)
+                    self.writer.add_scalar('train/pointer_loss', losses['pointer_loss'], self.global_step)
+                    self.writer.add_scalar('train/bar_pointer_loss', losses['bar_pointer_loss'], self.global_step)
+                    self.writer.add_scalar('train/beat_pointer_loss', losses['beat_pointer_loss'], self.global_step)
+                    self.writer.add_scalar('train/stop_loss', losses['stop_loss'], self.global_step)
+                    self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
 
-            # End of epoch
-            self.scheduler.step()
+                # OneCycleLR steps per batch, CosineAnnealing steps per epoch
+                if self.use_onecycle and (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                    self.scheduler.step()
+
+            # End of epoch - step for CosineAnnealing (per-epoch scheduler)
+            if not self.use_onecycle:
+                self.scheduler.step()
 
             # Average epoch losses
             n_batches = len(train_loader)
@@ -492,6 +559,9 @@ class PointerNetworkTrainer:
             if (epoch + 1) % self.config.eval_every == 0:
                 val_results = self.validate(val_loader)
                 print(f"Validation: {val_results}")
+                # TensorBoard validation logging
+                for k, v in val_results.items():
+                    self.writer.add_scalar(k, v, self.global_step)
 
                 # Check if best
                 val_loss = val_results['val_loss']
@@ -507,6 +577,7 @@ class PointerNetworkTrainer:
                 self.save_checkpoint()
 
         print("Training complete!")
+        self.writer.close()
 
 
 def train_pointer_network(config: Optional[TrainConfig] = None):
@@ -518,36 +589,39 @@ def train_pointer_network(config: Optional[TrainConfig] = None):
     trainer.train()
 
 
+def load_config(config_path: str) -> TrainConfig:
+    """Load config from JSON file."""
+    from ..config import PointerNetworkConfig
+
+    with open(config_path, 'r') as f:
+        data = json.load(f)
+
+    # Build model config if present
+    model_data = data.pop('model', {})
+    model_config = PointerNetworkConfig(**model_data)
+
+    # Build training config
+    return TrainConfig(model=model_config, **data)
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache-dir", type=str, default="F:/editorbot/cache")
-    parser.add_argument("--pointer-dir", type=str, default="F:/editorbot/training_data/pointer_sequences")
-    parser.add_argument("--save-dir", type=str, default="F:/editorbot/models/pointer_network")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--resume", type=str, default=None)
-    # Performance options
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
-    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
-    parser.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
+    parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     args = parser.parse_args()
 
-    config = TrainConfig(
-        cache_dir=args.cache_dir,
-        pointer_dir=args.pointer_dir,
-        save_dir=args.save_dir,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        learning_rate=args.lr,
-        num_workers=args.num_workers,
-        use_amp=not args.no_amp,
-        use_compile=not args.no_compile,
-        gradient_accumulation_steps=args.grad_accum,
-    )
+    if args.config:
+        print(f"Loading config from {args.config}")
+        config = load_config(args.config)
+    else:
+        print("Using default config")
+        config = TrainConfig()
+
+    # Print model config summary
+    print(f"Model: d_model={config.model.d_model}, n_heads={config.model.n_heads}, "
+          f"enc_layers={config.model.n_encoder_layers}, dec_layers={config.model.n_decoder_layers}")
 
     trainer = PointerNetworkTrainer(config)
     trainer.train(resume_from=Path(args.resume) if args.resume else None)

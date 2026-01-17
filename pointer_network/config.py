@@ -34,10 +34,10 @@ class PointerNetworkConfig:
 
     # Training
     batch_size: int = 4
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5  # Lower LR for stability
     warmup_steps: int = 1000
     max_epochs: int = 100
-    gradient_clip: float = 1.0
+    gradient_clip: float = 0.5  # Tighter clipping to prevent NaN
 
     @property
     def downsample_factor(self) -> int:
@@ -69,15 +69,72 @@ class TrainConfig:
     warmup_steps: int = 500  # Linear warmup steps
 
     # Performance optimizations
-    num_workers: int = 4  # DataLoader workers (0 for single-process)
+    num_workers: int = 0  # DataLoader workers (0 = main process, faster when data preloaded)
     prefetch_factor: int = 2  # Batches to prefetch per worker
     use_amp: bool = True  # Automatic mixed precision
     use_compile: bool = True  # torch.compile (PyTorch 2.0+)
     gradient_accumulation_steps: int = 1  # Accumulate gradients
     pin_memory: bool = True  # Pin memory for faster GPU transfer
     persistent_workers: bool = True  # Keep workers alive between epochs
+    use_onecycle: bool = True  # Use OneCycleLR scheduler (often faster convergence)
 
     # Logging
     log_every: int = 10
     save_every: int = 10
     eval_every: int = 5
+
+
+def get_mini_config() -> PointerNetworkConfig:
+    """Minimal config for proof-of-concept testing.
+
+    ~3M params vs ~15M for full config. Use this to:
+    - Validate the data pipeline works
+    - Confirm loss decreases
+    - Test overfitting on a few examples
+    - Fast iteration on hyperparameters
+    """
+    return PointerNetworkConfig(
+        # Keep audio params the same
+        n_mels=128,
+        hop_length=256,
+        sr=22050,
+        # Smaller encoder
+        encoder_channels=[32, 64],
+        encoder_kernel_size=5,
+        encoder_stride=2,
+        # Smaller transformer
+        d_model=128,
+        n_heads=4,
+        n_encoder_layers=2,
+        n_decoder_layers=2,
+        dim_feedforward=512,
+        dropout=0.1,
+        # Same chunk settings
+        chunk_size=512,
+        chunk_overlap=64,
+        max_output_length=65536,
+        # Training - higher LR ok for smaller model
+        batch_size=4,
+        learning_rate=3e-4,
+        warmup_steps=100,
+        max_epochs=50,
+        gradient_clip=1.0,
+    )
+
+
+def get_mini_train_config() -> TrainConfig:
+    """Training config using mini model for proof-of-concept."""
+    return TrainConfig(
+        model=get_mini_config(),
+        save_dir="F:/editorbot/models/pointer_network_mini",
+        batch_size=4,
+        epochs=50,
+        learning_rate=3e-4,
+        weight_decay=0.01,
+        warmup_steps=100,
+        use_amp=True,
+        use_compile=False,  # Faster startup for quick experiments
+        log_every=5,
+        save_every=10,
+        eval_every=5,
+    )

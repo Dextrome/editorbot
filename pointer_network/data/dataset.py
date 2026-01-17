@@ -2,11 +2,24 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import json
 from typing import Optional, Dict, List, Tuple
 import random
 from functools import lru_cache
+import sys
+
+
+def get_path_stem(path_str: str) -> str:
+    """Extract the stem from a path string, handling both Windows and Linux paths.
+
+    This is needed when running on Linux with paths created on Windows.
+    """
+    # Try as Windows path first (handles F:\...\file.wav correctly on Linux)
+    try:
+        return PureWindowsPath(path_str).stem
+    except:
+        return Path(path_str).stem
 
 
 class PointerDataset(Dataset):
@@ -59,6 +72,16 @@ class PointerDataset(Dataset):
                 self._preloaded_pointers[sample['name']] = np.load(sample['pointer_file'])
             print(f"Preloaded {len(self._preloaded_pointers)} pointer sequences")
 
+        # Preload mel spectrograms into RAM (eliminates disk I/O during training)
+        self._preloaded_mels = {}
+        total_mb = 0
+        print("Preloading mel spectrograms into RAM...")
+        for sample in self.samples:
+            mel = self._load_mel_from_disk(sample['raw_mel_file'])
+            self._preloaded_mels[sample['name']] = mel
+            total_mb += mel.nbytes / (1024 * 1024)
+        print(f"Preloaded {len(self._preloaded_mels)} mels ({total_mb:.1f} MB)")
+
     def _find_samples(self) -> List[Dict]:
         """Find all valid training samples."""
         samples = []
@@ -76,16 +99,17 @@ class PointerDataset(Dataset):
                 info = json.load(f)
 
             # Find raw mel file in cache - support both .npy and .npz formats
-            raw_path = Path(info['raw_path'])
+            # Use get_path_stem to handle Windows paths when running on Linux
+            raw_stem = get_path_stem(info['raw_path'])
             raw_mel_file = None
 
             # Try different possible cache file patterns
             possible_patterns = [
                 # .npz format (super_editor_cache style): {stem}.npz with 'mel' key
-                self.cache_dir / "features" / f"{raw_path.stem}.npz",
-                self.cache_dir / f"{raw_path.stem}.npz",
+                self.cache_dir / "features" / f"{raw_stem}.npz",
+                self.cache_dir / f"{raw_stem}.npz",
                 # .npy format: {stem}_mel.npy
-                self.cache_dir / f"{raw_path.stem}_mel.npy",
+                self.cache_dir / f"{raw_stem}_mel.npy",
                 self.cache_dir / f"{base_name}_raw_mel.npy",
             ]
 
@@ -127,8 +151,8 @@ class PointerDataset(Dataset):
         else:
             return self._get_chunk(idx)
 
-    def _load_mel(self, mel_file: Path) -> np.ndarray:
-        """Load mel spectrogram with optional memory mapping.
+    def _load_mel_from_disk(self, mel_file: Path) -> np.ndarray:
+        """Load mel spectrogram from disk.
 
         Supports both:
         - .npy files: direct mel array
@@ -136,21 +160,23 @@ class PointerDataset(Dataset):
         """
         if mel_file.suffix == '.npz':
             # .npz format - load archive and extract 'mel' key
-            # mmap not supported for .npz, but file is cached anyway
             data = np.load(mel_file)
             raw_mel = data['mel']
         else:
             # .npy format - direct array
-            if self.use_mmap:
-                raw_mel = np.load(mel_file, mmap_mode='r')
-            else:
-                raw_mel = np.load(mel_file)
+            raw_mel = np.load(mel_file)
 
         # Ensure shape is (n_mels, time) for consistency
         if raw_mel.shape[0] != 128:  # Assume n_mels=128
             # Data is (time, n_mels) - transpose to (n_mels, time)
             raw_mel = np.array(raw_mel.T)
         return raw_mel
+
+    def _load_mel(self, sample_name: str, mel_file: Path) -> np.ndarray:
+        """Load mel from preloaded cache (fast) or disk (fallback)."""
+        if sample_name in self._preloaded_mels:
+            return self._preloaded_mels[sample_name]
+        return self._load_mel_from_disk(mel_file)
 
     def _load_pointers(self, sample: Dict) -> np.ndarray:
         """Load pointers, using preloaded cache if available."""
@@ -162,8 +188,8 @@ class PointerDataset(Dataset):
         """Get a full sample (may be truncated if too long)."""
         sample = self.samples[idx]
 
-        # Load raw mel (memory-mapped for efficiency)
-        raw_mel = self._load_mel(sample['raw_mel_file'])
+        # Load raw mel (from preloaded cache)
+        raw_mel = self._load_mel(sample['name'], sample['raw_mel_file'])
 
         # Load pointers (from preloaded cache or disk)
         pointers = self._load_pointers(sample)
@@ -202,8 +228,8 @@ class PointerDataset(Dataset):
 
     def _get_chunk_from_sample(self, sample: Dict, chunk_idx: int) -> Dict[str, torch.Tensor]:
         """Get a specific chunk from a sample."""
-        # Load raw mel (memory-mapped for efficiency)
-        raw_mel = self._load_mel(sample['raw_mel_file'])
+        # Load raw mel (from preloaded cache)
+        raw_mel = self._load_mel(sample['name'], sample['raw_mel_file'])
 
         # Load pointers (from preloaded cache or disk)
         pointers = self._load_pointers(sample)
@@ -240,7 +266,7 @@ class PointerDataset(Dataset):
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """Collate batch with padding."""
+    """Collate batch with padding to max-in-batch (variable shapes)."""
     # Find max lengths
     max_raw_len = max(item['raw_mel'].shape[1] for item in batch)
     max_tgt_len = max(len(item['target_pointers']) for item in batch)
@@ -273,6 +299,47 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'tgt_padding_mask': tgt_padding_mask,
         'names': names,
     }
+
+
+def make_fixed_collate_fn(fixed_raw_len: int = 2048, fixed_tgt_len: int = 512):
+    """Create a collate function that pads to fixed sizes (for torch.compile).
+
+    Args:
+        fixed_raw_len: Fixed length for raw mel (pad/truncate to this)
+        fixed_tgt_len: Fixed length for target pointers (pad/truncate to this)
+    """
+    def fixed_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+        """Collate batch with padding to fixed sizes (enables torch.compile optimization)."""
+        batch_size = len(batch)
+        n_mels = batch[0]['raw_mel'].shape[0]
+
+        # Initialize tensors with fixed sizes
+        raw_mel = torch.zeros(batch_size, n_mels, fixed_raw_len)
+        target_pointers = torch.full((batch_size, fixed_tgt_len), -2, dtype=torch.long)  # -2 = STOP token
+        raw_padding_mask = torch.ones(batch_size, fixed_raw_len, dtype=torch.bool)
+        tgt_padding_mask = torch.ones(batch_size, fixed_tgt_len, dtype=torch.bool)
+
+        names = []
+
+        for i, item in enumerate(batch):
+            raw_len = min(item['raw_mel'].shape[1], fixed_raw_len)
+            tgt_len = min(len(item['target_pointers']), fixed_tgt_len)
+
+            raw_mel[i, :, :raw_len] = item['raw_mel'][:, :raw_len]
+            target_pointers[i, :tgt_len] = item['target_pointers'][:tgt_len]
+            raw_padding_mask[i, :raw_len] = False
+            tgt_padding_mask[i, :tgt_len] = False
+            names.append(item['name'])
+
+        return {
+            'raw_mel': raw_mel,
+            'target_pointers': target_pointers,
+            'raw_padding_mask': raw_padding_mask,
+            'tgt_padding_mask': tgt_padding_mask,
+            'names': names,
+        }
+
+    return fixed_collate_fn
 
 
 def create_dataloader(
