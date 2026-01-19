@@ -4,10 +4,13 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from pathlib import Path, PureWindowsPath
 import json
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, TYPE_CHECKING
 import random
 from functools import lru_cache
 import sys
+
+if TYPE_CHECKING:
+    from .augmentation import Augmentor, AugmentationConfig
 
 
 def get_path_stem(path_str: str) -> str:
@@ -40,6 +43,11 @@ class PointerDataset(Dataset):
         chunk_overlap: int = 64,
         use_mmap: bool = True,
         preload_pointers: bool = True,
+        exclude_samples: Optional[List[str]] = None,
+        synthetic_only: bool = False,
+        real_only: bool = False,
+        augment: bool = False,
+        augmentation_config: Optional["AugmentationConfig"] = None,
     ):
         """
         Args:
@@ -51,6 +59,11 @@ class PointerDataset(Dataset):
             chunk_overlap: overlap between chunks
             use_mmap: use memory-mapped file loading (faster, lower memory)
             preload_pointers: preload all pointer sequences into memory
+            exclude_samples: list of sample name patterns to exclude (substring match)
+            synthetic_only: if True, only include samples with '_synth' in name
+            real_only: if True, only include samples WITHOUT '_synth' in name
+            augment: if True, apply data augmentation during training
+            augmentation_config: configuration for augmentation (uses defaults if None)
         """
         self.cache_dir = Path(cache_dir)
         self.pointer_dir = Path(pointer_dir)
@@ -60,6 +73,17 @@ class PointerDataset(Dataset):
         self.chunk_overlap = chunk_overlap
         self.use_mmap = use_mmap
         self.preload_pointers = preload_pointers
+        self.exclude_samples = exclude_samples or []
+        self.synthetic_only = synthetic_only
+        self.real_only = real_only
+        self.augment = augment
+
+        # Setup augmentation
+        self.augmentor = None
+        if augment:
+            from .augmentation import Augmentor, AugmentationConfig
+            self.augmentor = Augmentor(augmentation_config or AugmentationConfig())
+            print(f"Augmentation enabled")
 
         # Find all pointer files
         self.samples = self._find_samples()
@@ -88,6 +112,18 @@ class PointerDataset(Dataset):
 
         for pointer_file in self.pointer_dir.glob("*_pointers.npy"):
             base_name = pointer_file.stem.replace("_pointers", "")
+
+            # Check if sample should be excluded
+            if any(pattern in base_name for pattern in self.exclude_samples):
+                print(f"Excluding sample: {base_name}")
+                continue
+
+            # Filter by synthetic/real
+            is_synthetic = '_synth' in base_name
+            if self.synthetic_only and not is_synthetic:
+                continue
+            if self.real_only and is_synthetic:
+                continue
 
             # Find corresponding info file
             info_file = self.pointer_dir / f"{base_name}_info.json"
@@ -207,9 +243,19 @@ class PointerDataset(Dataset):
         # Handle invalid pointers (-1)
         pointers = np.clip(pointers, 0, raw_mel.shape[1] - 1)
 
+        # Convert to tensors
+        raw_mel_t = torch.from_numpy(raw_mel).float()
+        pointers_t = torch.from_numpy(pointers).long()
+
+        # Apply augmentation if enabled
+        if self.augmentor is not None:
+            # Create a dummy edit_mel from pointed frames (for augmentation consistency)
+            edit_mel_t = raw_mel_t[:, pointers_t]
+            raw_mel_t, edit_mel_t, pointers_t = self.augmentor(raw_mel_t, edit_mel_t, pointers_t)
+
         return {
-            'raw_mel': torch.from_numpy(raw_mel).float(),
-            'target_pointers': torch.from_numpy(pointers).long(),
+            'raw_mel': raw_mel_t,
+            'target_pointers': pointers_t,
             'name': sample['name'],
         }
 
@@ -257,9 +303,19 @@ class PointerDataset(Dataset):
         chunk_pointers = chunk_pointers - min_ptr
         chunk_pointers = np.clip(chunk_pointers, 0, raw_mel_chunk.shape[1] - 1)
 
+        # Convert to tensors
+        raw_mel_t = torch.from_numpy(raw_mel_chunk).float()
+        pointers_t = torch.from_numpy(chunk_pointers).long()
+
+        # Apply augmentation if enabled
+        if self.augmentor is not None:
+            # Create edit_mel from pointed frames
+            edit_mel_t = raw_mel_t[:, pointers_t]
+            raw_mel_t, edit_mel_t, pointers_t = self.augmentor(raw_mel_t, edit_mel_t, pointers_t)
+
         return {
-            'raw_mel': torch.from_numpy(raw_mel_chunk).float(),
-            'target_pointers': torch.from_numpy(chunk_pointers).long(),
+            'raw_mel': raw_mel_t,
+            'target_pointers': pointers_t,
             'name': f"{sample['name']}_chunk{chunk_idx}",
             'raw_offset': min_ptr,
         }

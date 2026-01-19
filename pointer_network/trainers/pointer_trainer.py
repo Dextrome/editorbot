@@ -16,7 +16,39 @@ import sys
 
 from ..models import PointerNetwork, STOP_TOKEN, PAD_TOKEN
 from ..data.dataset import PointerDataset, collate_fn, make_fixed_collate_fn
+from ..data.augmentation import AugmentationConfig
 from ..config import TrainConfig
+
+
+def build_augmentation_config(config: TrainConfig) -> AugmentationConfig:
+    """Build AugmentationConfig from TrainConfig fields."""
+    return AugmentationConfig(
+        enabled=getattr(config, 'augmentation_enabled', False),
+        noise_enabled=True,
+        noise_probability=getattr(config, 'augmentation_noise_prob', 0.5),
+        noise_level_min=getattr(config, 'augmentation_noise_level_min', 0.05),
+        noise_level_max=getattr(config, 'augmentation_noise_level_max', 0.15),
+        spec_augment_enabled=True,
+        spec_augment_probability=getattr(config, 'augmentation_spec_augment_prob', 0.5),
+        freq_masks=getattr(config, 'augmentation_freq_masks', 2),
+        freq_mask_width=getattr(config, 'augmentation_freq_mask_width', 20),
+        time_masks=getattr(config, 'augmentation_time_masks', 2),
+        time_mask_width=getattr(config, 'augmentation_time_mask_width', 50),
+        gain_enabled=True,
+        gain_probability=getattr(config, 'augmentation_gain_prob', 0.5),
+        gain_scale_min=getattr(config, 'augmentation_gain_scale_min', 0.7),
+        gain_scale_max=getattr(config, 'augmentation_gain_scale_max', 1.3),
+        channel_dropout_enabled=True,
+        channel_dropout_probability=getattr(config, 'augmentation_channel_dropout_prob', 0.3),
+        channel_dropout_rate=getattr(config, 'augmentation_channel_dropout_rate', 0.1),
+        chunk_shuffle_enabled=True,
+        chunk_shuffle_probability=getattr(config, 'augmentation_chunk_shuffle_prob', 0.3),
+        chunk_size=getattr(config, 'augmentation_chunk_size', 1000),
+        crop_enabled=True,
+        crop_probability=getattr(config, 'augmentation_crop_prob', 0.5),
+        crop_min_len=getattr(config, 'augmentation_crop_min_len', 500),
+        crop_max_len=getattr(config, 'augmentation_crop_max_len', 5000),
+    )
 
 
 class PointerNetworkTrainer:
@@ -102,25 +134,73 @@ class PointerNetworkTrainer:
         self.writer = SummaryWriter(log_dir=self.save_dir / "tensorboard")
 
     def create_dataloaders(self) -> tuple:
-        """Create train and validation dataloaders with optimized settings."""
-        # Create full dataset
-        full_dataset = PointerDataset(
-            cache_dir=self.config.cache_dir,
-            pointer_dir=self.config.pointer_dir,
-            chunk_size=self.config.model.chunk_size,
-            chunk_overlap=self.config.model.chunk_overlap,
-            use_mmap=True,
-            preload_pointers=True,
-        )
+        """Create train and validation dataloaders with optimized settings.
 
-        # Split 90/10
-        n_samples = len(full_dataset)
-        n_train = int(0.9 * n_samples)
-        n_val = n_samples - n_train
+        Training uses all data (real + synthetic).
+        Validation uses only real data (no _synth samples) for honest evaluation.
+        """
+        # Check if we should use real-only validation
+        use_real_only_val = getattr(self.config, 'real_only_validation', True)
 
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            full_dataset, [n_train, n_val]
-        )
+        # Build augmentation config if enabled
+        use_augmentation = getattr(self.config, 'augmentation_enabled', False)
+        aug_config = build_augmentation_config(self.config) if use_augmentation else None
+
+        if use_real_only_val:
+            # Create separate train dataset (all data) and val dataset (real only)
+            train_dataset = PointerDataset(
+                cache_dir=self.config.cache_dir,
+                pointer_dir=self.config.pointer_dir,
+                chunk_size=self.config.model.chunk_size,
+                chunk_overlap=self.config.model.chunk_overlap,
+                use_mmap=True,
+                preload_pointers=True,
+                exclude_samples=getattr(self.config, 'exclude_samples', []),
+                real_only=False,  # Train on everything
+                augment=use_augmentation,
+                augmentation_config=aug_config,
+            )
+
+            val_dataset = PointerDataset(
+                cache_dir=self.config.cache_dir,
+                pointer_dir=self.config.pointer_dir,
+                chunk_size=self.config.model.chunk_size,
+                chunk_overlap=self.config.model.chunk_overlap,
+                use_mmap=True,
+                preload_pointers=True,
+                exclude_samples=getattr(self.config, 'exclude_samples', []),
+                real_only=True,  # Validate only on real data
+                augment=False,  # No augmentation for validation
+            )
+
+            print(f"Train: {len(train_dataset)} samples (real + synthetic)")
+            print(f"Val: {len(val_dataset)} samples (real only)")
+            if use_augmentation:
+                print("Augmentation enabled for training")
+        else:
+            # Original behavior: random split
+            full_dataset = PointerDataset(
+                cache_dir=self.config.cache_dir,
+                pointer_dir=self.config.pointer_dir,
+                chunk_size=self.config.model.chunk_size,
+                chunk_overlap=self.config.model.chunk_overlap,
+                use_mmap=True,
+                preload_pointers=True,
+                exclude_samples=getattr(self.config, 'exclude_samples', []),
+                augment=use_augmentation,
+                augmentation_config=aug_config,
+            )
+
+            # Split 90/10
+            n_samples = len(full_dataset)
+            n_train = int(0.9 * n_samples)
+            n_val = n_samples - n_train
+
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                full_dataset, [n_train, n_val]
+            )
+            if use_augmentation:
+                print("Augmentation enabled for training")
 
         # DataLoader settings for performance
         num_workers = self.config.num_workers
@@ -470,8 +550,11 @@ class PointerNetworkTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        if 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        if 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict']:
+            try:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            except RuntimeError as e:
+                print(f"Warning: Could not load scaler state (AMP setting changed): {e}")
 
         print(f"Loaded checkpoint from {path} (epoch {self.epoch})")
 
@@ -485,16 +568,18 @@ class PointerNetworkTrainer:
         # Create scheduler (needs total steps for OneCycleLR)
         total_steps = len(train_loader) * self.config.epochs // self.gradient_accumulation_steps
         if self.use_onecycle:
+            # max_lr multiplier - configurable, default 3x (conservative)
+            max_lr_mult = getattr(self.config, 'max_lr_mult', 3)
             self.scheduler = OneCycleLR(
                 self.optimizer,
-                max_lr=self.config.learning_rate * 10,  # Peak at 10x base LR
+                max_lr=self.config.learning_rate * max_lr_mult,
                 total_steps=total_steps,
                 pct_start=0.1,  # 10% warmup
                 anneal_strategy='cos',
-                div_factor=10,  # Start at base_lr
+                div_factor=max_lr_mult,  # Start at base_lr
                 final_div_factor=100,  # End at base_lr/100
             )
-            print(f"Using OneCycleLR scheduler (total_steps={total_steps})")
+            print(f"Using OneCycleLR scheduler (total_steps={total_steps}, max_lr={self.config.learning_rate * max_lr_mult:.2e})")
         else:
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,

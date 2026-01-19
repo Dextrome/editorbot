@@ -1,0 +1,94 @@
+# Training Pairs Analysis
+# Generated: 2026-01-18
+# Sorted by compute complexity (raw_frames x edit_frames)
+#
+# Complexity determines training time per sample due to attention mechanism
+# Relative Time = how many times slower than the fastest sample
+# Exclusion threshold: rel_time > 22x
+
+Name                                               Type   Status           Raw       Edit      Total      Complexity   Rel.Time
+----------------------------------------------------------------------------------------------------------------------------------
+ElectricOctopus-KinkyStar-Set1_synth               SYNTH  EXCLUDED     806,196    464,043  1,270,239 374,109,610,428     2099.6x
+ElectricOctopus-WoodStock-Jam1_synth               SYNTH  EXCLUDED     276,034    104,742    380,776  28,912,353,228      162.3x
+ElectricOctopus-WoodStock-Jam2_synth               SYNTH  EXCLUDED     214,678    123,627    338,305  26,539,997,106      149.0x
+20251014weliektorock                               REAL   EXCLUDED     201,999     91,683    293,682  18,519,874,317      103.9x
+Zappa-OrangeCounty_synth                           SYNTH  EXCLUDED     204,728     89,396    294,124  18,301,864,288      102.7x
+TheMachine-Chrysalis_synth                         SYNTH  EXCLUDED     186,612     84,874    271,486  15,838,506,888       88.9x
+TheMachine-ServusApparatus_synth                   SYNTH  EXCLUDED     181,384     63,612    244,996  11,538,199,008       64.8x
+20251012wartsnall23                                REAL   EXCLUDED     159,652     68,816    228,468  10,986,612,032       61.7x
+Cream-SteppinOut2_synth                            SYNTH  EXCLUDED     137,189     70,356    207,545   9,652,069,284       54.2x
+20251010rockdaparty                                REAL   EXCLUDED     299,557     30,408    329,965   9,108,929,256       51.1x
+20251021wartsnall24                                REAL   EXCLUDED     221,553     37,271    258,824   8,257,501,863       46.3x
+TheMachine-JamNoPhi_synth                          SYNTH  EXCLUDED     131,854     57,828    189,682   7,624,853,112       42.8x
+20250807wartsnall11                                REAL   EXCLUDED     138,817     51,106    189,923   7,094,381,602       39.8x
+TheMachine-SolarCorona_synth                       SYNTH  EXCLUDED     118,956     51,330    170,286   6,106,011,480       34.3x
+BlueSunshineFamilyBand-3_synth                     SYNTH  EXCLUDED     121,585     45,894    167,479   5,580,021,990       31.3x
+Mephistofeles-ChainsOfAgony_synth                  SYNTH  EXCLUDED     113,912     43,720    157,632   4,980,232,640       28.0x
+BlueSunshineFamilyBand-2_synth                     SYNTH  EXCLUDED     106,449     46,065    152,514   4,903,573,185       27.5x
+BlueSunshineFamilyBand-6_synth                     SYNTH  INCLUDED      87,511     44,644    132,155   3,906,841,084       21.9x
+20251009ehtu                                       REAL   INCLUDED     133,151     28,690    161,841   3,820,102,190       21.4x
+lastsocks                                          REAL   INCLUDED     192,389     18,494    210,883   3,558,042,166       20.0x
+Cream-Sunshine_synth                               SYNTH  INCLUDED      90,168     38,005    128,173   3,426,834,840       19.2x
+gravityloss                                        REAL   INCLUDED     121,739     26,707    148,446   3,251,283,473       18.2x
+downersdont                                        REAL   INCLUDED     117,257     25,715    142,972   3,015,263,755       16.9x
+Zappa-RatTomago_synth                              SYNTH  INCLUDED      84,735     34,339    119,074   2,909,715,165       16.3x
+20250818wartsnall22                                REAL   INCLUDED     110,743     24,537    135,280   2,717,300,991       15.3x
+20250809blackhunger                                REAL   INCLUDED     126,835     19,300    146,135   2,447,915,500       13.7x
+Zappa-EasyMeat1_synth                              SYNTH  INCLUDED      69,764     34,184    103,948   2,384,812,576       13.4x
+Zappa-Horsie_synth                                 SYNTH  INCLUDED      72,041     32,771    104,812   2,360,855,611       13.2x
+Mephistofeles-CurseOfTheKnife_synth                SYNTH  INCLUDED      76,457     28,891    105,348   2,208,919,187       12.4x
+Zappa-ShutUp_synth                                 SYNTH  INCLUDED      75,584     29,148    104,732   2,203,122,432       12.4x
+Mephistofeles- WhiteButterfly_synth                SYNTH  INCLUDED      66,852     32,725     99,577   2,187,731,700       12.3x
+walkerjamV2_synth                                  SYNTH  INCLUDED      71,954     29,578    101,532   2,128,255,412       11.9x
+Zappa-Downers_synth                                SYNTH  INCLUDED      68,373     30,985     99,358   2,118,537,405       11.9x
+walkerjam_synth                                    SYNTH  INCLUDED      68,836     30,693     99,529   2,112,783,348       11.9x
+wartsnall15B                                       REAL   INCLUDED      72,392     24,815     97,207   1,796,407,480       10.1x
+wartsnall15                                        REAL   INCLUDED      54,018     28,506     82,524   1,539,837,108        8.6x
+wartsnall5                                         REAL   INCLUDED      44,641     33,641     78,282   1,501,767,881        8.4x
+Mephistofeles-TrashLord_synth                      SYNTH  INCLUDED      49,029     28,410     77,439   1,392,913,890        7.8x
+KingKongo-FFRUIT_synth                             SYNTH  INCLUDED      55,474     23,828     79,302   1,321,834,472        7.4x
+20251018omen                                       REAL   INCLUDED      58,679     21,441     80,120   1,258,136,439        7.1x
+Zappa-Downers2_synth                               SYNTH  INCLUDED      50,411     23,408     73,819   1,180,020,688        6.6x
+Zappa-EasyMeat2_synth                              SYNTH  INCLUDED      53,344     19,908     73,252   1,061,972,352        6.0x
+Cream-SteppinOut_synth                             SYNTH  INCLUDED      52,057     18,655     70,712     971,123,335        5.5x
+Zappa-Carlos_synth                                 SYNTH  INCLUDED      44,206     20,529     64,735     907,504,974        5.1x
+20251009eh                                         REAL   INCLUDED      77,618     11,534     89,152     895,246,012        5.0x
+rectifiedviolence                                  REAL   INCLUDED      65,102      8,993     74,095     585,462,286        3.3x
+20250715wartsnall6                                 REAL   INCLUDED      55,216     10,588     65,804     584,627,008        3.3x
+20250805wartsnall10                                REAL   INCLUDED      37,789     13,249     51,038     500,666,461        2.8x
+Zappa-555_synth                                    SYNTH  INCLUDED      32,200     13,422     45,622     432,188,400        2.4x
+Cream-LawdyMama_synth                              SYNTH  INCLUDED      26,681     14,297     40,978     381,458,257        2.1x
+Mephistofeles-KissOfMagick_synth                   SYNTH  INCLUDED      30,998     11,534     42,532     357,530,932        2.0x
+20251107P1                                         REAL   INCLUDED      21,780     11,479     33,259     250,012,620        1.4x
+weebler_synth                                      SYNTH  INCLUDED      22,417      9,660     32,077     216,548,220        1.2x
+somethingdied_synth                                SYNTH  INCLUDED      17,799     11,111     28,910     197,764,689        1.1x
+turbosnail_synth                                   SYNTH  INCLUDED      18,885      9,435     28,320     178,179,975        1.0x
+----------------------------------------------------------------------------------------------------------------------------------
+
+## Summary
+Total pairs: 55
+Included: 38
+Excluded: 17
+
+## Included Samples Stats
+Real pairs: 15
+Synthetic pairs: 23
+Max raw_frames: 192,389
+Max edit_frames: 44,644
+Max rel_time: 21.9x
+Avg rel_time: 9.5x
+Total complexity: 64,269,520,314
+
+## Edit Frame Thresholds (all pairs)
+  edit_frames <= 20k: 15 samples
+  edit_frames <= 30k: 29 samples
+  edit_frames <= 40k: 39 samples
+  edit_frames <= 50k: 43 samples
+  edit_frames <= 75k: 49 samples
+  edit_frames <= 100k: 52 samples
+
+## Current Training Config
+  batch_size: 8
+  exclusion_threshold: rel_time > 22x
+  training_samples: 38
+  validation_samples: 15 (real only)

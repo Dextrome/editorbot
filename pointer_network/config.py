@@ -77,11 +77,37 @@ class TrainConfig:
     pin_memory: bool = True  # Pin memory for faster GPU transfer
     persistent_workers: bool = True  # Keep workers alive between epochs
     use_onecycle: bool = True  # Use OneCycleLR scheduler (often faster convergence)
+    max_lr_mult: float = 3.0  # OneCycleLR max_lr = learning_rate * max_lr_mult
 
     # Logging
     log_every: int = 10
     save_every: int = 10
     eval_every: int = 5
+
+    # Data filtering
+    exclude_samples: List[str] = field(default_factory=list)  # Sample name patterns to exclude
+    real_only_validation: bool = True  # Use only real (non-synthetic) samples for validation
+
+    # Augmentation
+    augmentation_enabled: bool = False  # Enable data augmentation during training
+    augmentation_noise_prob: float = 0.5
+    augmentation_noise_level_min: float = 0.05
+    augmentation_noise_level_max: float = 0.15
+    augmentation_spec_augment_prob: float = 0.5
+    augmentation_freq_masks: int = 2
+    augmentation_freq_mask_width: int = 20
+    augmentation_time_masks: int = 2
+    augmentation_time_mask_width: int = 50
+    augmentation_gain_prob: float = 0.5
+    augmentation_gain_scale_min: float = 0.7
+    augmentation_gain_scale_max: float = 1.3
+    augmentation_channel_dropout_prob: float = 0.3
+    augmentation_channel_dropout_rate: float = 0.1
+    augmentation_chunk_shuffle_prob: float = 0.3
+    augmentation_chunk_size: int = 1000
+    augmentation_crop_prob: float = 0.5
+    augmentation_crop_min_len: int = 500
+    augmentation_crop_max_len: int = 5000
 
 
 def get_mini_config() -> PointerNetworkConfig:

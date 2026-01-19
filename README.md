@@ -45,6 +45,13 @@ Pointer Sequence (T_edit indices into raw)
 - **Hierarchical**: Coarse-to-fine (bar → beat → frame) for musical coherence
 - **Variable length**: STOP token handles different output lengths
 
+### Special Tokens
+
+| Token | Value | Purpose |
+|-------|-------|---------|
+| `STOP_TOKEN` | -2 | End of output sequence |
+| `PAD_TOKEN` | -1 | Padding for batching |
+
 ### Quick Start (Pointer Network)
 
 ```bash
@@ -57,6 +64,27 @@ python -m pointer_network.trainers.pointer_trainer \
     --pointer-dir training_data/pointer_sequences \
     --save-dir models/pointer_network \
     --epochs 100
+```
+
+### Inference Example
+
+```python
+from pointer_network import PointerNetwork
+import torch
+
+# Load trained model
+model = PointerNetwork(d_model=256, n_heads=8).cuda()
+checkpoint = torch.load('models/pointer_network/best.pt')
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+# Run inference on raw mel spectrogram
+with torch.no_grad():
+    result = model.generate(raw_mel.unsqueeze(0).cuda(), max_length=10000)
+    pointers = result['pointers'][0]  # Frame indices into raw audio
+
+# Reconstruct edited audio by selecting frames
+edited_mel = raw_mel[:, pointers[pointers >= 0]]
 ```
 
 ## Setup
@@ -204,6 +232,34 @@ The factored action space uses 3 heads instead of 500 discrete actions:
 | n_fft | 2048 | FFT window size |
 | hop_length | 256 | ~11.6ms per frame |
 
+### Loss Weights (Pointer Network)
+
+| Loss | Weight | Purpose |
+|------|--------|---------|
+| Frame Pointer CE | 1.0 | Main frame-level prediction |
+| Bar Pointer CE | 0.3 | Coarse bar-level guidance |
+| Beat Pointer CE | 0.3 | Medium beat-level guidance |
+| Stop BCE | 0.5 | End-of-sequence prediction |
+| KL Divergence | 0.01 | VAE regularization |
+| Length MSE | 0.1 | Output length prediction |
+
+### Metric Targets
+
+| Metric | Target | Description |
+|--------|--------|-------------|
+| Pointer Accuracy | >80% | Exact frame match |
+| Within-5 Accuracy | >95% | Pointer within 5 frames |
+| Length MAE | <50 frames | Mean absolute length error |
+| Stop Precision | >90% | Correct stop predictions |
+
+## Training Tips
+
+1. **Start with mini config**: Use `d_model=128`, 2 layers for fast iteration
+2. **Monitor gradient norms**: Should stay <10 after clipping; >100 indicates instability
+3. **Check alignment quality**: Pointer sequences should have >95% valid alignments
+4. **Use mixed precision**: AMP gives ~2x speedup with minimal quality loss
+5. **Lower LR if unstable**: Start with 5e-5 if gradients explode, increase gradually
+
 ## Monitoring
 
 ```bash
@@ -221,8 +277,48 @@ tensorboard --logdir logs
 - Python 3.10+
 - PyTorch 2.0+
 - CUDA recommended
-- ~8GB+ VRAM for training
-- ~16GB RAM for RL with parallel environments
+
+### Hardware by Approach
+
+| Approach | VRAM | RAM | Training Time |
+|----------|------|-----|---------------|
+| Pointer Network (mini) | 4GB | 8GB | ~2 hours (50 epochs) |
+| Pointer Network (full) | 8GB | 16GB | ~8 hours (100 epochs) |
+| Super Editor Phase 1 | 8GB | 8GB | ~6-12 hours |
+| Super Editor Phase 2 | 4GB | 8GB | ~2-4 hours |
+| RL (PPO) | 8GB | 16GB | ~24+ hours |
+
+## Troubleshooting
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Gradients exploding (>100 norm) | LR too high or unstable data | Lower LR to 5e-5, check data alignment |
+| Loss stuck at high value | Model not learning | Verify data pipeline, try smaller model first |
+| OOM errors | Batch/sequence too large | Reduce batch size, enable chunking |
+| All pointers same value | Action collapse | Increase label smoothing, check loss weights |
+| Training very slow | Variable sequence lengths | Use fixed-length collation for torch.compile |
+| NaN in loss | Numerical instability | Enable AMP, add gradient clipping |
+
+## Lessons Learned
+
+Approaches that **didn't work** (documented in `audio_slicer/`):
+
+| Approach | Why It Failed |
+|----------|---------------|
+| FaceSwap-style dual autoencoder | Raw/edited audio too similar, couldn't discriminate |
+| Binary classifier (edited=good) | Good content exists in both datasets |
+| Direct mel generation | Quality degradation, can't preserve original audio |
+| Pure RL (no BC) | 500 action combinations too large for exploration |
+
+**Key insight**: Editing is mostly **selection/reordering**, not generation. Pointer networks preserve quality by copying frames.
+
+## Roadmap
+
+- [x] Hierarchical pointers (bar → beat → frame)
+- [x] Sparse attention for long sequences
+- [x] OneCycleLR scheduler
+- [ ] Edit operation tokens (COPY, LOOP, CUT labels)
+- [ ] Multi-track stem coherence
 
 ## Development
 

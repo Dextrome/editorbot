@@ -456,9 +456,14 @@ class EditStyleVAE(nn.Module):
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # Force float32 for numerical stability (prevents AMP float16 issues)
+        mu = mu.float()
+        logvar = logvar.float()
         # Clamp logvar to prevent numerical instability
         logvar = logvar.clamp(-10, 10)
-        return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        # Clamp KL loss to prevent explosion (normal range is 0.0001-0.01)
+        return kl.clamp(0, 1.0)
 
 
 class StructurePredictionHead(nn.Module):
