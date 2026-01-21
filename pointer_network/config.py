@@ -36,6 +36,8 @@ class PointerNetworkConfig:
     use_pre_norm: bool = True  # Pre-LayerNorm for stability
     use_stems: bool = False  # Multi-stem encoder
     n_stems: int = 4  # Number of stems (drums, bass, vocals, other)
+    use_edit_ops: bool = False  # Edit operation auxiliary task (optional)
+    op_loss_weight: float = 0.05  # Low weight since it's auxiliary
 
     # V2 Full-Sequence Architecture (Delta Prediction)
     compression_ratio: float = 0.67  # Expected output/input ratio (edit is ~67% of raw)

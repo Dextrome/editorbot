@@ -108,6 +108,8 @@ class PointerNetworkTrainer:
         n_stems = getattr(config.model, 'n_stems', 4)
         dim_feedforward = getattr(config.model, 'dim_feedforward', None)  # None = d_model * 4
         label_smoothing = getattr(config, 'label_smoothing', 0.1)
+        use_edit_ops = getattr(config.model, 'use_edit_ops', False)  # Optional auxiliary task
+        op_loss_weight = getattr(config.model, 'op_loss_weight', 0.05)  # Low weight
 
         # V2 full-sequence parameters
         compression_ratio = getattr(config.model, 'compression_ratio', 0.67)
@@ -130,6 +132,8 @@ class PointerNetworkTrainer:
             n_stems=n_stems,
             dim_feedforward=dim_feedforward,
             label_smoothing=label_smoothing,
+            use_edit_ops=use_edit_ops,
+            op_loss_weight=op_loss_weight,
             # V2 full-sequence parameters
             compression_ratio=compression_ratio,
             attn_window_size=attn_window_size,
@@ -142,8 +146,8 @@ class PointerNetworkTrainer:
         n_params = sum(p.numel() for p in self.model.parameters())
         print(f"Model parameters: {n_params:,} ({n_params/1e6:.1f}M)")
         print(f"V2 Architecture: linear_attn, windowed_xattn, delta_prediction")
-        print(f"Features: pre_norm={use_pre_norm}, stems={use_stems}, compression_ratio={compression_ratio}")
-        print(f"Delta prediction: max_delta={max_delta}, attn_window={attn_window_size}")
+        print(f"Features: pre_norm={use_pre_norm}, stems={use_stems}, edit_ops={use_edit_ops}")
+        print(f"Delta prediction: max_delta={max_delta}, attn_window={attn_window_size}, compression={compression_ratio}")
         if use_checkpoint:
             print("Using gradient checkpointing (saves VRAM, slightly slower)")
 
@@ -567,6 +571,7 @@ class PointerNetworkTrainer:
             'kl_loss': outputs['kl_loss'].item(),
             'length_loss': outputs['length_loss'].item(),
             'structure_loss': outputs['structure_loss'].item(),
+            'op_loss': outputs.get('op_loss', torch.tensor(0.0)).item(),
         }
         return loss_dict
 
@@ -578,6 +583,7 @@ class PointerNetworkTrainer:
         total_losses = {
             'loss': 0.0, 'pointer_loss': 0.0, 'delta_loss': 0.0,
             'jump_loss': 0.0, 'use_jump_loss': 0.0, 'stop_loss': 0.0,
+            'op_loss': 0.0,
         }
         total_delta_correct = 0
         total_frames = 0
@@ -612,6 +618,7 @@ class PointerNetworkTrainer:
             total_losses['jump_loss'] += outputs['jump_loss'].item()
             total_losses['use_jump_loss'] += outputs['use_jump_loss'].item()
             total_losses['stop_loss'] += outputs['stop_loss'].item()
+            total_losses['op_loss'] += outputs.get('op_loss', torch.tensor(0.0)).item()
 
             # Compute delta accuracy (V2: check if predicted delta matches target delta)
             delta_predictions = outputs['delta_logits'].argmax(dim=-1)

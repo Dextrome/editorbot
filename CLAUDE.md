@@ -52,32 +52,37 @@ The factored 3-head action space (20×5×5 = 500 combinations) makes pure RL exp
 - Faster convergence than pure exploration
 - Prevents entropy collapse to uniform distributions
 
-### Approach 3: Pointer Network (Current Focus)
+### Approach 3: Pointer Network V2 (Current Focus)
 
 Instead of generating audio, the pointer network **points to frames** in the original raw audio to construct the edit. For each output frame, it predicts which raw frame to copy.
 
 ```
-Raw Mel (T_raw frames) → Encoder → Pointer Decoder → Pointer Sequence (T_edit indices)
+Raw Mel (T_raw frames) → Linear Attn Encoder → Windowed Cross-Attn → Delta Prediction → Pointers
 ```
 
 **Key Insight**: Editing is mostly rearrangement (cuts, loops, reordering) not generation. By copying frames from the original, we preserve 100% audio quality.
 
-**Advantages:**
-- **Perfect quality** - Copies original frames, no generation artifacts
-- **Learns edit patterns** - Cuts, loops, reordering from examples
-- **Variable output length** - STOP token handles different edit lengths
-- **Style diversity** - VAE latent enables multiple valid edits
+**V2 Architecture (Full-Sequence Delta Prediction):**
+- **Linear Attention Encoder** - O(n) complexity via ELU+1 feature map, handles 50k+ frames
+- **Global Summary Tokens** - ~64 tokens for long-range context (cuts/loops)
+- **Position-Aware Windowed Cross-Attention** - Only attend to window around expected position
+- **Delta Prediction Head** - Predicts offset from expected position (not absolute)
+  - Small deltas: [-64, +64] for sequential edits (97-99% of cases)
+  - Jump buckets: For large jumps (cuts, loops)
+  - use_jump: Binary decision to use delta or jump
+  - stop: End-of-sequence prediction
+- **Edit Ops (optional auxiliary task)** - COPY, LOOP, SKIP, FADE labels
 
-**Architecture:**
-- Multi-scale encoder (frame/beat/bar levels)
-- Music-aware positional encoding
-- Hierarchical decoder with sparse attention
-- Pointer head + STOP prediction
+**Why Delta Prediction?**
+- Expected position = output_position / compression_ratio (~0.67)
+- Network learns WHEN to deviate, not memorizing absolute positions
+- Compression ratio encodes prior that edited track is ~67% of raw length
 
 **Data Pipeline:**
 1. Align raw ↔ edited audio pairs via cross-correlation
 2. Generate pointer sequences mapping each edit frame → raw frame
-3. Train pointer network to predict these sequences
+3. (Optional) Generate edit operation labels
+4. Train pointer network with delta prediction
 
 ## Commands
 
@@ -206,6 +211,16 @@ The system uses a factored action space instead of 500 discrete actions:
 | `approx_kl` | Near 0.02 | >0.05 = updates too aggressive |
 | `train/episode_reward` | Increasing | Declining = reward/BC conflict |
 | `counters/n_keep_ratio` | 40-60% | >90% = action collapse |
+
+### Pointer Network V2 Training
+| Metric | Target | Problem If |
+|--------|--------|------------|
+| `train/delta_loss` | Decreasing | Stuck = not learning delta offsets |
+| `train/jump_loss` | Decreasing | High = can't predict large jumps |
+| `train/use_jump_loss` | Decreasing | High = can't decide delta vs jump |
+| `train/stop_loss` | Decreasing | High = poor sequence ending |
+| `val_delta_accuracy` | >90% | Low = model not learning patterns |
+| `grad_norm` | <10 after clip | >100 = exploding gradients |
 
 ## Key Constraints
 

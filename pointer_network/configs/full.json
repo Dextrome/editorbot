@@ -10,10 +10,15 @@
         "chunk_size": 512,
         "chunk_overlap": 64,
         "use_pre_norm": true,
-        "use_edit_ops": true,
-        "op_loss_weight": 0.1,
         "use_stems": true,
-        "n_stems": 4
+        "n_stems": 4,
+        "use_edit_ops": true,
+        "op_loss_weight": 0.05,
+        "compression_ratio": 0.67,
+        "attn_window_size": 512,
+        "max_delta": 64,
+        "n_global_tokens": 64,
+        "global_token_stride": 1000
     },
     "cache_dir": "F:/editorbot/cache",
     "pointer_dir": "F:/editorbot/training_data/pointer_sequences",
