@@ -12,6 +12,11 @@ from .pointer_network import (
     EditStyleVAE,
     StructurePredictionHead,
     CachedMultiHeadAttention,
+    # V2 features integrated into V1
+    EditOp,
+    PreNormTransformerEncoderLayer,
+    PreNormTransformerDecoderLayer,
+    StemEncoder,
     STOP_TOKEN,
     PAD_TOKEN,
 )
@@ -34,6 +39,11 @@ __all__ = [
     'EditStyleVAE',
     'StructurePredictionHead',
     'CachedMultiHeadAttention',
+    # V2 features (Pre-LayerNorm, Edit Ops, Stems)
+    'EditOp',
+    'PreNormTransformerEncoderLayer',
+    'PreNormTransformerDecoderLayer',
+    'StemEncoder',
     # Constants
     'STOP_TOKEN',
     'PAD_TOKEN',

@@ -14,6 +14,12 @@ Features:
 - Structure prediction auxiliary task
 - KV caching for fast inference
 - Chunked processing for long sequences
+
+V2 Full-Sequence Architecture:
+- Linear Attention Encoder (O(n) complexity for full sequences)
+- Position-Aware Windowed Cross-Attention (attend to expected position window)
+- Delta Prediction (predict offset from expected position, not absolute)
+- Global Summary Tokens (for long-range jumps/loops)
 """
 import torch
 import torch.nn as nn
@@ -28,6 +34,551 @@ import math
 # =============================================================================
 STOP_TOKEN = -2  # Special token indicating sequence end
 PAD_TOKEN = -1   # Padding token
+
+
+# =============================================================================
+# EDIT OPERATIONS
+# =============================================================================
+class EditOp:
+    """Edit operation types for explicit edit labeling."""
+    COPY = 0        # Copy frame at pointer position
+    LOOP_START = 1  # Mark start of loop region
+    LOOP_END = 2    # End loop, jump back to LOOP_START
+    SKIP = 3        # Skip N frames (cut)
+    FADE_IN = 4     # Apply fade in
+    FADE_OUT = 5    # Apply fade out
+    STOP = 6        # End of sequence
+
+    NUM_OPS = 7
+
+    @classmethod
+    def names(cls):
+        return ['COPY', 'LOOP_START', 'LOOP_END', 'SKIP', 'FADE_IN', 'FADE_OUT', 'STOP']
+
+
+# =============================================================================
+# V2: LINEAR ATTENTION (O(n) complexity for full sequences)
+# =============================================================================
+class LinearAttention(nn.Module):
+    """Linear attention using ELU feature map for O(n) complexity.
+
+    Instead of softmax(QK^T)V which is O(n²), we use:
+    φ(Q)(φ(K)^T V) where φ is ELU+1 feature map.
+    This allows computing (K^T V) first in O(n*d) then multiplying by Q.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def _feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        """ELU + 1 feature map for non-negative features."""
+        return F.elu(x) + 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+        Returns:
+            (batch, seq_len, d_model)
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # Project to Q, K, V
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Apply feature map
+        q = self._feature_map(q)
+        k = self._feature_map(k)
+
+        # Linear attention: φ(Q)(φ(K)^T V)
+        # First compute K^T V: (batch, heads, head_dim, head_dim)
+        kv = torch.einsum('bhnd,bhne->bhde', k, v)
+
+        # Then multiply by Q: (batch, heads, seq_len, head_dim)
+        out = torch.einsum('bhnd,bhde->bhne', q, kv)
+
+        # Normalize by sum of keys (for numerical stability)
+        k_sum = k.sum(dim=2, keepdim=True)  # (batch, heads, 1, head_dim)
+        normalizer = torch.einsum('bhnd,bhkd->bhnk', q, k_sum).squeeze(-1) + 1e-6
+        out = out / normalizer.unsqueeze(-1)
+
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        out = self.dropout(self.out_proj(out))
+
+        return out
+
+
+class LinearAttentionEncoderLayer(nn.Module):
+    """Encoder layer with linear attention for O(n) complexity."""
+
+    def __init__(self, d_model: int, n_heads: int, dim_feedforward: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.linear_attn = LinearAttention(d_model, n_heads, dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm linear attention
+        x = x + self.linear_attn(self.norm1(x))
+        # Pre-norm FFN
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class LinearAttentionEncoder(nn.Module):
+    """Full encoder using linear attention for O(n) complexity on full sequences."""
+
+    def __init__(
+        self,
+        n_mels: int = 128,
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_layers: int = 4,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        n_global_tokens: int = 64,  # Summary tokens for long-range
+        global_token_stride: int = 1000,  # One global token per N frames
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_global_tokens = n_global_tokens
+        self.global_token_stride = global_token_stride
+
+        # Input projection
+        self.mel_proj = nn.Linear(n_mels, d_model)
+
+        # Positional encoding (sinusoidal for arbitrary length)
+        self.pos_scale = nn.Parameter(torch.ones(1))
+
+        # Encoder layers
+        self.layers = nn.ModuleList([
+            LinearAttentionEncoderLayer(d_model, n_heads, dim_feedforward, dropout)
+            for _ in range(n_layers)
+        ])
+        self.final_norm = nn.LayerNorm(d_model)
+
+        # Global token generator (pools local info into summary tokens)
+        self.global_pool = nn.Conv1d(d_model, d_model, kernel_size=global_token_stride,
+                                      stride=global_token_stride, padding=0)
+        self.global_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def _sinusoidal_pos_encoding(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Generate sinusoidal positional encoding."""
+        position = torch.arange(seq_len, device=device).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, device=device).float() *
+                            (-math.log(10000.0) / self.d_model))
+        pe = torch.zeros(seq_len, self.d_model, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe * self.pos_scale
+
+    def forward(self, mel: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            mel: (batch, n_mels, time)
+        Returns:
+            dict with 'frame' and 'global' embeddings
+        """
+        batch_size, n_mels, time = mel.shape
+
+        # Project mel to d_model
+        x = mel.transpose(1, 2)  # (batch, time, n_mels)
+        x = self.mel_proj(x)  # (batch, time, d_model)
+
+        # Add positional encoding
+        pos_enc = self._sinusoidal_pos_encoding(time, x.device)
+        x = x + pos_enc.unsqueeze(0)
+
+        # Run through linear attention layers
+        for layer in self.layers:
+            x = layer(x)
+
+        frame_emb = self.final_norm(x)
+
+        # Generate global summary tokens
+        if time >= self.global_token_stride:
+            # Pool to create global tokens
+            global_tokens = self.global_pool(frame_emb.transpose(1, 2)).transpose(1, 2)
+            global_tokens = self.global_proj(global_tokens)
+        else:
+            # For short sequences, just use mean
+            global_tokens = frame_emb.mean(dim=1, keepdim=True)
+            global_tokens = self.global_proj(global_tokens)
+
+        return {
+            'frame': frame_emb,
+            'global': global_tokens,
+        }
+
+
+# =============================================================================
+# V2: POSITION-AWARE WINDOWED CROSS-ATTENTION
+# =============================================================================
+class PositionAwareWindowedAttention(nn.Module):
+    """Cross-attention that only attends to a window around expected position.
+
+    For output position t with compression ratio r:
+    - Expected raw position = t / r
+    - Only attend to encoder[expected - window : expected + window]
+    - Plus global tokens for long-range dependencies
+
+    This makes cross-attention O(output_len * window_size) instead of O(output_len * input_len).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        window_size: int = 512,  # Attend to ±256 frames around expected position
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.window_size = window_size
+        self.scale = math.sqrt(self.head_dim)
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        # Separate projections for global tokens
+        self.global_k_proj = nn.Linear(d_model, d_model)
+        self.global_v_proj = nn.Linear(d_model, d_model)
+
+    def forward(
+        self,
+        query: torch.Tensor,  # (batch, tgt_len, d_model)
+        encoder_out: torch.Tensor,  # (batch, src_len, d_model)
+        global_tokens: torch.Tensor,  # (batch, n_global, d_model)
+        compression_ratio: float,  # Expected output/input ratio
+        cumulative_offset: Optional[torch.Tensor] = None,  # (batch, tgt_len) position adjustments
+    ) -> torch.Tensor:
+        """
+        Args:
+            query: Decoder queries (batch, tgt_len, d_model)
+            encoder_out: Encoder frame embeddings (batch, src_len, d_model)
+            global_tokens: Global summary tokens (batch, n_global, d_model)
+            compression_ratio: Expected edit/raw ratio (e.g., 0.67)
+            cumulative_offset: Optional position adjustments from previous predictions
+        """
+        batch_size, tgt_len, _ = query.shape
+        src_len = encoder_out.shape[1]
+        device = query.device
+
+        # Compute expected positions for each output position
+        positions = torch.arange(tgt_len, device=device).float()
+        expected_positions = (positions / compression_ratio).long()
+
+        if cumulative_offset is not None:
+            expected_positions = expected_positions.unsqueeze(0) + cumulative_offset
+            expected_positions = expected_positions.long()
+        else:
+            expected_positions = expected_positions.unsqueeze(0).expand(batch_size, -1)
+
+        # Clamp to valid range
+        expected_positions = expected_positions.clamp(0, src_len - 1)
+
+        # Project queries
+        q = self.q_proj(query)
+        q = q.view(batch_size, tgt_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # For efficiency, we compute attention in chunks
+        # Each output position attends to its local window + global tokens
+
+        # Project global tokens (same for all positions)
+        global_k = self.global_k_proj(global_tokens)
+        global_v = self.global_v_proj(global_tokens)
+        n_global = global_tokens.shape[1]
+
+        global_k = global_k.view(batch_size, n_global, self.n_heads, self.head_dim).transpose(1, 2)
+        global_v = global_v.view(batch_size, n_global, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Pre-project all encoder frames
+        all_k = self.k_proj(encoder_out)
+        all_v = self.v_proj(encoder_out)
+        all_k = all_k.view(batch_size, src_len, self.n_heads, self.head_dim).transpose(1, 2)
+        all_v = all_v.view(batch_size, src_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # Process in chunks for memory efficiency
+        chunk_size = 256
+        outputs = []
+
+        for chunk_start in range(0, tgt_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, tgt_len)
+            chunk_q = q[:, :, chunk_start:chunk_end, :]  # (batch, heads, chunk, head_dim)
+            chunk_expected = expected_positions[:, chunk_start:chunk_end]  # (batch, chunk)
+
+            # Gather local windows for this chunk
+            # For simplicity, use a single window for the whole chunk based on center
+            chunk_center = chunk_expected[:, chunk_expected.shape[1] // 2]  # (batch,)
+
+            window_start = (chunk_center - self.window_size // 2).clamp(0, src_len - self.window_size)
+            window_end = (window_start + self.window_size).clamp(0, src_len)
+
+            # Gather window keys/values
+            # For each batch, extract the window
+            window_k_list = []
+            window_v_list = []
+            for b in range(batch_size):
+                ws = window_start[b].item()
+                we = window_end[b].item()
+                window_k_list.append(all_k[b, :, ws:we, :])
+                window_v_list.append(all_v[b, :, ws:we, :])
+
+            # Pad to same size and stack
+            max_window = max(wk.shape[1] for wk in window_k_list)
+            window_k = torch.zeros(batch_size, self.n_heads, max_window, self.head_dim, device=device)
+            window_v = torch.zeros(batch_size, self.n_heads, max_window, self.head_dim, device=device)
+            window_mask = torch.ones(batch_size, max_window, device=device, dtype=torch.bool)
+
+            for b, (wk, wv) in enumerate(zip(window_k_list, window_v_list)):
+                wlen = wk.shape[1]
+                window_k[b, :, :wlen, :] = wk
+                window_v[b, :, :wlen, :] = wv
+                window_mask[b, :wlen] = False
+
+            # Concatenate global tokens
+            full_k = torch.cat([global_k, window_k], dim=2)  # (batch, heads, n_global + window, head_dim)
+            full_v = torch.cat([global_v, window_v], dim=2)
+            full_mask = torch.cat([
+                torch.zeros(batch_size, n_global, device=device, dtype=torch.bool),
+                window_mask
+            ], dim=1)
+
+            # Compute attention
+            attn = torch.matmul(chunk_q, full_k.transpose(-2, -1)) / self.scale
+            attn = attn.masked_fill(full_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.dropout(attn)
+
+            chunk_out = torch.matmul(attn, full_v)
+            outputs.append(chunk_out)
+
+        # Concatenate chunks
+        out = torch.cat(outputs, dim=2)  # (batch, heads, tgt_len, head_dim)
+        out = out.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.d_model)
+
+        return self.out_proj(out)
+
+
+# =============================================================================
+# V2: DELTA PREDICTION HEAD
+# =============================================================================
+class DeltaPredictionHead(nn.Module):
+    """Predicts pointer offset from expected position instead of absolute position.
+
+    For output position t:
+    - Expected raw position = t / compression_ratio
+    - Predict delta ∈ {-max_delta, ..., +max_delta} OR large jump
+    - Actual position = expected + delta
+
+    This leverages the prior that edits are mostly sequential (delta=0 or 1).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        max_delta: int = 64,  # Max small delta (covers ~0.7 seconds at 22050/256)
+        n_jump_buckets: int = 32,  # For large jumps, quantize into buckets
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.max_delta = max_delta
+        self.n_jump_buckets = n_jump_buckets
+
+        # Delta prediction: -max_delta to +max_delta (2*max_delta + 1 classes)
+        self.n_delta_classes = 2 * max_delta + 1
+        self.delta_head = nn.Linear(d_model, self.n_delta_classes)
+
+        # Large jump prediction (for jumps > max_delta)
+        # Predicts bucket index, which maps to relative jump size
+        self.jump_head = nn.Linear(d_model, n_jump_buckets)
+
+        # Whether to use large jump vs small delta
+        self.use_jump_head = nn.Linear(d_model, 1)
+
+        # Stop prediction
+        self.stop_head = nn.Linear(d_model, 1)
+
+    def forward(self, decoder_out: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            decoder_out: (batch, tgt_len, d_model)
+        Returns:
+            dict with 'delta_logits', 'jump_logits', 'use_jump_logits', 'stop_logits'
+        """
+        return {
+            'delta_logits': self.delta_head(decoder_out),  # (batch, tgt_len, n_delta_classes)
+            'jump_logits': self.jump_head(decoder_out),    # (batch, tgt_len, n_jump_buckets)
+            'use_jump_logits': self.use_jump_head(decoder_out).squeeze(-1),  # (batch, tgt_len)
+            'stop_logits': self.stop_head(decoder_out).squeeze(-1),  # (batch, tgt_len)
+        }
+
+    def delta_to_index(self, delta: torch.Tensor) -> torch.Tensor:
+        """Convert delta values to class indices."""
+        # delta in [-max_delta, max_delta] -> index in [0, 2*max_delta]
+        return (delta + self.max_delta).clamp(0, self.n_delta_classes - 1)
+
+    def index_to_delta(self, index: torch.Tensor) -> torch.Tensor:
+        """Convert class indices to delta values."""
+        return index - self.max_delta
+
+    def compute_targets(
+        self,
+        target_pointers: torch.Tensor,  # (batch, tgt_len)
+        compression_ratio: float,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute delta targets from absolute pointer targets.
+
+        Args:
+            target_pointers: Absolute pointer positions (batch, tgt_len)
+            compression_ratio: Expected edit/raw ratio
+        Returns:
+            dict with 'delta_targets', 'use_jump_targets', 'jump_targets'
+        """
+        batch_size, tgt_len = target_pointers.shape
+        device = target_pointers.device
+
+        # Compute expected positions
+        positions = torch.arange(tgt_len, device=device).float()
+        expected_positions = (positions / compression_ratio).unsqueeze(0).expand(batch_size, -1)
+
+        # Compute deltas
+        deltas = target_pointers.float() - expected_positions
+
+        # Handle STOP tokens (mark as delta=0 for now, will be masked)
+        stop_mask = target_pointers == STOP_TOKEN
+        deltas = deltas.masked_fill(stop_mask, 0)
+
+        # Determine if small delta or large jump
+        use_jump = deltas.abs() > self.max_delta
+
+        # Small delta targets (clamp to valid range)
+        delta_targets = self.delta_to_index(deltas.round().long())
+
+        # Large jump targets (quantize into buckets)
+        # Map large jumps to bucket indices based on magnitude
+        jump_magnitude = deltas.abs()
+        jump_sign = deltas.sign()
+        # Log-scale bucketing for jumps
+        jump_log = torch.log1p(jump_magnitude - self.max_delta).clamp(0, 10)
+        jump_bucket = (jump_log / 10 * (self.n_jump_buckets // 2 - 1)).long()
+        # Encode sign in bucket index
+        jump_targets = torch.where(
+            jump_sign >= 0,
+            jump_bucket + self.n_jump_buckets // 2,
+            self.n_jump_buckets // 2 - 1 - jump_bucket
+        ).clamp(0, self.n_jump_buckets - 1)
+
+        return {
+            'delta_targets': delta_targets,  # (batch, tgt_len)
+            'use_jump_targets': use_jump,    # (batch, tgt_len) bool
+            'jump_targets': jump_targets,    # (batch, tgt_len)
+            'stop_targets': stop_mask,       # (batch, tgt_len) bool
+            'expected_positions': expected_positions,  # (batch, tgt_len)
+        }
+
+    def decode_predictions(
+        self,
+        delta_logits: torch.Tensor,
+        jump_logits: torch.Tensor,
+        use_jump_logits: torch.Tensor,
+        compression_ratio: float,
+        src_len: int,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Decode predictions to absolute pointer positions.
+
+        Args:
+            delta_logits: (batch, tgt_len, n_delta_classes)
+            jump_logits: (batch, tgt_len, n_jump_buckets)
+            use_jump_logits: (batch, tgt_len)
+            compression_ratio: Expected edit/raw ratio
+            src_len: Source sequence length
+            temperature: Sampling temperature (0 = greedy)
+        Returns:
+            pointers: (batch, tgt_len) absolute pointer positions
+        """
+        batch_size, tgt_len, _ = delta_logits.shape
+        device = delta_logits.device
+
+        # Expected positions
+        positions = torch.arange(tgt_len, device=device).float()
+        expected = (positions / compression_ratio).unsqueeze(0).expand(batch_size, -1)
+
+        # Decide whether to use jump or delta
+        use_jump = torch.sigmoid(use_jump_logits) > 0.5
+
+        # Get delta predictions
+        if temperature > 0:
+            delta_probs = F.softmax(delta_logits / temperature, dim=-1)
+            delta_idx = torch.multinomial(delta_probs.view(-1, self.n_delta_classes), 1)
+            delta_idx = delta_idx.view(batch_size, tgt_len)
+        else:
+            delta_idx = delta_logits.argmax(dim=-1)
+
+        deltas = self.index_to_delta(delta_idx).float()
+
+        # Get jump predictions (for positions that need it)
+        if temperature > 0:
+            jump_probs = F.softmax(jump_logits / temperature, dim=-1)
+            jump_idx = torch.multinomial(jump_probs.view(-1, self.n_jump_buckets), 1)
+            jump_idx = jump_idx.view(batch_size, tgt_len)
+        else:
+            jump_idx = jump_logits.argmax(dim=-1)
+
+        # Decode jump bucket to actual offset
+        center = self.n_jump_buckets // 2
+        jump_sign = torch.where(jump_idx >= center,
+                                torch.ones_like(jump_idx),
+                                -torch.ones_like(jump_idx)).float()
+        jump_log_mag = torch.where(
+            jump_idx >= center,
+            (jump_idx - center).float() / (center - 1) * 10,
+            (center - 1 - jump_idx).float() / (center - 1) * 10
+        )
+        jump_offset = jump_sign * (torch.expm1(jump_log_mag) + self.max_delta)
+
+        # Combine delta and jump based on use_jump
+        offset = torch.where(use_jump, jump_offset, deltas)
+
+        # Compute absolute positions
+        pointers = (expected + offset).round().long()
+        pointers = pointers.clamp(0, src_len - 1)
+
+        return pointers
 
 
 # =============================================================================
@@ -187,15 +738,15 @@ class HierarchicalAttention(nn.Module):
         beat_keys: torch.Tensor,
         bar_keys: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        bar_out, _ = self.bar_attn(query, bar_keys, bar_keys)
-        beat_out, _ = self.beat_attn(query, beat_keys, beat_keys)
-        frame_out, frame_weights = self.frame_attn(query, frame_keys, frame_keys)
+        bar_out, _ = self.bar_attn(query, bar_keys, bar_keys, need_weights=False)
+        beat_out, _ = self.beat_attn(query, beat_keys, beat_keys, need_weights=False)
+        frame_out, _ = self.frame_attn(query, frame_keys, frame_keys, need_weights=False)
 
         combined = torch.cat([bar_out, beat_out, frame_out], dim=-1)
         gate = self.gate(combined)
         output = self.combine(combined) * gate + frame_out * (1 - gate)
 
-        return output, frame_weights
+        return output, None  # No longer returning weights for Flash Attention
 
 
 class SparseAttention(nn.Module):
@@ -283,6 +834,234 @@ class SparseAttention(nn.Module):
 
 
 # =============================================================================
+# PRE-LAYERNORM TRANSFORMER LAYERS (More stable training)
+# =============================================================================
+class PreNormTransformerEncoderLayer(nn.Module):
+    """Transformer encoder layer with Pre-LayerNorm (more stable, no NaN)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Pre-norm: normalize before attention
+        x_norm = self.norm1(x)
+        attn_out, _ = self.self_attn(
+            x_norm, x_norm, x_norm,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = x + self.dropout(attn_out)
+
+        # Pre-norm: normalize before FFN
+        x_norm = self.norm2(x)
+        x = x + self.ffn(x_norm)
+        return x
+
+
+class PreNormTransformerDecoderLayer(nn.Module):
+    """Transformer decoder layer with Pre-LayerNorm (more stable)."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Self-attention with pre-norm
+        tgt_norm = self.norm1(tgt)
+        self_attn_out, _ = self.self_attn(
+            tgt_norm, tgt_norm, tgt_norm,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+        )
+        tgt = tgt + self.dropout(self_attn_out)
+
+        # Cross-attention with pre-norm
+        tgt_norm = self.norm2(tgt)
+        cross_attn_out, _ = self.cross_attn(
+            tgt_norm, memory, memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        tgt = tgt + self.dropout(cross_attn_out)
+
+        # FFN with pre-norm
+        tgt_norm = self.norm3(tgt)
+        tgt = tgt + self.ffn(tgt_norm)
+        return tgt
+
+
+# =============================================================================
+# STEM ENCODER (Multi-track support)
+# =============================================================================
+class StemEncoder(nn.Module):
+    """Encodes multiple audio stems into a shared representation.
+
+    Stems (drums, bass, vocals, other) are encoded separately then fused
+    via attention. The same pointers will be applied to all stems for
+    coherent editing.
+    """
+
+    def __init__(
+        self,
+        n_mels: int = 128,
+        d_model: int = 256,
+        n_stems: int = 4,  # drums, bass, vocals, other
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_stems = n_stems
+        self.d_model = d_model
+
+        # Per-stem projection
+        self.stem_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n_mels, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            for _ in range(n_stems)
+        ])
+
+        # Stem type embeddings
+        self.stem_embed = nn.Embedding(n_stems, d_model)
+
+        # Fusion layer (concatenate + project)
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * n_stems, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+
+        # Attention-based fusion (alternative, more expressive)
+        # NOTE: Disabled due to CUDA issues with large batch*seq_len
+        self.use_attention_fusion = False
+        if self.use_attention_fusion:
+            self.fusion_attn = nn.MultiheadAttention(
+                d_model, num_heads=4, dropout=dropout, batch_first=True
+            )
+            self.fusion_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+    def forward(
+        self,
+        stems: Dict[str, torch.Tensor],
+        stem_order: List[str] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            stems: Dict mapping stem name to mel spectrogram (B, n_mels, T) or (B, T, n_mels)
+            stem_order: Order of stems for consistent processing
+
+        Returns:
+            Fused representation (B, T, d_model)
+        """
+        if stem_order is None:
+            stem_order = ['drums', 'bass', 'vocals', 'other']
+
+        # Get first stem to determine shape
+        first_stem = next(iter(stems.values()))
+        if first_stem.dim() == 3 and first_stem.shape[1] != first_stem.shape[2]:
+            # Assume (B, n_mels, T) format, transpose to (B, T, n_mels)
+            stems = {k: v.transpose(1, 2) if v.shape[1] < v.shape[2] else v for k, v in stems.items()}
+            first_stem = next(iter(stems.values()))
+
+        batch_size = first_stem.shape[0]
+        seq_len = first_stem.shape[1]
+        device = first_stem.device
+
+        # Encode each stem
+        stem_encodings = []
+        for i, stem_name in enumerate(stem_order):
+            if stem_name in stems:
+                stem_mel = stems[stem_name]  # (B, T, n_mels)
+            else:
+                # Use zeros for missing stems
+                n_mels = self.stem_proj[0][0].in_features
+                stem_mel = torch.zeros(batch_size, seq_len, n_mels, device=device)
+
+            # Project and add stem embedding
+            encoded = self.stem_proj[i](stem_mel)  # (B, T, d_model)
+            encoded = encoded + self.stem_embed.weight[i].unsqueeze(0).unsqueeze(0)
+            stem_encodings.append(encoded)
+
+        if self.use_attention_fusion:
+            # Stack stems: (B, T, n_stems, d_model)
+            stacked = torch.stack(stem_encodings, dim=2)
+            # Reshape for attention: (B*T, n_stems, d_model)
+            stacked = stacked.view(batch_size * seq_len, self.n_stems, self.d_model)
+            # Query to fuse: (B*T, 1, d_model)
+            query = self.fusion_query.expand(batch_size * seq_len, -1, -1)
+            # Attention fusion
+            fused, _ = self.fusion_attn(query, stacked, stacked, need_weights=False)
+            # Reshape back: (B, T, d_model)
+            fused = fused.view(batch_size, seq_len, self.d_model)
+        else:
+            # Concatenate and project
+            concat = torch.cat(stem_encodings, dim=-1)  # (B, T, d_model * n_stems)
+            fused = self.fusion(concat)  # (B, T, d_model)
+
+        return fused
+
+
+# =============================================================================
 # ENCODER
 # =============================================================================
 class MultiScaleEncoder(nn.Module):
@@ -298,6 +1077,8 @@ class MultiScaleEncoder(nn.Module):
         beats_per_bar: int = 4,
         dropout: float = 0.1,
         use_checkpoint: bool = False,
+        use_pre_norm: bool = True,  # Pre-LayerNorm for stability
+        dim_feedforward: int = None,  # Default: d_model * 4
     ):
         super().__init__()
         self.frames_per_beat = frames_per_beat
@@ -305,40 +1086,84 @@ class MultiScaleEncoder(nn.Module):
         self.frames_per_bar = frames_per_beat * beats_per_bar
         self.d_model = d_model
         self.use_checkpoint = use_checkpoint
+        self.use_pre_norm = use_pre_norm
+
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 4
 
         self.mel_proj = nn.Linear(n_mels, d_model)
         self.pos_enc = MusicAwarePositionalEncoding(d_model, dropout=dropout)
 
-        self.frame_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model, n_heads, d_model * 4, dropout, 'gelu', batch_first=True
-            ),
-            num_layers=n_layers
-        )
+        # Frame encoder - use Pre-LayerNorm if specified
+        if use_pre_norm:
+            self.frame_encoder = nn.ModuleList([
+                PreNormTransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout)
+                for _ in range(n_layers)
+            ])
+            self.frame_encoder_norm = nn.LayerNorm(d_model)  # Final norm for pre-norm
+        else:
+            self.frame_encoder = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model, n_heads, dim_feedforward, dropout, 'gelu', batch_first=True
+                ),
+                num_layers=n_layers
+            )
+            self.frame_encoder_norm = None
 
         self.beat_pool = nn.Conv1d(d_model, d_model, frames_per_beat, stride=frames_per_beat)
-        self.beat_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, n_heads, d_model * 4, dropout, 'gelu', batch_first=True),
-            num_layers=2
-        )
+
+        if use_pre_norm:
+            self.beat_encoder = nn.ModuleList([
+                PreNormTransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout)
+                for _ in range(2)
+            ])
+            self.beat_encoder_norm = nn.LayerNorm(d_model)
+        else:
+            self.beat_encoder = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout, 'gelu', batch_first=True),
+                num_layers=2
+            )
+            self.beat_encoder_norm = None
 
         self.bar_pool = nn.Conv1d(d_model, d_model, beats_per_bar, stride=beats_per_bar)
-        self.bar_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, n_heads, d_model * 4, dropout, 'gelu', batch_first=True),
-            num_layers=2
-        )
+
+        if use_pre_norm:
+            self.bar_encoder = nn.ModuleList([
+                PreNormTransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout)
+                for _ in range(2)
+            ])
+            self.bar_encoder_norm = nn.LayerNorm(d_model)
+        else:
+            self.bar_encoder = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout, 'gelu', batch_first=True),
+                num_layers=2
+            )
+            self.bar_encoder_norm = None
+
+    def _run_encoder(self, x: torch.Tensor, encoder, final_norm=None) -> torch.Tensor:
+        """Run encoder (handles both ModuleList and TransformerEncoder)."""
+        if self.use_pre_norm:
+            # Pre-norm: run through ModuleList
+            for layer in encoder:
+                x = layer(x)
+            if final_norm is not None:
+                x = final_norm(x)
+        else:
+            # Post-norm: run through TransformerEncoder
+            x = encoder(x)
+        return x
 
     def _frame_encode(self, x: torch.Tensor) -> torch.Tensor:
         """Frame encoder forward (for checkpointing)."""
-        return self.frame_encoder(x)
+        return self._run_encoder(x, self.frame_encoder, self.frame_encoder_norm)
 
     def _beat_encode(self, x: torch.Tensor) -> torch.Tensor:
         """Beat encoder forward (for checkpointing)."""
-        return self.beat_encoder(x)
+        return self._run_encoder(x, self.beat_encoder, self.beat_encoder_norm)
 
     def _bar_encode(self, x: torch.Tensor) -> torch.Tensor:
         """Bar encoder forward (for checkpointing)."""
-        return self.bar_encoder(x)
+        return self._run_encoder(x, self.bar_encoder, self.bar_encoder_norm)
 
     def forward(self, mel: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -357,7 +1182,7 @@ class MultiScaleEncoder(nn.Module):
         if self.use_checkpoint and self.training:
             frame_emb = checkpoint(self._frame_encode, x, use_reentrant=False)
         else:
-            frame_emb = self.frame_encoder(x)
+            frame_emb = self._run_encoder(x, self.frame_encoder, self.frame_encoder_norm)
 
         # Beat level
         if time >= self.frames_per_beat:
@@ -365,7 +1190,7 @@ class MultiScaleEncoder(nn.Module):
             if self.use_checkpoint and self.training:
                 beat_emb = checkpoint(self._beat_encode, beat_emb, use_reentrant=False)
             else:
-                beat_emb = self.beat_encoder(beat_emb)
+                beat_emb = self._run_encoder(beat_emb, self.beat_encoder, self.beat_encoder_norm)
         else:
             beat_emb = frame_emb.mean(dim=1, keepdim=True)
 
@@ -376,7 +1201,7 @@ class MultiScaleEncoder(nn.Module):
             if self.use_checkpoint and self.training:
                 bar_emb = checkpoint(self._bar_encode, bar_emb, use_reentrant=False)
             else:
-                bar_emb = self.bar_encoder(bar_emb)
+                bar_emb = self._run_encoder(bar_emb, self.bar_encoder, self.bar_encoder_norm)
         else:
             bar_emb = beat_emb.mean(dim=1, keepdim=True)
 
@@ -441,6 +1266,7 @@ class EditStyleVAE(nn.Module):
         )
 
     def forward(self, context: torch.Tensor, sample: bool = True):
+        # bfloat16 is numerically stable, no need to disable AMP
         h = self.encoder(context.mean(dim=1))
         mu = self.mu_head(h)
         logvar = self.logvar_head(h)
@@ -456,10 +1282,7 @@ class EditStyleVAE(nn.Module):
 
     @staticmethod
     def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        # Force float32 for numerical stability (prevents AMP float16 issues)
-        mu = mu.float()
-        logvar = logvar.float()
-        # Clamp logvar to prevent numerical instability
+        # Clamp logvar to prevent extreme values
         logvar = logvar.clamp(-10, 10)
         kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
         # Clamp KL loss to prevent explosion (normal range is 0.0001-0.01)
@@ -491,6 +1314,13 @@ class PointerNetwork(nn.Module):
 
     Takes raw audio mel spectrogram and outputs a sequence of pointers
     into the raw audio, representing which frames to select and in what order.
+
+    Architecture:
+    - Linear attention encoder (O(n) complexity for full sequences)
+    - Position-aware windowed cross-attention
+    - Delta prediction (offset from expected position)
+    - Global summary tokens for long-range jumps
+    - Multi-stem encoding with shared pointers
     """
 
     def __init__(
@@ -506,15 +1336,44 @@ class PointerNetwork(nn.Module):
         dropout: float = 0.1,
         max_length: int = 65536,
         use_checkpoint: bool = False,
+        use_pre_norm: bool = True,      # Pre-LayerNorm for stability
+        use_stems: bool = False,         # Enable multi-stem encoding
+        n_stems: int = 4,                # Number of stems (drums, bass, vocals, other)
+        dim_feedforward: int = None,     # FFN dimension (default: d_model * 4)
+        label_smoothing: float = 0.1,    # Label smoothing for loss
+        # Full-Sequence features
+        compression_ratio: float = 0.67, # Expected output/input ratio
+        attn_window_size: int = 512,     # Window size for position-aware attention
+        max_delta: int = 64,             # Max delta for small adjustments
+        n_global_tokens: int = 64,       # Number of global summary tokens
+        global_token_stride: int = 1000, # Frames per global token
+        # Deprecated V1 params (ignored, kept for checkpoint compat)
+        use_edit_ops: bool = False,
+        op_loss_weight: float = 0.1,
+        use_full_sequence: bool = True,  # Always True now
     ):
         super().__init__()
 
         self.d_model = d_model
+        self.n_mels = n_mels
         self.max_length = max_length
         self.frames_per_beat = frames_per_beat
         self.beats_per_bar = beats_per_bar
         self.frames_per_bar = frames_per_beat * beats_per_bar
         self.use_checkpoint = use_checkpoint
+        self.use_pre_norm = use_pre_norm
+        self.use_stems = use_stems
+        self.n_stems = n_stems
+        self.label_smoothing = label_smoothing
+
+        # Full-sequence settings
+        self.compression_ratio = compression_ratio
+        self.attn_window_size = attn_window_size
+        self.max_delta = max_delta
+
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 4
+        self.dim_feedforward = dim_feedforward
 
         # Precomputed constants
         self.scale = math.sqrt(d_model)  # Attention temperature scale
@@ -522,10 +1381,14 @@ class PointerNetwork(nn.Module):
         # Cache for position indices
         self._position_cache: Dict[Tuple[int, str], torch.Tensor] = {}
 
-        # Encoder
-        self.encoder = MultiScaleEncoder(
+        # Multi-stem encoder (optional)
+        if use_stems:
+            self.stem_encoder = StemEncoder(n_mels, d_model, n_stems, dropout)
+
+        # Linear attention encoder for O(n) complexity
+        self.encoder = LinearAttentionEncoder(
             n_mels, d_model, n_heads, n_encoder_layers,
-            frames_per_beat, beats_per_bar, dropout, use_checkpoint
+            dim_feedforward, dropout, n_global_tokens, global_token_stride
         )
 
         # VAE for style
@@ -541,28 +1404,39 @@ class PointerNetwork(nn.Module):
         self.query_embed = nn.Embedding(max_length + 1, d_model)  # +1 for STOP
         self.stop_embed_idx = max_length
 
-        # Attention layers
-        self.hierarchical_attn = HierarchicalAttention(
-            d_model, n_heads, frames_per_beat, beats_per_bar, dropout
+        # Position-aware windowed cross-attention
+        self.windowed_attn = PositionAwareWindowedAttention(
+            d_model, n_heads, attn_window_size, dropout
         )
-        self.sparse_attn = SparseAttention(d_model, n_heads, dropout=dropout)
 
-        # Decoder transformer layers
+        # Delta prediction head
+        self.delta_head = DeltaPredictionHead(d_model, max_delta)
+
+        # Decoder transformer layers (Pre-LayerNorm for stability)
         self.decoder_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model, n_heads, d_model * 4, dropout, 'gelu', batch_first=True
-            )
+            PreNormTransformerDecoderLayer(d_model, n_heads, dim_feedforward, dropout)
             for _ in range(n_decoder_layers)
         ])
+        self.decoder_norm = nn.LayerNorm(d_model)
 
-        # Output heads - hierarchical pointers (bar -> beat -> frame)
-        self.pointer_proj = nn.Linear(d_model, d_model)  # Frame-level pointer
-        self.bar_pointer_proj = nn.Linear(d_model, d_model)  # Bar-level pointer
-        self.beat_pointer_proj = nn.Linear(d_model, d_model)  # Beat-level pointer
-        self.stop_head = nn.Linear(d_model, 1)
-
-        # Auxiliary task
+        # Auxiliary task (structure prediction)
         self.structure_head = StructurePredictionHead(d_model)
+
+        # Initialize weights for stability
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with Xavier uniform and small gain for stability."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0, std=0.02)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def _get_positions(self, length: int, device: torch.device) -> torch.Tensor:
         """Get cached position indices."""
@@ -575,8 +1449,10 @@ class PointerNetwork(nn.Module):
         self,
         raw_mel: torch.Tensor,
         target_pointers: torch.Tensor,
+        target_ops: Optional[torch.Tensor] = None,  # Edit operation targets
         target_length: Optional[int] = None,
         use_vae: bool = True,
+        stems: Optional[Dict[str, torch.Tensor]] = None,  # Multi-stem input
     ) -> Dict[str, torch.Tensor]:
         """
         Training forward pass.
@@ -584,16 +1460,34 @@ class PointerNetwork(nn.Module):
         Args:
             raw_mel: (batch, n_mels, time)
             target_pointers: (batch, tgt_len) with STOP_TOKEN (-2) for end positions
+            target_ops: (batch, tgt_len) edit operation labels (optional)
+            stems: Dict of stem mels {name: (batch, n_mels, time)} (optional)
         """
         batch_size = raw_mel.shape[0]
         device = raw_mel.device
 
-        # Encode
-        encoded = self.encoder(raw_mel)
+        # Multi-stem encoding (if enabled and stems provided)
+        if self.use_stems and stems is not None:
+            stem_emb = self.stem_encoder(stems)
+            # Add stem embedding to the main encoder input
+            # This is a simple approach - could also concatenate or use cross-attention
+            raw_mel_for_encoder = raw_mel  # Still use raw_mel for positional structure
+        else:
+            raw_mel_for_encoder = raw_mel
+
+        # Encode with linear attention encoder
+        encoded = self.encoder(raw_mel_for_encoder)
         frame_emb = encoded['frame']
-        beat_emb = encoded['beat']
-        bar_emb = encoded['bar']
+        global_tokens = encoded['global']
         src_len = frame_emb.shape[1]
+
+        # If using stems, fuse the stem embedding with frame embedding
+        if self.use_stems and stems is not None:
+            if stem_emb.shape[1] != frame_emb.shape[1]:
+                stem_emb = F.interpolate(
+                    stem_emb.transpose(1, 2), size=frame_emb.shape[1], mode='linear', align_corners=False
+                ).transpose(1, 2)
+            frame_emb = frame_emb + stem_emb
 
         # Style VAE
         if use_vae:
@@ -612,88 +1506,76 @@ class PointerNetwork(nn.Module):
         cond_frame_emb = self.duration_cond(frame_emb, target_length)
         cond_frame_emb = cond_frame_emb + style_cond.unsqueeze(1)
 
-        # Decoder queries (use cached positions)
+        # Decoder queries
         positions = self._get_positions(tgt_len, device).unsqueeze(0).expand(batch_size, -1)
         queries = self.query_embed(positions.clamp(0, self.stop_embed_idx - 1))
 
-        # Hierarchical + sparse attention
-        hier_out, _ = self.hierarchical_attn(queries, cond_frame_emb, beat_emb, bar_emb)
-        sparse_out = self.sparse_attn(hier_out, cond_frame_emb, cond_frame_emb)
-        decoder_out = hier_out + sparse_out
+        # Position-aware windowed cross-attention
+        decoder_out = self.windowed_attn(
+            queries, cond_frame_emb, global_tokens,
+            self.compression_ratio
+        )
 
-        # Decoder layers
+        # Decoder layers (Pre-LayerNorm)
         for layer in self.decoder_layers:
             decoder_out = layer(decoder_out, cond_frame_emb)
+        decoder_out = self.decoder_norm(decoder_out)
 
-        # === Hierarchical pointer logits (bar -> beat -> frame) ===
-        # Frame-level pointers (use precomputed scale)
-        pointer_queries = self.pointer_proj(decoder_out)
-        pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2)) / self.scale
-
-        # Bar-level pointers
-        bar_queries = self.bar_pointer_proj(decoder_out)
-        bar_pointer_logits = torch.matmul(bar_queries, bar_emb.transpose(1, 2)) / self.scale
-
-        # Beat-level pointers
-        beat_queries = self.beat_pointer_proj(decoder_out)
-        beat_pointer_logits = torch.matmul(beat_queries, beat_emb.transpose(1, 2)) / self.scale
-
-        # Stop logits
-        stop_logits = self.stop_head(decoder_out).squeeze(-1)
-
-        # === Compute losses ===
+        # === DELTA PREDICTION ===
         stop_mask = target_pointers == STOP_TOKEN
-        target_clamped = target_pointers.clone()
-        target_clamped[stop_mask] = 0
-        target_clamped = target_clamped.clamp(0, src_len - 1)
+        delta_outputs = self.delta_head(decoder_out)
 
-        # Derive hierarchical targets from frame pointers
-        n_bars = bar_emb.shape[1]
-        n_beats = beat_emb.shape[1]
-        target_bar = (target_clamped // self.frames_per_bar).clamp(0, n_bars - 1)
-        target_beat = (target_clamped // self.frames_per_beat).clamp(0, n_beats - 1)
+        # Compute delta targets
+        delta_targets = self.delta_head.compute_targets(
+            target_pointers, self.compression_ratio
+        )
 
-        # Frame pointer loss
-        pointer_loss = F.cross_entropy(
-            pointer_logits.reshape(-1, src_len),
-            target_clamped.reshape(-1),
+        # Delta loss (small adjustments)
+        delta_loss = F.cross_entropy(
+            delta_outputs['delta_logits'].reshape(-1, self.delta_head.n_delta_classes),
+            delta_targets['delta_targets'].reshape(-1),
             reduction='none',
+            label_smoothing=self.label_smoothing,
         ).view(batch_size, tgt_len)
-        pointer_loss = (pointer_loss * (~stop_mask).float()).sum() / (~stop_mask).sum().clamp(min=1)
+        delta_loss = (delta_loss * (~stop_mask).float()).sum() / (~stop_mask).sum().clamp(min=1)
 
-        # Bar pointer loss
-        bar_pointer_loss = F.cross_entropy(
-            bar_pointer_logits.reshape(-1, n_bars),
-            target_bar.reshape(-1),
-            reduction='none',
-        ).view(batch_size, tgt_len)
-        bar_pointer_loss = (bar_pointer_loss * (~stop_mask).float()).sum() / (~stop_mask).sum().clamp(min=1)
+        # Jump loss (large jumps)
+        use_jump_mask = delta_targets['use_jump_targets'] & ~stop_mask
+        if use_jump_mask.any():
+            jump_loss = F.cross_entropy(
+                delta_outputs['jump_logits'][use_jump_mask],
+                delta_targets['jump_targets'][use_jump_mask],
+                label_smoothing=self.label_smoothing,
+            )
+        else:
+            jump_loss = torch.tensor(0.0, device=device)
 
-        # Beat pointer loss
-        beat_pointer_loss = F.cross_entropy(
-            beat_pointer_logits.reshape(-1, n_beats),
-            target_beat.reshape(-1),
-            reduction='none',
-        ).view(batch_size, tgt_len)
-        beat_pointer_loss = (beat_pointer_loss * (~stop_mask).float()).sum() / (~stop_mask).sum().clamp(min=1)
+        # Use-jump classification loss
+        use_jump_loss = F.binary_cross_entropy_with_logits(
+            delta_outputs['use_jump_logits'],
+            delta_targets['use_jump_targets'].float(),
+        )
 
         # Stop loss
+        stop_logits = delta_outputs['stop_logits']
         stop_loss = F.binary_cross_entropy_with_logits(stop_logits, stop_mask.float())
 
-        # Length loss (normalized by scale factor to prevent huge values)
-        predicted_length = self.length_predictor(encoded['frame'], src_len)
-        length_scale = 1000.0  # Normalize to reasonable range
+        # Combined pointer loss
+        pointer_loss = delta_loss + 0.5 * jump_loss + 0.3 * use_jump_loss
+
+        # Length loss
+        predicted_length = self.length_predictor(frame_emb, src_len)
+        length_scale = 1000.0
         length_loss = F.mse_loss(
             predicted_length / length_scale,
             torch.tensor([tgt_len / length_scale], device=device).float().expand(batch_size)
         )
 
-        # Structure loss (handle shape mismatches carefully)
+        # Structure loss (predict cut points)
         structure_preds = self.structure_head(frame_emb)
         pointer_diff = torch.diff(target_pointers, dim=1)
         cut_labels = (pointer_diff.abs() > 50).float()
         cut_labels = F.pad(cut_labels, (0, 1), value=0)
-        # Use minimum length to avoid indexing errors
         min_len = min(tgt_len, structure_preds['cut_logits'].shape[1], cut_labels.shape[1])
         if min_len > 0:
             structure_loss = F.binary_cross_entropy_with_logits(
@@ -703,16 +1585,9 @@ class PointerNetwork(nn.Module):
         else:
             structure_loss = torch.tensor(0.0, device=device)
 
-        # Combined hierarchical pointer loss (coarse-to-fine weighting)
-        # Bar loss weighted lower since it's easier, frame loss weighted higher for precision
-        hierarchical_pointer_loss = (
-            0.2 * bar_pointer_loss +
-            0.3 * beat_pointer_loss +
-            1.0 * pointer_loss
-        )
-
+        # Total loss
         total_loss = (
-            hierarchical_pointer_loss +
+            pointer_loss +
             0.5 * stop_loss +
             0.1 * kl_loss +
             0.01 * length_loss +
@@ -720,19 +1595,21 @@ class PointerNetwork(nn.Module):
         )
 
         return {
-            'pointer_logits': pointer_logits,
-            'bar_pointer_logits': bar_pointer_logits,
-            'beat_pointer_logits': beat_pointer_logits,
+            'delta_logits': delta_outputs['delta_logits'],
+            'jump_logits': delta_outputs['jump_logits'],
+            'use_jump_logits': delta_outputs['use_jump_logits'],
             'stop_logits': stop_logits,
+            'delta_loss': delta_loss,
+            'jump_loss': jump_loss,
+            'use_jump_loss': use_jump_loss,
             'pointer_loss': pointer_loss,
-            'bar_pointer_loss': bar_pointer_loss,
-            'beat_pointer_loss': beat_pointer_loss,
             'stop_loss': stop_loss,
             'kl_loss': kl_loss,
             'length_loss': length_loss,
             'structure_loss': structure_loss,
             'loss': total_loss,
             'predicted_length': predicted_length,
+            'delta_targets': delta_targets,
         }
 
     @torch.no_grad()
@@ -744,17 +1621,65 @@ class PointerNetwork(nn.Module):
         sample_style: bool = True,
         n_samples: int = 1,
         stop_threshold: float = 0.5,
+        stems: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Generate pointer sequence."""
+        """Generate pointer sequence using V2 architecture with delta prediction.
+
+        The generation process:
+        1. Encode raw mel with LinearAttentionEncoder -> frame embeddings + global tokens
+        2. Optionally fuse stem embeddings
+        3. Apply VAE style conditioning and duration conditioning
+        4. Run position-aware windowed cross-attention (attends to expected positions)
+        5. Decoder layers refine the representation
+        6. Delta head predicts offset from expected position for each output frame
+        7. Decode predictions to absolute pointer positions
+
+        Args:
+            raw_mel: Input mel spectrogram (batch, n_mels, time)
+            target_length: Target output length (None = use length predictor)
+            temperature: Sampling temperature (0 = greedy)
+            sample_style: Whether to sample from VAE latent space
+            n_samples: Number of samples to generate
+            stop_threshold: Threshold for stop prediction
+            stems: Optional stem mel spectrograms
+
+        Returns:
+            Dict with 'pointers' (batch, tgt_len) and 'predicted_length'
+        """
         batch_size = raw_mel.shape[0]
         device = raw_mel.device
 
+        # Encode stems if provided and enabled
+        stem_emb = None
+        if self.use_stems and stems is not None:
+            # stems can be a dict or a tensor (n_stems, n_mels, time) or (batch, n_stems, n_mels, time)
+            if isinstance(stems, dict):
+                stem_emb = self.stem_encoder(stems)
+            else:
+                # Convert tensor to dict format
+                stem_names = ['drums', 'bass', 'vocals', 'other']
+                if stems.dim() == 3:
+                    # (n_stems, n_mels, time) -> add batch dim
+                    stems = stems.unsqueeze(0)
+                # (batch, n_stems, n_mels, time)
+                stems_dict = {name: stems[:, i] for i, name in enumerate(stem_names)}
+                stem_emb = self.stem_encoder(stems_dict)
+
+        # Encode with linear attention encoder (O(n) complexity)
         encoded = self.encoder(raw_mel)
-        frame_emb = encoded['frame']
-        beat_emb = encoded['beat']
-        bar_emb = encoded['bar']
+        frame_emb = encoded['frame']  # (batch, src_len, d_model)
+        global_tokens = encoded['global']  # (batch, n_global, d_model)
         src_len = frame_emb.shape[1]
 
+        # Fuse stem embedding with frame embedding
+        if self.use_stems and stem_emb is not None:
+            if stem_emb.shape[1] != frame_emb.shape[1]:
+                stem_emb = F.interpolate(
+                    stem_emb.transpose(1, 2), size=frame_emb.shape[1], mode='linear', align_corners=False
+                ).transpose(1, 2)
+            frame_emb = frame_emb + stem_emb
+
+        # Predict target length if not provided
         if target_length is None:
             target_length = int(self.length_predictor(frame_emb, src_len).mean().item())
             target_length = max(1, min(target_length, self.max_length))
@@ -762,30 +1687,44 @@ class PointerNetwork(nn.Module):
         all_pointers = []
 
         for _ in range(n_samples):
+            # Style conditioning from VAE
             style_cond, _, _ = self.style_vae(frame_emb, sample=sample_style)
+
+            # Duration conditioning
             cond_frame_emb = self.duration_cond(frame_emb, target_length)
             cond_frame_emb = cond_frame_emb + style_cond.unsqueeze(1)
 
+            # Decoder queries (learned embeddings for each output position)
             positions = torch.arange(target_length, device=device).unsqueeze(0).expand(batch_size, -1)
             queries = self.query_embed(positions.clamp(0, self.stop_embed_idx - 1))
 
-            hier_out, _ = self.hierarchical_attn(queries, cond_frame_emb, beat_emb, bar_emb)
-            sparse_out = self.sparse_attn(hier_out, cond_frame_emb, cond_frame_emb)
-            decoder_out = hier_out + sparse_out
+            # Position-aware windowed cross-attention
+            # Attends to window around expected position + global tokens
+            decoder_out = self.windowed_attn(
+                queries, cond_frame_emb, global_tokens,
+                self.compression_ratio
+            )
 
+            # Decoder transformer layers
             for layer in self.decoder_layers:
                 decoder_out = layer(decoder_out, cond_frame_emb)
+            decoder_out = self.decoder_norm(decoder_out)
 
-            pointer_queries = self.pointer_proj(decoder_out)
-            pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2))
+            # Delta prediction
+            delta_outputs = self.delta_head(decoder_out)
 
-            if temperature > 0:
-                probs = F.softmax(pointer_logits / temperature, dim=-1)
-                pointers = torch.multinomial(probs.view(-1, src_len), 1).view(batch_size, target_length)
-            else:
-                pointers = pointer_logits.argmax(dim=-1)
+            # Decode predictions to absolute pointer positions
+            pointers = self.delta_head.decode_predictions(
+                delta_outputs['delta_logits'],
+                delta_outputs['jump_logits'],
+                delta_outputs['use_jump_logits'],
+                self.compression_ratio,
+                src_len,
+                temperature=temperature,
+            )
 
-            stop_logits = self.stop_head(decoder_out).squeeze(-1)
+            # Apply stop tokens
+            stop_logits = delta_outputs['stop_logits']
             stops = torch.sigmoid(stop_logits) > stop_threshold
 
             for b in range(batch_size):
@@ -799,132 +1738,6 @@ class PointerNetwork(nn.Module):
             return {'pointers': all_pointers[0], 'predicted_length': target_length}
         return {'pointers': torch.stack(all_pointers, dim=1), 'predicted_length': target_length}
 
-    @torch.no_grad()
-    def generate_hierarchical(
-        self,
-        raw_mel: torch.Tensor,
-        target_length: Optional[int] = None,
-        temperature: float = 1.0,
-        sample_style: bool = True,
-        stop_threshold: float = 0.5,
-        coarse_to_fine: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        """Generate pointer sequence using coarse-to-fine hierarchical sampling.
-
-        Instead of directly predicting frame pointers, first sample bar,
-        then sample beat within bar context, then sample frame within beat context.
-        This provides more structured outputs that respect musical boundaries.
-        """
-        batch_size = raw_mel.shape[0]
-        device = raw_mel.device
-
-        encoded = self.encoder(raw_mel)
-        frame_emb = encoded['frame']
-        beat_emb = encoded['beat']
-        bar_emb = encoded['bar']
-        src_len = frame_emb.shape[1]
-        n_beats = beat_emb.shape[1]
-        n_bars = bar_emb.shape[1]
-
-        if target_length is None:
-            target_length = int(self.length_predictor(frame_emb, src_len).mean().item())
-            target_length = max(1, min(target_length, self.max_length))
-
-        style_cond, _, _ = self.style_vae(frame_emb, sample=sample_style)
-        cond_frame_emb = self.duration_cond(frame_emb, target_length)
-        cond_frame_emb = cond_frame_emb + style_cond.unsqueeze(1)
-
-        positions = torch.arange(target_length, device=device).unsqueeze(0).expand(batch_size, -1)
-        queries = self.query_embed(positions.clamp(0, self.stop_embed_idx - 1))
-
-        hier_out, _ = self.hierarchical_attn(queries, cond_frame_emb, beat_emb, bar_emb)
-        sparse_out = self.sparse_attn(hier_out, cond_frame_emb, cond_frame_emb)
-        decoder_out = hier_out + sparse_out
-
-        for layer in self.decoder_layers:
-            decoder_out = layer(decoder_out, cond_frame_emb)
-
-        if coarse_to_fine:
-            # Step 1: Sample bar indices
-            bar_queries = self.bar_pointer_proj(decoder_out)
-            bar_logits = torch.matmul(bar_queries, bar_emb.transpose(1, 2))
-            if temperature > 0:
-                bar_probs = F.softmax(bar_logits / temperature, dim=-1)
-                bar_indices = torch.multinomial(bar_probs.view(-1, n_bars), 1).view(batch_size, target_length)
-            else:
-                bar_indices = bar_logits.argmax(dim=-1)
-
-            # Step 2: Sample beat indices (constrained to selected bar)
-            beat_queries = self.beat_pointer_proj(decoder_out)
-            beat_logits = torch.matmul(beat_queries, beat_emb.transpose(1, 2))
-
-            # Mask beats outside selected bar
-            beat_mask = torch.zeros(batch_size, target_length, n_beats, device=device)
-            for b in range(batch_size):
-                for t in range(target_length):
-                    bar_idx = bar_indices[b, t].item()
-                    beat_start = bar_idx * self.beats_per_bar
-                    beat_end = min((bar_idx + 1) * self.beats_per_bar, n_beats)
-                    beat_mask[b, t, beat_start:beat_end] = 1.0
-
-            beat_logits = beat_logits.masked_fill(beat_mask == 0, float('-inf'))
-            if temperature > 0:
-                beat_probs = F.softmax(beat_logits / temperature, dim=-1)
-                # Handle potential all-inf case
-                beat_probs = beat_probs.nan_to_num(0)
-                beat_probs = beat_probs / beat_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                beat_indices = torch.multinomial(beat_probs.view(-1, n_beats), 1).view(batch_size, target_length)
-            else:
-                beat_indices = beat_logits.argmax(dim=-1)
-
-            # Step 3: Sample frame indices (constrained to selected beat)
-            pointer_queries = self.pointer_proj(decoder_out)
-            frame_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2))
-
-            # Mask frames outside selected beat
-            frame_mask = torch.zeros(batch_size, target_length, src_len, device=device)
-            for b in range(batch_size):
-                for t in range(target_length):
-                    beat_idx = beat_indices[b, t].item()
-                    frame_start = beat_idx * self.frames_per_beat
-                    frame_end = min((beat_idx + 1) * self.frames_per_beat, src_len)
-                    frame_mask[b, t, frame_start:frame_end] = 1.0
-
-            frame_logits = frame_logits.masked_fill(frame_mask == 0, float('-inf'))
-            if temperature > 0:
-                frame_probs = F.softmax(frame_logits / temperature, dim=-1)
-                frame_probs = frame_probs.nan_to_num(0)
-                frame_probs = frame_probs / frame_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                pointers = torch.multinomial(frame_probs.view(-1, src_len), 1).view(batch_size, target_length)
-            else:
-                pointers = frame_logits.argmax(dim=-1)
-        else:
-            # Standard frame-level generation (no hierarchy)
-            pointer_queries = self.pointer_proj(decoder_out)
-            pointer_logits = torch.matmul(pointer_queries, cond_frame_emb.transpose(1, 2))
-            if temperature > 0:
-                probs = F.softmax(pointer_logits / temperature, dim=-1)
-                pointers = torch.multinomial(probs.view(-1, src_len), 1).view(batch_size, target_length)
-            else:
-                pointers = pointer_logits.argmax(dim=-1)
-            bar_indices = pointers // self.frames_per_bar
-            beat_indices = pointers // self.frames_per_beat
-
-        # Apply stop tokens
-        stop_logits = self.stop_head(decoder_out).squeeze(-1)
-        stops = torch.sigmoid(stop_logits) > stop_threshold
-        for b in range(batch_size):
-            stop_pos = stops[b].nonzero(as_tuple=True)[0]
-            if len(stop_pos) > 0:
-                pointers[b, stop_pos[0]:] = STOP_TOKEN
-
-        return {
-            'pointers': pointers,
-            'bar_indices': bar_indices,
-            'beat_indices': beat_indices,
-            'predicted_length': target_length,
-        }
-
     @classmethod
     def from_checkpoint(cls, path: str, device: str = 'cuda') -> 'PointerNetwork':
         checkpoint = torch.load(path, map_location=device)
@@ -933,10 +1746,27 @@ class PointerNetwork(nn.Module):
         return model.to(device)
 
     def save_checkpoint(self, path: str, optimizer=None, epoch: int = 0, **kwargs):
+        """Save model checkpoint with V2 architecture config."""
         checkpoint = {
-            'model_config': {'d_model': self.d_model, 'max_length': self.max_length},
+            'model_config': {
+                'n_mels': self.n_mels,
+                'd_model': self.d_model,
+                'max_length': self.max_length,
+                'frames_per_beat': self.frames_per_beat,
+                'beats_per_bar': self.beats_per_bar,
+                'use_pre_norm': self.use_pre_norm,
+                'use_stems': self.use_stems,
+                'n_stems': self.n_stems,
+                'dim_feedforward': self.dim_feedforward,
+                'label_smoothing': self.label_smoothing,
+                # V2 full-sequence parameters
+                'compression_ratio': self.compression_ratio,
+                'attn_window_size': self.attn_window_size,
+                'max_delta': self.max_delta,
+            },
             'model_state_dict': self.state_dict(),
             'epoch': epoch,
+            'architecture_version': 'v2',  # Mark as V2 for compatibility checking
         }
         if optimizer:
             checkpoint['optimizer_state_dict'] = optimizer.state_dict()

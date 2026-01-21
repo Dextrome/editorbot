@@ -32,6 +32,18 @@ class PointerNetworkConfig:
     # Pointer output
     max_output_length: int = 65536  # Maximum output sequence length
 
+    # V2 architecture features
+    use_pre_norm: bool = True  # Pre-LayerNorm for stability
+    use_stems: bool = False  # Multi-stem encoder
+    n_stems: int = 4  # Number of stems (drums, bass, vocals, other)
+
+    # V2 Full-Sequence Architecture (Delta Prediction)
+    compression_ratio: float = 0.67  # Expected output/input ratio (edit is ~67% of raw)
+    attn_window_size: int = 512  # Window size for position-aware cross-attention
+    max_delta: int = 64  # Max small delta offset (larger = jump prediction)
+    n_global_tokens: int = 64  # Number of global summary tokens
+    global_token_stride: int = 1000  # Frames per global token
+
     # Training
     batch_size: int = 4
     learning_rate: float = 1e-5  # Lower LR for stability
@@ -59,7 +71,7 @@ class TrainConfig:
     # Data paths
     cache_dir: str = "F:/editorbot/cache"
     pointer_dir: str = "F:/editorbot/training_data/pointer_sequences"
-    save_dir: str = "F:/editorbot/models/pointer_network"
+    save_dir: str = "F:/editorbot/models/pointer_network_full"
 
     # Training params
     batch_size: int = 4
@@ -67,16 +79,19 @@ class TrainConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 500  # Linear warmup steps
+    label_smoothing: float = 0.1  # Label smoothing for cross-entropy loss
 
     # Performance optimizations
     num_workers: int = 0  # DataLoader workers (0 = main process, faster when data preloaded)
     prefetch_factor: int = 2  # Batches to prefetch per worker
     use_amp: bool = True  # Automatic mixed precision
-    use_compile: bool = True  # torch.compile (PyTorch 2.0+)
+    use_bfloat16: bool = True  # Use bfloat16 instead of float16 (more stable)
+    use_gradient_checkpoint: bool = False  # Gradient checkpointing (saves VRAM, slower)
+    use_compile: bool = False  # torch.compile (requires Triton, not available on Windows)
     gradient_accumulation_steps: int = 1  # Accumulate gradients
     pin_memory: bool = True  # Pin memory for faster GPU transfer
     persistent_workers: bool = True  # Keep workers alive between epochs
-    use_onecycle: bool = True  # Use OneCycleLR scheduler (often faster convergence)
+    scheduler_type: str = "warmup_cosine"  # "warmup_cosine", "onecycle", or "none"
     max_lr_mult: float = 3.0  # OneCycleLR max_lr = learning_rate * max_lr_mult
 
     # Logging
@@ -139,6 +154,12 @@ def get_mini_config() -> PointerNetworkConfig:
         chunk_size=512,
         chunk_overlap=64,
         max_output_length=65536,
+        # V2 full-sequence settings (smaller for mini)
+        compression_ratio=0.67,
+        attn_window_size=256,  # Smaller window for mini model
+        max_delta=32,
+        n_global_tokens=32,
+        global_token_stride=500,
         # Training - higher LR ok for smaller model
         batch_size=4,
         learning_rate=3e-4,

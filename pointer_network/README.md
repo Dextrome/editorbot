@@ -78,19 +78,53 @@ pip install torch librosa numpy tqdm
 
 ## Usage
 
+### Data Preparation (Required for New Samples)
+
+Before training, you need to precache mel spectrograms and generate pointer sequences:
+
+```bash
+# Precache specific new samples (generates mels + pointer sequences)
+python -m pointer_network.precache_samples bubbletron 20180927darkjam
+
+# Or precache all uncached samples
+python -m pointer_network.precache_samples
+
+# (Optional) Precache Demucs stems - only needed if use_stems=True in config
+# Step 1: Extract stems from audio (creates raw audio waveforms)
+python scripts/precache_stems.py --data_dir training_data --cache_dir cache
+
+# Step 2: Convert stem audio to mel spectrograms (required for model)
+python scripts/convert_stems_to_mel.py
+```
+
+This creates:
+- `cache/features/{sample}_raw.npz` - Mel spectrogram for raw audio
+- `cache/features/{sample}_edit.npz` - Mel spectrogram for edited audio
+- `cache/stems/{sample}_raw_stems.npz` - Raw audio waveforms for each stem (intermediate)
+- `cache/stems_mel/{sample}_raw_stems.npz` - Mel spectrograms for each stem (used by model)
+- `training_data/pointer_sequences/{sample}_pointers.npy` - Pointer sequence
+- `training_data/pointer_sequences/{sample}_info.json` - Metadata
+- `training_data/pointer_sequences/{sample}_alignment.png` - Visualization
+
 ### Training
 
 ```bash
-# Generate pointer sequences from aligned audio pairs
-python _generate_pointer_sequences.py
-
-# Train the pointer network
+# Train using config file (recommended)
 python -m pointer_network.trainers.pointer_trainer \
-    --cache-dir training_data/super_editor_cache \
+    --config pointer_network/configs/full.json
+
+# Or with explicit paths
+python -m pointer_network.trainers.pointer_trainer \
+    --cache-dir cache \
     --pointer-dir training_data/pointer_sequences \
     --save-dir models/pointer_network \
     --epochs 100 \
     --batch-size 4
+
+# Resume from checkpoint
+python -m pointer_network.trainers.pointer_trainer \
+    --config pointer_network/configs/full.json \
+    --resume models/pointer_network_full_v2/latest.pt
 ```
 
 ### Inference
@@ -257,10 +291,72 @@ print(result['beat_indices'])  # Which beats within bars
 print(result['pointers'])      # Final frame pointers
 ```
 
+## Stem Support
+
+The model supports multi-stem input from Demucs source separation (drums, bass, vocals, other). When enabled, the StemEncoder processes each stem independently and fuses them with the main mel spectrogram.
+
+### Configuration
+
+In your config JSON:
+```json
+{
+    "model": {
+        "use_stems": true,
+        "n_stems": 4
+    }
+}
+```
+
+### Data Pipeline
+
+1. **Extract stems**: Run `scripts/precache_stems.py` to separate audio into stems using Demucs
+2. **Convert to mel**: Run `scripts/convert_stems_to_mel.py` to convert stem audio to mel spectrograms
+3. **Train**: The dataset will automatically load stems from `cache/stems_mel/`
+
+### Architecture
+
+```
+Raw Mel (128, T) ─────┐
+                      │
+Drums Mel (128, T) ───┼──→ StemEncoder ──→ Fused Features (d_model, T)
+Bass Mel (128, T) ────┤         │
+Vocals Mel (128, T) ──┤    Linear + Concat + Linear
+Other Mel (128, T) ───┘
+```
+
 ## Future Improvements
 
 - [x] Hierarchical pointers (bar → beat → frame) ✅ IMPLEMENTED
-- [ ] Edit operations format (COPY, LOOP, etc.)
+- [x] Multi-stem support (drums, bass, vocals, other) ✅ IMPLEMENTED
+- [x] Edit operations format (COPY, LOOP, etc.) ✅ IMPLEMENTED
 - [ ] Style conditioning from reference tracks
 - [ ] RL fine-tuning with audio quality rewards
-- [ ] Multi-track awareness for stem coherence
+
+## Edit Operations
+
+The model supports frame-level edit operation prediction alongside pointer prediction. Operations are automatically detected from pointer sequences:
+
+| Operation | Description |
+|-----------|-------------|
+| COPY | Normal 1:1 frame copying |
+| LOOP_START | Beginning of a repeated section |
+| LOOP_END | End of loop, jumping back |
+| SKIP | Forward jump (cut out content) |
+| FADE_IN | Frames after a transition |
+| FADE_OUT | Frames before a transition |
+| STOP | End of sequence |
+
+### Generating Edit Ops
+
+```bash
+# Generate ops for all existing pointer sequences
+python -m pointer_network.generate_edit_ops
+
+# Generate ops for specific samples
+python -m pointer_network.generate_edit_ops sample1 sample2
+
+# Force regeneration of existing ops
+python -m pointer_network.generate_edit_ops --force
+```
+
+This creates `{sample}_ops.npy` files alongside the pointer files. The dataset automatically loads these if available.

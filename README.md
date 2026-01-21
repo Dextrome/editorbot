@@ -8,7 +8,7 @@ This project explores multiple approaches to learning audio editing from example
 
 | Approach | Status | Description |
 |----------|--------|-------------|
-| **Pointer Network** | **Current Focus** | Learns to reorder/select frames from raw audio |
+| **Pointer Network** | **Current Focus** | Edit operations + multi-stem + stable training |
 | Supervised Mel Reconstruction | Implemented | Direct mel spectrogram reconstruction |
 | RL with Factored Actions | Implemented | Sequential decision making with PPO |
 | Mel-to-Mel Editor | Experimental | Transformer-based mel transformation |
@@ -19,46 +19,72 @@ Instead of generating new audio, the pointer network learns to **copy and reorde
 
 ```
 Raw Mel (T_raw frames)
-        │
-        ▼
-┌───────────────────────┐
-│   Multi-Scale Encoder │  ← Frame/Beat/Bar level encoding
-│   + Music-Aware PE    │  ← Beat, bar, phrase structure
-│   + Edit Style VAE    │  ← Latent space for edit diversity
-└───────────────────────┘
-        │
-        ▼
-┌───────────────────────┐
-│  Hierarchical Decoder │  ← Bar → Beat → Frame prediction
-│   + Sparse Attention  │  ← O(n) not O(n²)
-│   + KV Caching        │  ← Fast inference
-└───────────────────────┘
-        │
-        ▼
-Pointer Sequence (T_edit indices into raw)
+        |
+        v
++---------------------------+
+|   Multi-Scale Encoder     |  <- Frame/Beat/Bar level encoding
+|   + Music-Aware PE        |  <- Beat, bar, phrase structure
+|   + Edit Style VAE        |  <- Latent space for edit diversity
+|   + Stem Encoder (opt)    |  <- Multi-track: drums, bass, vocals, other
++---------------------------+
+        |
+        v
++---------------------------+
+|  Hierarchical Decoder     |  <- Bar -> Beat -> Frame prediction
+|   + Pre-LayerNorm         |  <- Stable training (no NaN)
+|   + Sparse Attention      |  <- O(n) not O(n^2)
+|   + KV Caching            |  <- Fast inference
++---------------------------+
+        |
+        v
++---------------------------+
+|  Edit Op Head             |  <- COPY, LOOP, SKIP, FADE, STOP
+|  Pointer Head             |  <- Frame indices into raw
++---------------------------+
 ```
 
 ### Why Pointers?
 
 - **Preserves quality**: Copies frames, never generates
 - **Learns patterns**: Cuts, loops, reordering from examples
-- **Hierarchical**: Coarse-to-fine (bar → beat → frame) for musical coherence
+- **Hierarchical**: Coarse-to-fine (bar -> beat -> frame) for musical coherence
 - **Variable length**: STOP token handles different output lengths
+- **Edit operations**: Explicit labels for what each edit does
 
-### Special Tokens
+### Special Tokens & Edit Operations
 
 | Token | Value | Purpose |
 |-------|-------|---------|
 | `STOP_TOKEN` | -2 | End of output sequence |
 | `PAD_TOKEN` | -1 | Padding for batching |
 
+| EditOp | Value | Purpose |
+|--------|-------|---------|
+| `COPY` | 0 | Copy frame at pointer position |
+| `LOOP_START` | 1 | Mark start of loop region |
+| `LOOP_END` | 2 | End loop, jump back to LOOP_START |
+| `SKIP` | 3 | Skip N frames (cut) |
+| `FADE_IN` | 4 | Apply fade in |
+| `FADE_OUT` | 5 | Apply fade out |
+| `STOP` | 6 | End of sequence |
+
 ### Quick Start (Pointer Network)
 
 ```bash
-# 1. Generate pointer sequences from paired audio
+# 1. Find optimal learning rate
+python -m pointer_network.lr_finder --pointer-dir training_data/pointer_sequences
+
+# 2. Generate pointer sequences from paired audio
 python -m pointer_network.generate_pointer_sequences
 
-# 2. Train the pointer network
+# 3. (Optional) Precache stems for multi-track mode
+# 3a. Extract stems from audio (raw audio waveforms)
+python -m scripts.precache_stems
+
+# 3b. Convert stems to mel spectrograms (required for model)
+python scripts/convert_stems_to_mel.py
+
+# 4. Train the pointer network
 python -m pointer_network.trainers.pointer_trainer \
     --cache-dir cache \
     --pointer-dir training_data/pointer_sequences \
@@ -69,11 +95,16 @@ python -m pointer_network.trainers.pointer_trainer \
 ### Inference Example
 
 ```python
-from pointer_network import PointerNetwork
+from pointer_network import PointerNetwork, EditOp
 import torch
 
 # Load trained model
-model = PointerNetwork(d_model=256, n_heads=8).cuda()
+model = PointerNetwork(
+    d_model=256,
+    n_heads=8,
+    use_pre_norm=True,   # Pre-LayerNorm for stability
+    use_edit_ops=True,   # Edit operation tokens
+).cuda()
 checkpoint = torch.load('models/pointer_network/best.pt')
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
@@ -85,6 +116,9 @@ with torch.no_grad():
 
 # Reconstruct edited audio by selecting frames
 edited_mel = raw_mel[:, pointers[pointers >= 0]]
+
+# EditOp usage
+print(EditOp.names())  # ['COPY', 'LOOP_START', 'LOOP_END', 'SKIP', 'FADE_IN', 'FADE_OUT', 'STOP']
 ```
 
 ## Setup
@@ -120,7 +154,7 @@ training_data/
 └── reference/       # Additional finished tracks (optional)
 ```
 
-Files are matched by name prefix (e.g., `song1_raw.wav` ↔ `song1_edit.wav`).
+Files are matched by name prefix (e.g., `song1_raw.wav` <-> `song1_edit.wav`).
 
 ## Project Structure
 
@@ -128,12 +162,13 @@ Files are matched by name prefix (e.g., `song1_raw.wav` ↔ `song1_edit.wav`).
 editorbot/
 ├── pointer_network/           # Pointer-based editing (CURRENT FOCUS)
 │   ├── models/
-│   │   └── pointer_network.py # Main model with hierarchical pointers
+│   │   └── pointer_network.py # Main model with all features
 │   ├── data/
 │   │   └── dataset.py         # PointerDataset, collate_fn
 │   ├── trainers/
-│   │   └── pointer_trainer.py # Training loop
+│   │   └── pointer_trainer.py # Training loop with bfloat16
 │   ├── generate_pointer_sequences.py  # Create training data
+│   ├── lr_finder.py           # Learning rate finder
 │   └── config.py              # Configuration
 │
 ├── super_editor/              # Multi-component editor
@@ -150,7 +185,7 @@ editorbot/
 │   ├── train.py               # PPO training loop
 │   ├── agent.py               # Policy/Value networks
 │   ├── environment.py         # Gymnasium environment
-│   ├── actions.py             # Factored action space (20×5×5)
+│   ├── actions.py             # Factored action space (20x5x5)
 │   ├── config.py              # Hyperparameters
 │   ├── features.py            # Audio feature extraction
 │   ├── supervised_trainer.py  # Supervised reconstruction
@@ -211,7 +246,7 @@ The factored action space uses 3 heads instead of 500 discrete actions:
 
 ## Configuration
 
-### Pointer Network
+### Pointer Network Model
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -222,6 +257,22 @@ The factored action space uses 3 heads instead of 500 discrete actions:
 | `n_decoder_layers` | 4 | Decoder layers |
 | `frames_per_beat` | 43 | ~86ms at 22050Hz, hop=256 |
 | `frames_per_bar` | 172 | 4 beats per bar |
+| `use_pre_norm` | True | Pre-LayerNorm (stable training) |
+| `use_edit_ops` | True | Edit operation tokens |
+| `use_stems` | False | Multi-stem encoding |
+| `n_stems` | 4 | Number of stems |
+| `label_smoothing` | 0.1 | Label smoothing for loss |
+
+### Pointer Network Training
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `learning_rate` | 1e-5 | Base learning rate |
+| `scheduler_type` | warmup_cosine | Scheduler: warmup, warmup_cosine, cosine, onecycle |
+| `warmup_steps` | 1000 | Linear warmup steps |
+| `use_bfloat16` | True | bfloat16 mixed precision (stable) |
+| `gradient_clip` | 1.0 | Gradient clipping |
+| `weight_decay` | 0.01 | AdamW weight decay |
 
 ### Audio Processing
 
@@ -237,11 +288,12 @@ The factored action space uses 3 heads instead of 500 discrete actions:
 | Loss | Weight | Purpose |
 |------|--------|---------|
 | Frame Pointer CE | 1.0 | Main frame-level prediction |
-| Bar Pointer CE | 0.3 | Coarse bar-level guidance |
+| Bar Pointer CE | 0.2 | Coarse bar-level guidance |
 | Beat Pointer CE | 0.3 | Medium beat-level guidance |
+| Edit Op CE | 1.0 | Edit operation prediction |
 | Stop BCE | 0.5 | End-of-sequence prediction |
-| KL Divergence | 0.01 | VAE regularization |
-| Length MSE | 0.1 | Output length prediction |
+| KL Divergence | 0.1 | VAE regularization |
+| Length MSE | 0.01 | Output length prediction |
 
 ### Metric Targets
 
@@ -254,11 +306,20 @@ The factored action space uses 3 heads instead of 500 discrete actions:
 
 ## Training Tips
 
-1. **Start with mini config**: Use `d_model=128`, 2 layers for fast iteration
-2. **Monitor gradient norms**: Should stay <10 after clipping; >100 indicates instability
-3. **Check alignment quality**: Pointer sequences should have >95% valid alignments
-4. **Use mixed precision**: AMP gives ~2x speedup with minimal quality loss
-5. **Lower LR if unstable**: Start with 5e-5 if gradients explode, increase gradually
+### Stability Features (Prevent NaN)
+
+1. **Pre-LayerNorm** (default): Normalizes before attention, much more stable
+2. **bfloat16** (default): Same exponent range as float32, no GradScaler needed
+3. **Warmup+Cosine scheduler** (default): No LR spikes like OneCycleLR
+4. **Label smoothing**: 0.1 default prevents overconfident predictions
+5. **Xavier init with gain=0.1**: Small initial weights for stability
+
+### General Tips
+
+1. **Run LR finder first**: `python -m pointer_network.lr_finder`
+2. **Start with mini config**: Use `d_model=128`, 2 layers for fast iteration
+3. **Monitor gradient norms**: Should stay <10 after clipping
+4. **Check alignment quality**: Pointer sequences should have >95% valid alignments
 
 ## Monitoring
 
@@ -270,7 +331,9 @@ tensorboard --logdir logs
 - `pointer_loss` - Frame-level pointer accuracy
 - `bar_pointer_loss` - Bar-level prediction
 - `beat_pointer_loss` - Beat-level prediction
+- `op_loss` - Edit operation prediction
 - `val_accuracy` - Validation pointer accuracy
+- `grad_norm` - Gradient norm (should stay <10)
 
 ## Requirements
 
@@ -292,12 +355,12 @@ tensorboard --logdir logs
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| Gradients exploding (>100 norm) | LR too high or unstable data | Lower LR to 5e-5, check data alignment |
+| Gradients exploding (>100 norm) | LR too high or unstable data | Lower LR to 5e-5, use warmup_cosine scheduler |
 | Loss stuck at high value | Model not learning | Verify data pipeline, try smaller model first |
 | OOM errors | Batch/sequence too large | Reduce batch size, enable chunking |
 | All pointers same value | Action collapse | Increase label smoothing, check loss weights |
 | Training very slow | Variable sequence lengths | Use fixed-length collation for torch.compile |
-| NaN in loss | Numerical instability | Enable AMP, add gradient clipping |
+| NaN in loss | Numerical instability | Use bfloat16 (default), enable Pre-LayerNorm |
 
 ## Lessons Learned
 
@@ -314,11 +377,17 @@ Approaches that **didn't work** (documented in `audio_slicer/`):
 
 ## Roadmap
 
-- [x] Hierarchical pointers (bar → beat → frame)
+- [x] Hierarchical pointers (bar -> beat -> frame)
 - [x] Sparse attention for long sequences
 - [x] OneCycleLR scheduler
-- [ ] Edit operation tokens (COPY, LOOP, CUT labels)
-- [ ] Multi-track stem coherence
+- [x] Pre-LayerNorm for stable training
+- [x] bfloat16 mixed precision
+- [x] Edit operation tokens (COPY, LOOP, SKIP, FADE, STOP)
+- [x] Multi-stem encoder (StemEncoder)
+- [x] Warmup+Cosine scheduler (stable, no spikes)
+- [x] LR finder script
+- [x] Stem-to-mel conversion pipeline
+- [ ] Generate edit op training data
 
 ## Development
 
@@ -329,5 +398,8 @@ See `CLAUDE.md` for detailed development guidelines.
 pytest rl_editor/tests/
 
 # Check pointer network compiles
-python -c "from pointer_network import PointerNetwork; print('OK')"
+python -c "from pointer_network import PointerNetwork, EditOp; print('OK')"
+
+# Run LR finder
+python -m pointer_network.lr_finder --pointer-dir training_data/pointer_sequences
 ```

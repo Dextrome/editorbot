@@ -1,5 +1,6 @@
 # Pointer Network for Audio Editing
 # Learns to generate sequences of frame pointers from raw audio
+# Now includes: Pre-LayerNorm, Edit Operations, Multi-Stem support
 
 from .models import (
     PointerNetwork,
@@ -9,6 +10,12 @@ from .models import (
     SparseAttention,
     EditStyleVAE,
     StructurePredictionHead,
+    # V2 features (now integrated)
+    EditOp,
+    PreNormTransformerEncoderLayer,
+    PreNormTransformerDecoderLayer,
+    StemEncoder,
+    # Constants
     STOP_TOKEN,
     PAD_TOKEN,
 )
@@ -25,6 +32,12 @@ __all__ = [
     'SparseAttention',
     'EditStyleVAE',
     'StructurePredictionHead',
+    # V2 features (Pre-LayerNorm, Edit Ops, Stems)
+    'EditOp',
+    'PreNormTransformerEncoderLayer',
+    'PreNormTransformerDecoderLayer',
+    'StemEncoder',
+    # Constants
     'STOP_TOKEN',
     'PAD_TOKEN',
     # Data

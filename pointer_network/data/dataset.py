@@ -8,9 +8,35 @@ from typing import Optional, Dict, List, Tuple, TYPE_CHECKING
 import random
 from functools import lru_cache
 import sys
+import librosa
 
 if TYPE_CHECKING:
     from .augmentation import Augmentor, AugmentationConfig
+
+# Audio params for stem mel conversion (must match training)
+STEM_SR = 22050
+STEM_N_FFT = 2048
+STEM_HOP_LENGTH = 256
+STEM_N_MELS = 128
+
+
+def audio_to_mel(audio: np.ndarray, sr: int = STEM_SR) -> np.ndarray:
+    """Convert raw audio waveform to mel spectrogram.
+
+    Args:
+        audio: (samples,) raw audio waveform
+        sr: sample rate
+
+    Returns:
+        mel: (n_mels, time) normalized mel spectrogram
+    """
+    mel = librosa.feature.melspectrogram(
+        y=audio, sr=sr, n_fft=STEM_N_FFT, hop_length=STEM_HOP_LENGTH, n_mels=STEM_N_MELS
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    mel_db = (mel_db + 80) / 80  # Normalize to [0, 1]
+    mel_db = np.clip(mel_db, 0, 1)
+    return mel_db
 
 
 def get_path_stem(path_str: str) -> str:
@@ -31,6 +57,12 @@ class PointerDataset(Dataset):
     Each sample contains:
     - raw_mel: mel spectrogram of raw audio
     - target_pointers: sequence of frame indices (edited -> raw mapping)
+
+    V2 Architecture Support:
+    - validation_mode=True: Uses full raw mel without cropping, which is required
+      for delta prediction to work correctly at inference time.
+    - validation_mode=False: Crops raw mel to pointer region for memory efficiency
+      during training (only valid for V1 architecture).
     """
 
     def __init__(
@@ -48,6 +80,9 @@ class PointerDataset(Dataset):
         real_only: bool = False,
         augment: bool = False,
         augmentation_config: Optional["AugmentationConfig"] = None,
+        use_stems: bool = False,
+        stems_dir: Optional[str] = None,
+        validation_mode: bool = False,
     ):
         """
         Args:
@@ -64,6 +99,9 @@ class PointerDataset(Dataset):
             real_only: if True, only include samples WITHOUT '_synth' in name
             augment: if True, apply data augmentation during training
             augmentation_config: configuration for augmentation (uses defaults if None)
+            validation_mode: if True, use full raw mel without cropping (required for
+                V2 delta prediction architecture). When False, crops raw mel to pointer
+                region for memory efficiency.
         """
         self.cache_dir = Path(cache_dir)
         self.pointer_dir = Path(pointer_dir)
@@ -77,6 +115,9 @@ class PointerDataset(Dataset):
         self.synthetic_only = synthetic_only
         self.real_only = real_only
         self.augment = augment
+        self.use_stems = use_stems
+        self.stems_dir = Path(stems_dir) if stems_dir else self.cache_dir / "stems_mel"
+        self.validation_mode = validation_mode
 
         # Setup augmentation
         self.augmentor = None
@@ -105,6 +146,35 @@ class PointerDataset(Dataset):
             self._preloaded_mels[sample['name']] = mel
             total_mb += mel.nbytes / (1024 * 1024)
         print(f"Preloaded {len(self._preloaded_mels)} mels ({total_mb:.1f} MB)")
+
+        # Preload edit ops if available
+        self._preloaded_ops = {}
+        n_ops_loaded = 0
+        for sample in self.samples:
+            if sample['ops_file'] is not None:
+                self._preloaded_ops[sample['name']] = np.load(sample['ops_file'])
+                n_ops_loaded += 1
+        if n_ops_loaded > 0:
+            print(f"Preloaded {n_ops_loaded} edit ops sequences")
+
+        # Preload stems if enabled
+        self._preloaded_stems = {}
+        if self.use_stems:
+            stems_mb = 0
+            print("Preloading stems into RAM...")
+            for sample in self.samples:
+                stems_file = sample.get('stems_file')
+                if stems_file and stems_file.exists():
+                    stems_data = np.load(stems_file)
+                    # stems_data contains: drums, bass, vocals, other (each is mel spectrogram)
+                    self._preloaded_stems[sample['name']] = {
+                        'drums': stems_data['drums'],
+                        'bass': stems_data['bass'],
+                        'vocals': stems_data['vocals'],
+                        'other': stems_data['other'],
+                    }
+                    stems_mb += sum(s.nbytes for s in self._preloaded_stems[sample['name']].values()) / (1024 * 1024)
+            print(f"Preloaded {len(self._preloaded_stems)} stems ({stems_mb:.1f} MB)")
 
     def _find_samples(self) -> List[Dict]:
         """Find all valid training samples."""
@@ -159,6 +229,18 @@ class PointerDataset(Dataset):
                 print(f"  Tried: {[str(p) for p in possible_patterns]}")
                 continue
 
+            # Find stems file if stems are enabled
+            stems_file = None
+            if self.use_stems:
+                stems_file = self.stems_dir / f"{base_name}_raw_stems.npz"
+                if not stems_file.exists():
+                    stems_file = None  # Will fallback to no stems for this sample
+
+            # Find ops file if it exists
+            ops_file = self.pointer_dir / f"{base_name}_ops.npy"
+            if not ops_file.exists():
+                ops_file = None
+
             samples.append({
                 'name': base_name,
                 'pointer_file': pointer_file,
@@ -166,12 +248,15 @@ class PointerDataset(Dataset):
                 'raw_mel_file': raw_mel_file,
                 'raw_frames': info['raw_frames'],
                 'edit_frames': info['edit_frames'],
+                'stems_file': stems_file,
+                'ops_file': ops_file,
             })
 
         return samples
 
     def __len__(self) -> int:
-        if self.chunk_size is None:
+        # In validation mode, always use full samples (no chunking)
+        if self.validation_mode or self.chunk_size is None:
             return len(self.samples)
         else:
             # Count total chunks across all samples
@@ -182,7 +267,10 @@ class PointerDataset(Dataset):
             return total
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        if self.chunk_size is None:
+        # In validation mode, always use full samples (required for V2 delta prediction)
+        if self.validation_mode:
+            return self._get_full_sample_v2(idx)
+        elif self.chunk_size is None:
             return self._get_full_sample(idx)
         else:
             return self._get_chunk(idx)
@@ -220,6 +308,15 @@ class PointerDataset(Dataset):
             return self._preloaded_pointers[sample['name']].copy()
         return np.load(sample['pointer_file'])
 
+    def _load_ops(self, sample: Dict) -> Optional[np.ndarray]:
+        """Load edit ops if available, using preloaded cache."""
+        name = sample['name']
+        if name in self._preloaded_ops:
+            return self._preloaded_ops[name].copy()
+        if sample.get('ops_file') is not None:
+            return np.load(sample['ops_file'])
+        return None
+
     def _get_full_sample(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a full sample (may be truncated if too long)."""
         sample = self.samples[idx]
@@ -230,6 +327,9 @@ class PointerDataset(Dataset):
         # Load pointers (from preloaded cache or disk)
         pointers = self._load_pointers(sample)
 
+        # Load edit ops if available
+        ops = self._load_ops(sample)
+
         # Truncate if needed
         if raw_mel.shape[1] > self.max_raw_frames:
             raw_mel = raw_mel[:, :self.max_raw_frames]
@@ -239,6 +339,8 @@ class PointerDataset(Dataset):
 
         if len(pointers) > self.max_edit_frames:
             pointers = pointers[:self.max_edit_frames]
+            if ops is not None:
+                ops = ops[:self.max_edit_frames]
 
         # Handle invalid pointers (-1)
         pointers = np.clip(pointers, 0, raw_mel.shape[1] - 1)
@@ -253,11 +355,108 @@ class PointerDataset(Dataset):
             edit_mel_t = raw_mel_t[:, pointers_t]
             raw_mel_t, edit_mel_t, pointers_t = self.augmentor(raw_mel_t, edit_mel_t, pointers_t)
 
-        return {
+        result = {
             'raw_mel': raw_mel_t,
             'target_pointers': pointers_t,
             'name': sample['name'],
         }
+
+        # Add target_ops if available
+        if ops is not None:
+            result['target_ops'] = torch.from_numpy(ops).long()
+
+        # Add stems if enabled and available
+        if self.use_stems and sample['name'] in self._preloaded_stems:
+            stems = self._preloaded_stems[sample['name']]
+            max_t = raw_mel_t.shape[1]
+            result['stems'] = {
+                'drums': torch.from_numpy(stems['drums'][:, :max_t]).float(),
+                'bass': torch.from_numpy(stems['bass'][:, :max_t]).float(),
+                'vocals': torch.from_numpy(stems['vocals'][:, :max_t]).float(),
+                'other': torch.from_numpy(stems['other'][:, :max_t]).float(),
+            }
+
+        return result
+
+    def _get_full_sample_v2(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get a full sample for V2 architecture validation.
+
+        Key differences from _get_full_sample:
+        1. Uses full raw mel without pointer-based cropping
+        2. Keeps absolute pointer indices (required for delta prediction)
+        3. No augmentation (validation mode)
+
+        The V2 architecture uses delta prediction where:
+        - expected_position = output_position / compression_ratio
+        - delta = actual_pointer - expected_position
+
+        This requires the model to see the full raw mel with absolute pointer
+        indices, matching what it will see at inference time.
+        """
+        sample = self.samples[idx]
+
+        # Load raw mel (from preloaded cache) - FULL without cropping
+        raw_mel = self._load_mel(sample['name'], sample['raw_mel_file'])
+        raw_frames = raw_mel.shape[1]
+
+        # Load pointers (from preloaded cache or disk) - keep as ABSOLUTE indices
+        pointers = self._load_pointers(sample)
+
+        # Load edit ops if available
+        ops = self._load_ops(sample)
+
+        # Only truncate raw mel if it exceeds max_raw_frames
+        # (but do NOT crop based on pointer positions)
+        if raw_frames > self.max_raw_frames:
+            raw_mel = raw_mel[:, :self.max_raw_frames]
+            raw_frames = self.max_raw_frames
+            # Mark pointers beyond truncation as STOP tokens
+            pointers = np.where(pointers < self.max_raw_frames, pointers, -2)
+
+        # Truncate pointers if too long
+        if len(pointers) > self.max_edit_frames:
+            pointers = pointers[:self.max_edit_frames]
+            if ops is not None:
+                ops = ops[:self.max_edit_frames]
+
+        # Handle invalid pointers (-1 padding, but keep -2 STOP tokens)
+        # Clip -1 to valid range, but leave -2 as STOP
+        stop_mask = pointers == -2
+        pointers = np.where(
+            stop_mask,
+            -2,
+            np.clip(pointers, 0, raw_frames - 1)
+        )
+
+        # Convert to tensors
+        raw_mel_t = torch.from_numpy(raw_mel).float()
+        pointers_t = torch.from_numpy(pointers).long()
+
+        # NO augmentation in validation mode
+
+        result = {
+            'raw_mel': raw_mel_t,
+            'target_pointers': pointers_t,
+            'name': sample['name'],
+            'raw_frames': raw_frames,  # Include raw frames count for reference
+        }
+
+        # Add target_ops if available
+        if ops is not None:
+            result['target_ops'] = torch.from_numpy(ops).long()
+
+        # Add stems if enabled and available
+        if self.use_stems and sample['name'] in self._preloaded_stems:
+            stems = self._preloaded_stems[sample['name']]
+            max_t = raw_mel_t.shape[1]
+            result['stems'] = {
+                'drums': torch.from_numpy(stems['drums'][:, :max_t]).float(),
+                'bass': torch.from_numpy(stems['bass'][:, :max_t]).float(),
+                'vocals': torch.from_numpy(stems['vocals'][:, :max_t]).float(),
+                'other': torch.from_numpy(stems['other'][:, :max_t]).float(),
+            }
+
+        return result
 
     def _get_chunk(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a chunk from a sample."""
@@ -280,21 +479,33 @@ class PointerDataset(Dataset):
         # Load pointers (from preloaded cache or disk)
         pointers = self._load_pointers(sample)
 
+        # Load edit ops if available
+        ops = self._load_ops(sample)
+
         # Calculate chunk boundaries
         stride = self.chunk_size - self.chunk_overlap
         start = chunk_idx * stride
         end = min(start + self.chunk_size, len(pointers))
 
-        # Get chunk of pointers
+        # Get chunk of pointers and ops
         chunk_pointers = pointers[start:end]
+        chunk_ops = ops[start:end] if ops is not None else None
 
         # Find the range of raw frames needed for this chunk
+        # Limit to max_raw_frames to prevent OOM on samples with wide pointer spread
+        max_raw_chunk = min(self.max_raw_frames, 8192)  # Hard limit for attention memory
         valid_pointers = chunk_pointers[chunk_pointers >= 0]
         if len(valid_pointers) > 0:
             min_ptr = max(0, valid_pointers.min() - 100)  # Add some context
             max_ptr = min(raw_mel.shape[1], valid_pointers.max() + 100)
+            # Limit the raw chunk size to prevent OOM
+            if max_ptr - min_ptr > max_raw_chunk:
+                # Center the window around the median pointer
+                center = int(np.median(valid_pointers))
+                min_ptr = max(0, center - max_raw_chunk // 2)
+                max_ptr = min(raw_mel.shape[1], min_ptr + max_raw_chunk)
         else:
-            min_ptr, max_ptr = 0, min(raw_mel.shape[1], self.max_raw_frames)
+            min_ptr, max_ptr = 0, min(raw_mel.shape[1], max_raw_chunk)
 
         # Truncate raw mel to relevant range
         raw_mel_chunk = raw_mel[:, min_ptr:max_ptr]
@@ -313,12 +524,28 @@ class PointerDataset(Dataset):
             edit_mel_t = raw_mel_t[:, pointers_t]
             raw_mel_t, edit_mel_t, pointers_t = self.augmentor(raw_mel_t, edit_mel_t, pointers_t)
 
-        return {
+        result = {
             'raw_mel': raw_mel_t,
             'target_pointers': pointers_t,
             'name': f"{sample['name']}_chunk{chunk_idx}",
             'raw_offset': min_ptr,
         }
+
+        # Add target_ops if available
+        if chunk_ops is not None:
+            result['target_ops'] = torch.from_numpy(chunk_ops).long()
+
+        # Add stems if enabled and available
+        if self.use_stems and sample['name'] in self._preloaded_stems:
+            stems = self._preloaded_stems[sample['name']]
+            result['stems'] = {
+                'drums': torch.from_numpy(stems['drums'][:, min_ptr:max_ptr]).float(),
+                'bass': torch.from_numpy(stems['bass'][:, min_ptr:max_ptr]).float(),
+                'vocals': torch.from_numpy(stems['vocals'][:, min_ptr:max_ptr]).float(),
+                'other': torch.from_numpy(stems['other'][:, min_ptr:max_ptr]).float(),
+            }
+
+        return result
 
 
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -338,6 +565,24 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
     names = []
 
+    # Check if batch has stems
+    has_stems = 'stems' in batch[0]
+    stems = None
+    if has_stems:
+        stems = {
+            'drums': torch.zeros(batch_size, n_mels, max_raw_len),
+            'bass': torch.zeros(batch_size, n_mels, max_raw_len),
+            'vocals': torch.zeros(batch_size, n_mels, max_raw_len),
+            'other': torch.zeros(batch_size, n_mels, max_raw_len),
+        }
+
+    # Check if batch has target_ops
+    has_ops = 'target_ops' in batch[0]
+    target_ops = None
+    if has_ops:
+        # Default to COPY (0) for padding
+        target_ops = torch.zeros(batch_size, max_tgt_len, dtype=torch.long)
+
     for i, item in enumerate(batch):
         raw_len = item['raw_mel'].shape[1]
         tgt_len = len(item['target_pointers'])
@@ -348,13 +593,31 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         tgt_padding_mask[i, :tgt_len] = False
         names.append(item['name'])
 
-    return {
+        # Collate stems if present
+        if has_stems and 'stems' in item:
+            for stem_name in ['drums', 'bass', 'vocals', 'other']:
+                stem_len = item['stems'][stem_name].shape[1]
+                stems[stem_name][i, :, :stem_len] = item['stems'][stem_name]
+
+        # Collate target_ops if present
+        if has_ops and 'target_ops' in item:
+            target_ops[i, :tgt_len] = item['target_ops']
+
+    result = {
         'raw_mel': raw_mel,
         'target_pointers': target_pointers,
         'raw_padding_mask': raw_padding_mask,
         'tgt_padding_mask': tgt_padding_mask,
         'names': names,
     }
+
+    if stems is not None:
+        result['stems'] = stems
+
+    if target_ops is not None:
+        result['target_ops'] = target_ops
+
+    return result
 
 
 def make_fixed_collate_fn(fixed_raw_len: int = 2048, fixed_tgt_len: int = 512):

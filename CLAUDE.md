@@ -108,15 +108,39 @@ python -m rl_editor.infer "input.wav" --checkpoint "models/v1/best.pt" --output 
 pytest rl_editor/tests/
 
 # === Pointer Network ===
-# Generate pointer sequences (aligns raw ↔ edited audio frame-by-frame)
-python -m pointer_network.generate_pointer_sequences
 
-# Train pointer network
+# Step 1: Precache new samples (mel spectrograms + pointer sequences)
+# For specific samples:
+python -m pointer_network.precache_samples bubbletron 20180927darkjam
+
+# For all uncached samples:
+python -m pointer_network.precache_samples
+
+# Step 2: (Optional) Precache Demucs stems (only needed if use_stems=True)
+# 2a. Extract stems from audio (creates raw audio waveforms in cache/stems/)
+python scripts/precache_stems.py --data_dir training_data --cache_dir cache
+
+# 2b. Convert stem audio to mel spectrograms (creates mel specs in cache/stems_mel/)
+python scripts/convert_stems_to_mel.py
+
+# Step 3: Train pointer network
+python -m pointer_network.trainers.pointer_trainer \
+    --config pointer_network/configs/full.json
+
+# Or with explicit paths:
 python -m pointer_network.trainers.pointer_trainer \
     --cache-dir cache \
     --pointer-dir training_data/pointer_sequences \
     --save-dir models/pointer_network \
     --epochs 100
+
+# Resume training from checkpoint:
+python -m pointer_network.trainers.pointer_trainer \
+    --config pointer_network/configs/full.json \
+    --resume models/pointer_network_full_v2/latest.pt
+
+# Inference:
+python -m pointer_network.infer input.wav --checkpoint models/pointer_network_full_v2/best.pt
 ```
 
 ## Architecture
@@ -201,27 +225,65 @@ Inspired by FaceSwap's multi-scale perceptual losses:
 
 ## Data Structure
 
+All paths are relative to `F:\editorbot\`:
+
 ```
-editorbot/
-├── cache/              # Centralized cache for all editors (gitignored contents)
-│   ├── features/       # Cached mel spectrograms (.npz files)
-│   └── labels/         # Cached edit labels (.npy files)
-├── training_data/      # Training audio pairs (gitignored)
-│   ├── input/          # Raw audio (*_raw.wav)
-│   ├── desired_output/ # Human-edited versions (*_edit.wav)
-│   ├── reference/      # Additional finished tracks (optional)
-│   └── pointer_sequences/  # Generated pointer sequences
-├── rl_editor/          # RL-based editor (BC + PPO)
-├── super_editor/       # Supervised mel reconstruction (Phase 1 & 2)
-├── audio_slicer/       # FaceSwap-style audio segmentation
-├── mel_to_mel_editor/  # Direct mel transformation
-├── pointer_network/    # Pointer network for frame alignment
-├── scripts/            # Utility scripts
-├── models/             # Saved checkpoints (gitignored)
-├── logs/               # TensorBoard logs (gitignored)
-├── bc_rich.npz         # BC dataset from infer_rich_bc_labels
-└── bc_augmented.npz    # BC dataset with synthetic augmentation
+F:\editorbot\
+├── cache\                              # Centralized cache (gitignored contents)
+│   ├── features\                       # Mel spectrograms: {sample}_raw.npz, {sample}_edit.npz
+│   │   └── *.npz                       # Contains 'mel' array (128, time), normalized (mel_db+80)/80
+│   ├── labels\                         # Cached edit labels (.npy files)
+│   ├── stems\                          # Raw audio waveforms from Demucs (intermediate)
+│   │   └── {sample}_stems.npz          # Contains drums, bass, vocals, other audio arrays
+│   └── stems_mel\                      # Mel spectrograms of stems (4 channels)
+│       └── {sample}_stems.npz          # Contains drums, bass, vocals, other mel arrays (128, time)
+│
+├── training_data\                      # Training audio pairs (gitignored)
+│   ├── input\                          # Raw recordings
+│   │   └── {sample}_raw.wav            # e.g., 20180927darkjam_raw.wav
+│   ├── desired_output\                 # Human-edited versions
+│   │   └── {sample}_edit.wav           # e.g., 20180927darkjam_edit.wav
+│   ├── reference\                      # Additional finished tracks (optional)
+│   └── pointer_sequences\              # Generated pointer/ops data
+│       ├── {sample}_pointers.npy       # Frame indices mapping edit→raw
+│       ├── {sample}_ops.npy            # Edit operation codes per frame
+│       ├── {sample}_info.json          # Alignment metadata
+│       └── {sample}_alignment.png      # Visual alignment plot
+│
+├── pointer_network\                    # Pointer network code
+│   ├── models\                         # Model definitions
+│   │   └── pointer_network.py          # Main PointerNetwork class
+│   ├── data\                           # Dataset classes
+│   │   └── dataset.py                  # PointerDataset
+│   ├── trainers\                       # Training code
+│   │   └── pointer_trainer.py          # PointerNetworkTrainer
+│   ├── configs\                        # JSON config files
+│   │   └── full.json                   # Full training config with stems
+│   └── infer.py                        # Inference script
+│
+├── models\                             # Saved checkpoints (gitignored)
+│   └── pointer_network_full_v2\        # Current best model
+│       ├── best.pt                     # Best validation loss checkpoint
+│       └── latest.pt                   # Most recent checkpoint
+│
+├── logs\                               # TensorBoard logs (gitignored)
+├── rl_editor\                          # RL-based editor (BC + PPO)
+├── super_editor\                       # Supervised mel reconstruction
+├── audio_slicer\                       # Audio segmentation
+├── mel_to_mel_editor\                  # Direct mel transformation
+└── scripts\                            # Utility scripts
 ```
+
+### Key File Formats
+
+| File Type | Location | Format |
+|-----------|----------|--------|
+| Raw audio | `training_data/input/{sample}_raw.wav` | WAV, any sample rate |
+| Edited audio | `training_data/desired_output/{sample}_edit.wav` | WAV, any sample rate |
+| Mel cache | `cache/features/{sample}_{raw|edit}.npz` | `mel`: (128, time) float32 |
+| Stem mel cache | `cache/stems_mel/{sample}_stems.npz` | `drums, bass, vocals, other`: (128, time) each |
+| Pointers | `training_data/pointer_sequences/{sample}_pointers.npy` | int64 array (edit_frames,) |
+| Edit ops | `training_data/pointer_sequences/{sample}_ops.npy` | int8 array (edit_frames,) |
 
 ## Development Guidelines
 

@@ -1,11 +1,18 @@
-"""Trainer for pointer network with performance optimizations."""
+"""Trainer for pointer network with performance optimizations.
+
+Supports:
+- Multiple scheduler types: OneCycleLR, Cosine, Warmup-only, Warmup+Cosine
+- bfloat16 mixed precision (no GradScaler needed)
+- Edit operation tokens
+- Multi-stem support
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR, LambdaLR
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 import json
@@ -14,10 +21,35 @@ from tqdm import tqdm
 import numpy as np
 import sys
 
-from ..models import PointerNetwork, STOP_TOKEN, PAD_TOKEN
+from ..models import PointerNetwork, STOP_TOKEN, PAD_TOKEN, EditOp
 from ..data.dataset import PointerDataset, collate_fn, make_fixed_collate_fn
 from ..data.augmentation import AugmentationConfig
 from ..config import TrainConfig
+
+
+# =============================================================================
+# SCHEDULER UTILITIES
+# =============================================================================
+def get_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
+    """Linear warmup then constant LR (most stable, no decay)."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        return 1.0  # Constant after warmup
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def get_warmup_cosine_scheduler(optimizer, warmup_steps: int, total_steps: int, min_lr_ratio: float = 0.1):
+    """Linear warmup then cosine decay (gentle, no spikes)."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        # Cosine decay
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + np.cos(np.pi * progress))
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 def build_augmentation_config(config: TrainConfig) -> AugmentationConfig:
@@ -52,7 +84,14 @@ def build_augmentation_config(config: TrainConfig) -> AugmentationConfig:
 
 
 class PointerNetworkTrainer:
-    """Trainer for pointer network with all losses and performance optimizations."""
+    """Trainer for pointer network with all losses and performance optimizations.
+
+    Supports:
+    - Multiple scheduler types: warmup, warmup_cosine, cosine, onecycle
+    - bfloat16 mixed precision (more stable than float16, no GradScaler needed)
+    - Edit operation tokens
+    - Multi-stem support
+    """
 
     def __init__(
         self,
@@ -62,8 +101,22 @@ class PointerNetworkTrainer:
         self.config = config
         self.device = device
 
-        # Create model
+        # V2 features config (from model config)
         use_checkpoint = getattr(config, 'use_gradient_checkpoint', False)
+        use_pre_norm = getattr(config.model, 'use_pre_norm', True)  # Pre-LayerNorm (default: True for stability)
+        use_stems = getattr(config.model, 'use_stems', False)        # Multi-stem encoding
+        n_stems = getattr(config.model, 'n_stems', 4)
+        dim_feedforward = getattr(config.model, 'dim_feedforward', None)  # None = d_model * 4
+        label_smoothing = getattr(config, 'label_smoothing', 0.1)
+
+        # V2 full-sequence parameters
+        compression_ratio = getattr(config.model, 'compression_ratio', 0.67)
+        attn_window_size = getattr(config.model, 'attn_window_size', 512)
+        max_delta = getattr(config.model, 'max_delta', 64)
+        n_global_tokens = getattr(config.model, 'n_global_tokens', 64)
+        global_token_stride = getattr(config.model, 'global_token_stride', 1000)
+
+        # Create model with V2 architecture
         self.model = PointerNetwork(
             n_mels=config.model.n_mels,
             d_model=config.model.d_model,
@@ -72,7 +125,25 @@ class PointerNetworkTrainer:
             n_decoder_layers=config.model.n_decoder_layers,
             dropout=config.model.dropout,
             use_checkpoint=use_checkpoint,
+            use_pre_norm=use_pre_norm,
+            use_stems=use_stems,
+            n_stems=n_stems,
+            dim_feedforward=dim_feedforward,
+            label_smoothing=label_smoothing,
+            # V2 full-sequence parameters
+            compression_ratio=compression_ratio,
+            attn_window_size=attn_window_size,
+            max_delta=max_delta,
+            n_global_tokens=n_global_tokens,
+            global_token_stride=global_token_stride,
         ).to(device)
+
+        # Print model info
+        n_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Model parameters: {n_params:,} ({n_params/1e6:.1f}M)")
+        print(f"V2 Architecture: linear_attn, windowed_xattn, delta_prediction")
+        print(f"Features: pre_norm={use_pre_norm}, stems={use_stems}, compression_ratio={compression_ratio}")
+        print(f"Delta prediction: max_delta={max_delta}, attn_window={attn_window_size}")
         if use_checkpoint:
             print("Using gradient checkpointing (saves VRAM, slightly slower)")
 
@@ -89,27 +160,39 @@ class PointerNetworkTrainer:
             except Exception as e:
                 print(f"torch.compile failed (will use eager mode): {e}")
 
-        # Optimizer
+        # Optimizer with stable beta2 for transformers
         self.optimizer = AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
+            betas=(0.9, 0.98),  # Higher beta2 for stability with transformers
+            eps=1e-8,
         )
 
-        # Scheduler - OneCycleLR often converges faster
-        self.use_onecycle = getattr(config, 'use_onecycle', True)
-        self.scheduler = None  # Created after dataloaders for OneCycleLR
-        self.scheduler_type = 'onecycle' if self.use_onecycle else 'cosine'
-
-        # Warmup settings (only for cosine)
-        self.warmup_steps = getattr(config, 'warmup_steps', 500)
+        # Scheduler type: warmup, warmup_cosine, cosine, onecycle
+        # Default: warmup_cosine (most stable, no LR spikes)
+        self.scheduler_type = getattr(config, 'scheduler_type', 'warmup_cosine')
+        self.scheduler = None  # Created after dataloaders
+        self.warmup_steps = getattr(config, 'warmup_steps', 1000)  # More warmup for stability
         self.base_lr = config.learning_rate
 
-        # Mixed precision scaler
+        # Mixed precision settings
         self.use_amp = config.use_amp and device == "cuda"
-        self.scaler = GradScaler(enabled=self.use_amp)
-        if self.use_amp:
-            print("Using automatic mixed precision (AMP)")
+        self.use_bfloat16 = getattr(config, 'use_bfloat16', True) and device == "cuda"
+
+        if self.use_bfloat16:
+            self.amp_dtype = torch.bfloat16
+            # bfloat16 doesn't need GradScaler (has same exponent range as float32)
+            self.scaler = GradScaler('cuda', enabled=False)
+            print("Using bfloat16 mixed precision (no GradScaler, more stable)")
+        elif self.use_amp:
+            self.amp_dtype = torch.float16
+            self.scaler = GradScaler('cuda', enabled=True)
+            print("Using float16 mixed precision with GradScaler")
+        else:
+            self.amp_dtype = torch.float32
+            self.scaler = GradScaler('cuda', enabled=False)
+            print("Using float32 (no mixed precision)")
 
         # Gradient accumulation
         self.gradient_accumulation_steps = config.gradient_accumulation_steps
@@ -120,6 +203,8 @@ class PointerNetworkTrainer:
         self.vae_kl_weight = 0.01
         self.stop_loss_weight = 0.5
         self.structure_loss_weight = 0.1
+        self.label_smoothing = getattr(config, 'label_smoothing', 0.1)
+        print(f"Label smoothing: {self.label_smoothing}")
 
         # Tracking
         self.global_step = 0
@@ -146,6 +231,10 @@ class PointerNetworkTrainer:
         use_augmentation = getattr(self.config, 'augmentation_enabled', False)
         aug_config = build_augmentation_config(self.config) if use_augmentation else None
 
+        # Get stems settings
+        use_stems = getattr(self.config.model, 'use_stems', False)
+        stems_dir = f"{self.config.cache_dir}/stems_mel" if use_stems else None
+
         if use_real_only_val:
             # Create separate train dataset (all data) and val dataset (real only)
             train_dataset = PointerDataset(
@@ -159,6 +248,8 @@ class PointerNetworkTrainer:
                 real_only=False,  # Train on everything
                 augment=use_augmentation,
                 augmentation_config=aug_config,
+                use_stems=use_stems,
+                stems_dir=stems_dir,
             )
 
             val_dataset = PointerDataset(
@@ -171,6 +262,9 @@ class PointerNetworkTrainer:
                 exclude_samples=getattr(self.config, 'exclude_samples', []),
                 real_only=True,  # Validate only on real data
                 augment=False,  # No augmentation for validation
+                use_stems=use_stems,
+                stems_dir=stems_dir,
+                validation_mode=True,  # V2: Use full raw mel without cropping for delta prediction
             )
 
             print(f"Train: {len(train_dataset)} samples (real + synthetic)")
@@ -189,6 +283,8 @@ class PointerNetworkTrainer:
                 exclude_samples=getattr(self.config, 'exclude_samples', []),
                 augment=use_augmentation,
                 augmentation_config=aug_config,
+                use_stems=use_stems,
+                stems_dir=stems_dir,
             )
 
             # Split 90/10
@@ -290,7 +386,7 @@ class PointerNetworkTrainer:
             logits_flat,
             targets_flat,
             ignore_index=-100,
-            label_smoothing=0.1,
+            label_smoothing=self.label_smoothing,
         )
         losses['pointer_loss'] = pointer_loss
 
@@ -372,9 +468,12 @@ class PointerNetworkTrainer:
             return metrics
 
     def _apply_warmup(self):
-        """Apply linear warmup to learning rate (only for CosineAnnealing)."""
-        # OneCycleLR has built-in warmup, so skip
-        if self.use_onecycle:
+        """Apply linear warmup to learning rate (only for CosineAnnealing scheduler).
+
+        Other scheduler types (warmup, warmup_cosine, onecycle) have warmup built in.
+        """
+        # Only apply manual warmup for cosine scheduler
+        if self.scheduler_type != 'cosine':
             return
         if self.global_step < self.warmup_steps:
             warmup_factor = (self.global_step + 1) / self.warmup_steps
@@ -385,18 +484,31 @@ class PointerNetworkTrainer:
         """Single training step with AMP and gradient accumulation."""
         self.model.train()
 
-        # Apply warmup
+        # Apply warmup (only for non-scheduler-based warmup)
         self._apply_warmup()
 
         # Move to device (non-blocking for better overlap)
         raw_mel = batch['raw_mel'].to(self.device, non_blocking=True)
         target_pointers = batch['target_pointers'].to(self.device, non_blocking=True)
 
+        # Get target ops if available
+        target_ops = batch.get('target_ops')
+        if target_ops is not None:
+            target_ops = target_ops.to(self.device, non_blocking=True)
+
+        # Get stems if available
+        stems = batch.get('stems')
+        if stems is not None:
+            stems = {k: v.to(self.device, non_blocking=True) for k, v in stems.items()}
+
         # Forward pass with automatic mixed precision
-        with autocast(enabled=self.use_amp):
+        # Use new-style autocast with device_type and dtype
+        with autocast('cuda', enabled=self.use_amp or self.use_bfloat16, dtype=self.amp_dtype):
             outputs = self.model(
                 raw_mel=raw_mel,
                 target_pointers=target_pointers,
+                target_ops=target_ops,
+                stems=stems,
             )
             total_loss = outputs['loss']
 
@@ -405,9 +517,9 @@ class PointerNetworkTrainer:
                 print(f"Warning: NaN/Inf loss detected at step {self.global_step}, skipping batch")
                 self.optimizer.zero_grad(set_to_none=True)
                 return {
-                    'total_loss': 0.0, 'pointer_loss': 0.0, 'bar_pointer_loss': 0.0,
-                    'beat_pointer_loss': 0.0, 'stop_loss': 0.0, 'kl_loss': 0.0,
-                    'length_loss': 0.0, 'structure_loss': 0.0,
+                    'total_loss': 0.0, 'pointer_loss': 0.0, 'delta_loss': 0.0,
+                    'jump_loss': 0.0, 'use_jump_loss': 0.0, 'stop_loss': 0.0,
+                    'kl_loss': 0.0, 'length_loss': 0.0, 'structure_loss': 0.0,
                 }
 
             # Scale loss by accumulation steps for correct averaging
@@ -444,12 +556,13 @@ class PointerNetworkTrainer:
 
             self.global_step += 1
 
-        # Return all losses for logging (including hierarchical)
+        # Return all losses for logging (V2 architecture)
         loss_dict = {
             'total_loss': outputs['loss'].item(),
             'pointer_loss': outputs['pointer_loss'].item(),
-            'bar_pointer_loss': outputs.get('bar_pointer_loss', torch.tensor(0.0)).item(),
-            'beat_pointer_loss': outputs.get('beat_pointer_loss', torch.tensor(0.0)).item(),
+            'delta_loss': outputs['delta_loss'].item(),
+            'jump_loss': outputs['jump_loss'].item(),
+            'use_jump_loss': outputs['use_jump_loss'].item(),
             'stop_loss': outputs['stop_loss'].item(),
             'kl_loss': outputs['kl_loss'].item(),
             'length_loss': outputs['length_loss'].item(),
@@ -459,48 +572,60 @@ class PointerNetworkTrainer:
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Run validation with AMP."""
+        """Run validation with AMP (V2 architecture)."""
         self.model.eval()
 
         total_losses = {
-            'loss': 0.0, 'pointer_loss': 0.0, 'bar_pointer_loss': 0.0,
-            'beat_pointer_loss': 0.0, 'stop_loss': 0.0,
+            'loss': 0.0, 'pointer_loss': 0.0, 'delta_loss': 0.0,
+            'jump_loss': 0.0, 'use_jump_loss': 0.0, 'stop_loss': 0.0,
         }
-        total_correct = 0
+        total_delta_correct = 0
         total_frames = 0
         n_batches = 0
 
         for batch in val_loader:
             raw_mel = batch['raw_mel'].to(self.device, non_blocking=True)
             target_pointers = batch['target_pointers'].to(self.device, non_blocking=True)
+            target_ops = batch.get('target_ops')
+            if target_ops is not None:
+                target_ops = target_ops.to(self.device, non_blocking=True)
+
+            # Get stems if available
+            stems = batch.get('stems')
+            if stems is not None:
+                stems = {k: v.to(self.device, non_blocking=True) for k, v in stems.items()}
 
             # Use AMP for validation too
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp or self.use_bfloat16, dtype=self.amp_dtype):
                 outputs = self.model(
                     raw_mel=raw_mel,
                     target_pointers=target_pointers,
+                    target_ops=target_ops,
+                    stems=stems,
                     use_vae=False,  # Deterministic for validation
                 )
 
-            # Accumulate losses
+            # Accumulate losses (V2 architecture)
             total_losses['loss'] += outputs['loss'].item()
             total_losses['pointer_loss'] += outputs['pointer_loss'].item()
-            total_losses['bar_pointer_loss'] += outputs.get('bar_pointer_loss', torch.tensor(0.0)).item()
-            total_losses['beat_pointer_loss'] += outputs.get('beat_pointer_loss', torch.tensor(0.0)).item()
+            total_losses['delta_loss'] += outputs['delta_loss'].item()
+            total_losses['jump_loss'] += outputs['jump_loss'].item()
+            total_losses['use_jump_loss'] += outputs['use_jump_loss'].item()
             total_losses['stop_loss'] += outputs['stop_loss'].item()
 
-            # Compute accuracy (frame-level)
-            predictions = outputs['pointer_logits'].argmax(dim=-1)
+            # Compute delta accuracy (V2: check if predicted delta matches target delta)
+            delta_predictions = outputs['delta_logits'].argmax(dim=-1)
+            delta_targets = outputs['delta_targets']['delta_targets']
             stop_mask = target_pointers == STOP_TOKEN
-            correct = (predictions == target_pointers) & (~stop_mask)
-            total_correct += correct.sum().item()
+            delta_correct = (delta_predictions == delta_targets) & (~stop_mask)
+            total_delta_correct += delta_correct.sum().item()
             total_frames += (~stop_mask).sum().item()
 
             n_batches += 1
 
         # Average
         avg_losses = {f'val_{k}': v / n_batches for k, v in total_losses.items()}
-        avg_losses['val_accuracy'] = total_correct / max(total_frames, 1)
+        avg_losses['val_delta_accuracy'] = total_delta_correct / max(total_frames, 1)
 
         return avg_losses
 
@@ -565,10 +690,28 @@ class PointerNetworkTrainer:
         print(f"Train: {len(train_loader)} batches, Val: {len(val_loader)} batches")
         print(f"Effective batch size: {self.config.batch_size * self.gradient_accumulation_steps}")
 
-        # Create scheduler (needs total steps for OneCycleLR)
+        # Create scheduler (needs total steps)
         total_steps = len(train_loader) * self.config.epochs // self.gradient_accumulation_steps
-        if self.use_onecycle:
-            # max_lr multiplier - configurable, default 3x (conservative)
+
+        if self.scheduler_type == 'warmup':
+            # Linear warmup then constant (most stable, no decay)
+            self.scheduler = get_warmup_scheduler(
+                self.optimizer,
+                warmup_steps=self.warmup_steps,
+                total_steps=total_steps,
+            )
+            print(f"Using warmup scheduler (warmup={self.warmup_steps}, constant after)")
+        elif self.scheduler_type == 'warmup_cosine':
+            # Linear warmup then cosine decay (stable, gentle decay)
+            self.scheduler = get_warmup_cosine_scheduler(
+                self.optimizer,
+                warmup_steps=self.warmup_steps,
+                total_steps=total_steps,
+                min_lr_ratio=0.1,
+            )
+            print(f"Using warmup+cosine scheduler (warmup={self.warmup_steps}, total={total_steps})")
+        elif self.scheduler_type == 'onecycle':
+            # OneCycleLR (can be unstable with LR spikes)
             max_lr_mult = getattr(self.config, 'max_lr_mult', 3)
             self.scheduler = OneCycleLR(
                 self.optimizer,
@@ -580,7 +723,7 @@ class PointerNetworkTrainer:
                 final_div_factor=100,  # End at base_lr/100
             )
             print(f"Using OneCycleLR scheduler (total_steps={total_steps}, max_lr={self.config.learning_rate * max_lr_mult:.2e})")
-        else:
+        else:  # cosine
             self.scheduler = CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.config.epochs,
@@ -608,31 +751,33 @@ class PointerNetworkTrainer:
                 for k, v in losses.items():
                     epoch_losses[k] = epoch_losses.get(k, 0) + v
 
-                # Update progress bar with hierarchical losses
+                # Update progress bar with V2 losses
                 pbar.set_postfix({
                     'loss': f"{losses['total_loss']:.4f}",
-                    'bar': f"{losses['bar_pointer_loss']:.4f}",
-                    'beat': f"{losses['beat_pointer_loss']:.4f}",
-                    'frame': f"{losses['pointer_loss']:.4f}",
+                    'delta': f"{losses['delta_loss']:.4f}",
+                    'jump': f"{losses['jump_loss']:.4f}",
+                    'stop': f"{losses['stop_loss']:.4f}",
                 })
 
                 # Log periodically
                 if self.global_step % self.config.log_every == 0 and self.global_step > 0:
-                    print(f"Step {self.global_step}: loss={losses['total_loss']:.4f}")
-                    # TensorBoard logging
+                    print(f"Step {self.global_step}: loss={losses['total_loss']:.4f}, delta={losses['delta_loss']:.4f}")
+                    # TensorBoard logging (V2 architecture)
                     self.writer.add_scalar('train/loss', losses['total_loss'], self.global_step)
                     self.writer.add_scalar('train/pointer_loss', losses['pointer_loss'], self.global_step)
-                    self.writer.add_scalar('train/bar_pointer_loss', losses['bar_pointer_loss'], self.global_step)
-                    self.writer.add_scalar('train/beat_pointer_loss', losses['beat_pointer_loss'], self.global_step)
+                    self.writer.add_scalar('train/delta_loss', losses['delta_loss'], self.global_step)
+                    self.writer.add_scalar('train/jump_loss', losses['jump_loss'], self.global_step)
+                    self.writer.add_scalar('train/use_jump_loss', losses['use_jump_loss'], self.global_step)
                     self.writer.add_scalar('train/stop_loss', losses['stop_loss'], self.global_step)
                     self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
 
-                # OneCycleLR steps per batch, CosineAnnealing steps per epoch
-                if self.use_onecycle and (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    self.scheduler.step()
+                # Step scheduler (warmup, warmup_cosine, onecycle step per batch; cosine per epoch)
+                if self.scheduler_type in ['warmup', 'warmup_cosine', 'onecycle']:
+                    if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                        self.scheduler.step()
 
             # End of epoch - step for CosineAnnealing (per-epoch scheduler)
-            if not self.use_onecycle:
+            if self.scheduler_type == 'cosine':
                 self.scheduler.step()
 
             # Average epoch losses
